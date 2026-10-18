@@ -10,9 +10,9 @@
 //! The gate runs the whole-tree lane ([`crate::trust_lane`]) twice on this clean checkout,
 //! the published seal's then the candidate's, each check under the memory guard with its
 //! per-obligation record, and compares them ([`crate::trust_compare`]). The receipt
-//! (`<out>/RECEIPT`, [`RECEIPT_MAGIC`]) is what the trust pack publisher admits: `--admits`
-//! answers its question ([`refusals`]), which `atpkg-publish publish-group rustc --upload`
-//! asks.
+//! (`<out>/RECEIPT`, [`RECEIPT_MAGIC`]) is what the trust pack publisher admits. What admits
+//! is atpkg-publish's pure rule (`atpkg_publish::channel::candidate`), which the `rustc`
+//! group's publish answers in-process; `--admits` asks the same rule here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -21,17 +21,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use atpkg::manifest::TRUST_EXPOSES;
+use atpkg_publish::channel::candidate::{
+    self as admission, RECEIPT_MAGIC, Receipt, toolchain_dir, tree_root,
+};
 
-use crate::ledger::GitRunner as _;
 use crate::trust_lane::{self, Guard, Outcome, Scope};
-
-/// A receipt's first line. Format 2 binds each excuse to the site it was audited at;
-/// an older receipt admits nothing.
-pub const RECEIPT_MAGIC: &str = "aterm-trust candidate-gate 2";
-
-/// How old a PASS may be and still admit a publish: a receipt measures one aterm tree
-/// on one day.
-const MAX_AGE_DAYS: i64 = 7;
 
 /// The candidate's run waits this long for the base's trustd to retire (300 s after
 /// its last grant), before it starts its own.
@@ -185,36 +179,17 @@ pub fn run(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
 // What the gate reads of the world
 // ---------------------------------------------------------------------------
 
-/// The physical toolchain directory: `dir`, or the parent of a `bin/` given.
-fn toolchain_dir(dir: &Path) -> Result<PathBuf, String> {
-    let d = fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    Ok(
-        if d.join("targo").is_file() && !d.join("bin/targo").is_file() {
-            d.parent().map_or(d.clone(), Path::to_path_buf)
-        } else {
-            d
-        },
-    )
-}
-
-/// atpkg's tree_root of a toolchain directory: the prover identity the judge reads.
-fn tree_root(dir: &Path) -> Result<String, String> {
-    atpkg::tree::tree_root(dir).map_err(|e| format!("the tree_root of {}: {e}", dir.display()))
-}
-
 /// The `commit-hash:` its `trustc -vV` names, `None` when it names none.
 fn trust_commit(bin: &Path) -> Option<String> {
     let c = crate::trust_facts::trustc_commit(bin);
     (c.len() == 40 && c.bytes().all(|b| b.is_ascii_hexdigit())).then_some(c)
 }
 
+/// The lanes' state root, found as the publisher's reader finds it
+/// ([`admission::state_dir_from_env`]); `.local/state/aterm-auto` under the current
+/// directory when `HOME` is unset, where that reader refuses to run.
 fn state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| aterm_types::dirs::home_dir().map(|h| h.join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from(".local/state"))
-        .join("aterm-auto")
+    admission::state_dir_from_env().unwrap_or_else(|| PathBuf::from(".local/state/aterm-auto"))
 }
 
 /// The trust build the public channel's newest `atpkg-index-<n>` release pins:
@@ -304,199 +279,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     crate::trust_facts::hex(&aterm_digest::Sha256::digest(bytes))
 }
 
-/// The aterm checkout a receipt is held to.
-pub trait Aterm {
-    /// Whether `commit` is an ancestor of (or is) HEAD.
-    fn contains(&self, commit: &str) -> bool;
-    /// The sha256 of the retraction ledger as committed at `rev`, `None` when git
-    /// cannot show it.
-    fn ledger_sha(&self, rev: &str) -> Option<String>;
-}
-
-impl Aterm for crate::ledger::GitCli {
-    fn contains(&self, commit: &str) -> bool {
-        self.git(&["merge-base", "--is-ancestor", commit, "HEAD"])
-            .is_ok_and(|o| o.success())
-    }
-
-    fn ledger_sha(&self, rev: &str) -> Option<String> {
-        let o = self
-            .git(&[
-                "cat-file",
-                "blob",
-                &format!("{rev}:{}", crate::trust_oblig::LEDGER_PATH),
-            ])
-            .ok()
-            .filter(crate::ledger::RunOut::success)?;
-        Some(sha256_hex(&o.stdout))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The receipt, and what admits a publish
-// ---------------------------------------------------------------------------
-
-/// A receipt's `key value` lines.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Receipt {
-    pub magic: String,
-    pub fields: BTreeMap<String, String>,
-}
-
-impl Receipt {
-    #[must_use]
-    pub fn parse(text: &str) -> Receipt {
-        let mut lines = text.lines();
-        let magic = lines.next().unwrap_or("").to_string();
-        let mut fields = BTreeMap::new();
-        for l in lines {
-            let (k, v) = l.split_once(' ').unwrap_or((l, ""));
-            fields.entry(k.to_string()).or_insert_with(|| v.to_string());
-        }
-        Receipt { magic, fields }
-    }
-
-    #[must_use]
-    pub fn get(&self, k: &str) -> &str {
-        self.fields.get(k).map_or("", String::as_str)
-    }
-
-    fn render(&self) -> String {
-        let mut t = format!("{}\n", self.magic);
-        for (k, v) in &self.fields {
-            t.push_str(&format!("{k} {}\n", crate::trust_facts::one_line(v)));
-        }
-        t
-    }
-}
-
-/// The newest receipt under `dir/*/RECEIPT` (by its `date`) of a run whose candidate is
-/// `root`: every run counts whatever it answered, so a newer refusal is never outlived by an
-/// older PASS.
-fn newest_receipt(dir: &Path, root: &str) -> Option<(PathBuf, Receipt)> {
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path().join("RECEIPT");
-            let r = Receipt::parse(&fs::read_to_string(&p).ok()?);
-            (r.get("candidate-tree-root") == root).then_some((p, r))
-        })
-        .max_by(|a, b| a.1.get("date").cmp(b.1.get("date")))
-}
-
-/// The publisher's question: every reason `receipt`, the newest run of the gate for the
-/// toolchain whose tree_root is `root`, admits no publish, against the trust build `pin` the
-/// public channel pins now, at `now` (epoch seconds), in `aterm`. Empty: admitted.
-#[must_use]
-pub fn refusals(
-    receipt: Option<&Receipt>,
-    root: &str,
-    pin: u64,
-    now: i64,
-    aterm: &dyn Aterm,
-) -> Vec<String> {
-    let Some(r) = receipt else {
-        return vec![format!(
-            "no candidate-gate receipt names this toolchain (tree_root {}): run `targo \
-             --unverified ship trust candidate --candidate <it>` first",
-            root.get(..12).unwrap_or(root)
-        )];
-    };
-    if r.magic != RECEIPT_MAGIC {
-        return vec![format!(
-            "the receipt's first line is `{}`, not `{RECEIPT_MAGIC}`: it admits nothing — run \
-             the gate again",
-            r.magic
-        )];
-    }
-    let mut out = Vec::new();
-    if r.get("verdict") != "PASS" || r.get("exit") != "0" {
-        out.push(format!(
-            "the newest run of the gate for it did not pass (verdict {}, exit {}); its \
-             comparison is {}",
-            r.get("verdict"),
-            r.get("exit"),
-            r.get("compare")
-        ));
-    }
-    if r.get("mode") != "run" {
-        out.push(format!(
-            "it records a {} of the gate, not a run of it",
-            r.get("mode")
-        ));
-    }
-    if r.get("candidate-tree-root") != root || r.get("candidate-prover") != root {
-        out.push(format!(
-            "it is not a run that measured this toolchain (its run's prover {})",
-            r.get("candidate-prover")
-        ));
-    }
-    if !r.get("base-from").starts_with("published") {
-        out.push(format!(
-            "it compared against a base named by hand ({}), not the published seal",
-            r.get("base-from")
-        ));
-    } else if !is_root(r.get("base-signed-tree-root"))
-        || r.get("base-prover") != r.get("base-signed-tree-root")
-    {
-        out.push(format!(
-            "its base run measured prover {}, not the published seal as the package client verified it ({})",
-            r.get("base-prover"),
-            r.get("base-signed-tree-root")
-        ));
-    }
-    if r.get("base-build") != pin.to_string() {
-        out.push(format!(
-            "it compared against trust build {}, and the public channel now pins {pin}: run \
-             the gate again, against the published seal",
-            r.get("base-build")
-        ));
-    }
-    match aterm_types::rfc3339::parse_utc(r.get("date")) {
-        None => out.push(format!(
-            "its date `{}` does not read, so nothing says the measurement is current",
-            r.get("date")
-        )),
-        Some(when) if (now - when) / 86_400 > MAX_AGE_DAYS => out.push(format!(
-            "it is {} days old (the gate ran {}), past {MAX_AGE_DAYS}: run the gate again on a \
-             current aterm",
-            (now - when) / 86_400,
-            r.get("date")
-        )),
-        Some(_) => {}
-    }
-    let commit = r.get("aterm-commit");
-    let hex40 = commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
-    if !hex40 || !aterm.contains(commit) {
-        out.push(format!(
-            "it measured aterm {commit}, which this checkout's HEAD does not contain: run the \
-             gate on this aterm's history"
-        ));
-    }
-    // An excuse comes only from the audited ledger: the one committed at the commit it
-    // measured, still the one at HEAD.
-    let read = r.get("retractions").split(' ').next().unwrap_or("");
-    match hex40.then(|| aterm.ledger_sha(commit)).flatten() {
-        None => out.push(format!(
-            "it read the retraction ledger {read}, and this checkout cannot show {} as \
-             committed at aterm {commit} to hold it to",
-            crate::trust_oblig::LEDGER_PATH
-        )),
-        Some(want) if want != read => out.push(format!(
-            "it read the retraction ledger {read}, not the one committed at aterm {commit} \
-             ({want}): a ledger named by hand admits nothing"
-        )),
-        Some(want) if aterm.ledger_sha("HEAD").as_deref() != Some(want.as_str()) => out.push(
-            "the retraction ledger changed since the run, so its excuses no longer stand: run \
-             the gate again under HEAD's ledger"
-                .to_string(),
-        ),
-        Some(_) => {}
-    }
-    out
-}
-
 /// `--admits`: what the publisher asks, asked here.
 fn admits(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
     let checked = (|| {
@@ -525,11 +307,16 @@ fn admits(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
     let receipts = args
         .receipts
         .clone()
-        .unwrap_or_else(|| state_dir().join("candidate-gate"));
-    let found = newest_receipt(&receipts, &root);
+        .unwrap_or_else(|| admission::receipts_dir(&state_dir()));
+    let found = admission::newest_receipt(&receipts, &root);
     let now = i64::try_from(crate::publish::unix_now()).unwrap_or(i64::MAX);
-    let git = crate::ledger::GitCli::new(repo);
-    let refused = refusals(found.as_ref().map(|(_, r)| r), &root, pin, now, &git);
+    let refused = admission::refusals(
+        found.as_ref().map(|(_, r)| r),
+        &root,
+        pin,
+        now,
+        &admission::Checkout(repo),
+    );
     let short = root.get(..12).unwrap_or(&root);
     if refused.is_empty() {
         let path = found
@@ -687,7 +474,7 @@ struct Seen {
     out_dir: PathBuf,
     /// --out already holds something.
     out_used: bool,
-    out_refused: Option<(PathBuf, String)>,
+    out_refused: Option<trust_lane::Refused>,
     /// The nearest existing directory of --out, and its free bytes.
     volume: PathBuf,
     free: Option<u64>,
@@ -780,8 +567,7 @@ impl Seen {
             let stamp = aterm_types::rfc3339::format_rfc3339(crate::publish::unix_now())
                 .replace([':', '-'], "");
             let c = cand.commit.clone().unwrap_or_default();
-            state_dir()
-                .join("candidate-gate")
+            admission::receipts_dir(&state_dir())
                 .join(format!("{stamp}-{}", c.get(..10).unwrap_or(&c)))
         });
         // The volume the runs will fill: the nearest directory of --out that exists
@@ -798,7 +584,7 @@ impl Seen {
             head: crate::ledger::rev_parse(&git, "HEAD").unwrap_or_default(),
             tree: crate::ledger::rev_parse(&git, "HEAD^{tree}").unwrap_or_default(),
             ledger_sha: ledger_bytes.as_deref().map(sha256_hex),
-            head_ledger_sha: git.ledger_sha("HEAD"),
+            head_ledger_sha: admission::Aterm::ledger_sha(&admission::Checkout(repo), "HEAD"),
             ledger,
             rows,
             row_commits,
@@ -849,11 +635,6 @@ impl Seen {
     }
 }
 
-/// 64 lowercase hex: a tree_root.
-fn is_root(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 /// The preflight: every reason the gate must not start, each one the comparison or the
 /// publisher would give hours later. Empty: run.
 fn preflight(seen: &Seen, args: &Args) -> Vec<String> {
@@ -893,7 +674,7 @@ fn preflight(seen: &Seen, args: &Args) -> Vec<String> {
                 ));
             }
             if let (Some(signed), Ok(root)) = (&s.signed, &s.side.root)
-                && is_root(signed)
+                && admission::is_tree_root(signed)
                 && root != signed
             {
                 problems.push(format!(
@@ -902,7 +683,7 @@ fn preflight(seen: &Seen, args: &Args) -> Vec<String> {
                     signed.get(..12).unwrap_or(signed)
                 ));
             }
-            if !s.signed.as_deref().is_some_and(is_root) {
+            if !s.signed.as_deref().is_some_and(admission::is_tree_root) {
                 problems.push(format!(
                     "the package client's status.toml names no verified tree_root for trust {b}, so nothing binds the base to the published seal (aterm pkg update trust)"
                 ));
@@ -979,11 +760,13 @@ fn preflight(seen: &Seen, args: &Args) -> Vec<String> {
             seen.out_dir.display()
         ));
     }
-    if let Some((dir, why)) = &seen.out_refused {
+    if let Some(r) = &seen.out_refused {
         problems.push(format!(
-            "--out {} has a path component, {}, that `targo trust` refuses ({why}): give a directory of your own",
+            "--out {} has a path component, {}, that `targo trust` refuses ({}): {}",
             seen.out_dir.display(),
-            dir.display()
+            r.dir.display(),
+            r.why,
+            r.fix("give --out a directory under one you own")
         ));
     }
     match seen.free {
@@ -1029,7 +812,7 @@ fn gate(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
         out_dir,
         ..
     } = seen;
-    let gate_root = state_dir().join("candidate-gate");
+    let gate_root = admission::receipts_dir(&state_dir());
     let guard = args
         .guard
         .then(|| guard_of(args, crate::artifact::host_memory_bytes().unwrap_or(0)));
@@ -1148,10 +931,10 @@ fn gate(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
         let _ = writeln!(out, "NO VERDICT: a dry run measures nothing (exit 3)");
         return 3;
     }
-    let _ = fs::create_dir_all(&gate_root);
-    let _lock = match trust_lane::RunLock::take(
+    let _lock = match gate_dirs(
+        &gate_root,
         &state_dir().join("candidate-gate.lock"),
-        "one measurement at a time on this host",
+        &out_dir,
     ) {
         Ok(l) => l,
         Err(why) => {
@@ -1162,20 +945,6 @@ fn gate(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
             return 2;
         }
     };
-    // The runs' directory is the operator's alone: its plans and receipt decide a
-    // publish.
-    let made = fs::create_dir_all(&out_dir).and_then(|()| {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o700))
-    });
-    if let Err(e) = made {
-        let _ = writeln!(
-            out,
-            "VERDICT: PUBLISH-REFUSED — COULD NOT RUN: {}: {e}; nothing is published",
-            out_dir.display()
-        );
-        return 2;
-    }
     // One snapshot of the cost history for both runs: the same order.
     let costs = fs::read(state_dir_of_clone(repo).join("trust-costs.tsv")).ok();
     let mut receipt = Receipt {
@@ -1296,9 +1065,11 @@ fn gate(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
         };
     let run_side = |side: &str, s: &Side, wait: Duration, out: &mut dyn Write| -> Ran {
         let cfg = side_cfg(side, s, wait);
+        if let Err(e) = side_dirs(&out_dir, side) {
+            return Ran::NotConcluded(format!("{}: {e}", out_dir.join(side).display()));
+        }
         if let (Some(c), Some(state)) = (&costs, &cfg.state) {
-            let _ = fs::create_dir_all(state)
-                .and_then(|()| fs::write(state.join("trust-costs.tsv"), c));
+            let _ = fs::write(state.join("trust-costs.tsv"), c);
         }
         let log = out_dir.join(side).join("lane.out");
         say(
@@ -1309,11 +1080,10 @@ fn gate(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
                 log.display()
             ),
         );
-        let mut file =
-            match fs::create_dir_all(out_dir.join(side)).and_then(|()| fs::File::create(&log)) {
-                Ok(f) => f,
-                Err(e) => return Ran::NotConcluded(format!("{}: {e}", log.display())),
-            };
+        let mut file = match fs::File::create(&log) {
+            Ok(f) => f,
+            Err(e) => return Ran::NotConcluded(format!("{}: {e}", log.display())),
+        };
         let outcome = trust_lane::run(&cfg, &mut file);
         let concluded = fs::read_to_string(plan_of(side))
             .ok()
@@ -1414,6 +1184,41 @@ fn gate(repo: &Path, args: &Args, out: &mut dyn Write) -> i32 {
     )
 }
 
+/// Make the receipts root `gate_root` as `targo trust` admits it under any umask
+/// ([`trust_lane::owner_dirs`]: the default `--out` lies under it, so a `0775` one would
+/// refuse every side's target root), take the host's one-measurement `lock`, then make the
+/// runs' directory ([`private_out`]).
+///
+/// # Errors
+/// Another gate holds the lock, or the runs' directory cannot be made.
+pub(crate) fn gate_dirs(
+    gate_root: &Path,
+    lock: &Path,
+    out_dir: &Path,
+) -> Result<trust_lane::RunLock, String> {
+    // Best effort: `private_out` makes what --out needs either way.
+    let _ = trust_lane::owner_dirs(gate_root);
+    let held = trust_lane::RunLock::take(lock, "one measurement at a time on this host")?;
+    private_out(out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
+    Ok(held)
+}
+
+/// Make the runs' directory, the operator's alone (`0700`: its plans and receipt decide a
+/// publish), and each missing directory above it as `targo trust` admits them under any
+/// umask ([`trust_lane::owner_dirs`]): each side's target root lies under it.
+fn private_out(out_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    trust_lane::owner_dirs(out_dir)?;
+    fs::set_permissions(out_dir, fs::Permissions::from_mode(0o700))
+}
+
+/// Make one side's directory under the runs' and its lane `state/`, as `targo trust`
+/// admits them under any umask: the side's target root is `<out>/<side>/target`, and a
+/// login's umask `002` would make a plain `create_dir_all`'s `0775`.
+pub(crate) fn side_dirs(out_dir: &Path, side: &str) -> std::io::Result<()> {
+    trust_lane::owner_dirs(&out_dir.join(side).join("state"))
+}
+
 /// The clone's own lane state (its cost history), where a plain `trust run` keeps it.
 fn state_dir_of_clone(repo: &Path) -> PathBuf {
     crate::ledger::git_ok(
@@ -1457,144 +1262,9 @@ fn hostname() -> String {
 mod tests {
     use super::*;
 
-    struct Repo {
-        head_contains: Vec<&'static str>,
-        ledgers: BTreeMap<&'static str, &'static str>,
-    }
-
-    impl Aterm for Repo {
-        fn contains(&self, commit: &str) -> bool {
-            self.head_contains.contains(&commit)
-        }
-        fn ledger_sha(&self, rev: &str) -> Option<String> {
-            self.ledgers.get(rev).map(|s| (*s).to_string())
-        }
-    }
-
     const ROOT: &str = "a519d423f47ff6fb19d505012f210f13ad39f2f6f31cb3c3af5aff508551d0b2";
     const SEAL: &str = "5ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea15ea1";
     const AT: &str = "36b2c3df36eac4971b8189da9967ab7cc442bbf2";
-
-    fn pass() -> Receipt {
-        let mut r = Receipt::parse(&format!(
-            "{RECEIPT_MAGIC}\nverdict PASS\nexit 0\nmode run\ncandidate-tree-root {ROOT}\n\
-             candidate-prover {ROOT}\nbase-from published (public index 68 on alabsystems/aterm)\n\
-             base-prover {SEAL}\nbase-signed-tree-root {SEAL}\n\
-             base-build 9192\ndate 2026-10-14T00:00:00Z\naterm-commit {AT}\n\
-             retractions abc /r/crates/aterm-release/trust/retractions.tsv\ncompare /o/compare.txt\n"
-        ));
-        r.fields.insert("extra".into(), "x".into());
-        r
-    }
-
-    fn repo() -> Repo {
-        Repo {
-            head_contains: vec![AT],
-            ledgers: BTreeMap::from([(AT, "abc"), ("HEAD", "abc")]),
-        }
-    }
-
-    fn now() -> i64 {
-        aterm_types::rfc3339::parse_utc("2026-10-15T00:00:00Z").unwrap()
-    }
-
-    /// A current PASS of a run that measured this toolchain against the published
-    /// build, on this aterm's history, under the ledger committed there, admits.
-    #[test]
-    fn a_current_pass_admits() {
-        assert_eq!(
-            refusals(Some(&pass()), ROOT, 9192, now(), &repo()),
-            Vec::<String>::new()
-        );
-    }
-
-    /// Each way a receipt admits nothing, one at a time.
-    #[test]
-    fn every_way_a_receipt_admits_nothing() {
-        let refused = |edit: &dyn Fn(&mut Receipt), pin: u64, at: i64, r: &Repo| {
-            let mut receipt = pass();
-            edit(&mut receipt);
-            refusals(Some(&receipt), ROOT, pin, at, r).len()
-        };
-        let set = |k: &'static str, v: &'static str| {
-            move |r: &mut Receipt| {
-                r.fields.insert(k.into(), v.into());
-            }
-        };
-        let none = |_: &mut Receipt| {};
-        assert_eq!(
-            refusals(None, ROOT, 9192, now(), &repo()).len(),
-            1,
-            "no receipt"
-        );
-        assert_eq!(
-            refused(
-                &|r| r.magic = "aterm-trust candidate-gate 1".into(),
-                9192,
-                now(),
-                &repo()
-            ),
-            1
-        );
-        assert_eq!(refused(&set("verdict", "REFUSED"), 9192, now(), &repo()), 1);
-        assert_eq!(refused(&set("exit", "1"), 9192, now(), &repo()), 1);
-        assert_eq!(refused(&set("mode", "replay"), 9192, now(), &repo()), 1);
-        assert_eq!(
-            refused(&set("candidate-prover", "other"), 9192, now(), &repo()),
-            1
-        );
-        assert_eq!(
-            refused(&set("base-from", "explicit (--base)"), 9192, now(), &repo()),
-            1
-        );
-        assert_eq!(
-            refused(&none, 9300, now(), &repo()),
-            1,
-            "the channel moved on"
-        );
-        assert_eq!(
-            refused(&set("base-prover", ROOT), 9192, now(), &repo()),
-            1,
-            "a base that is not the verified seal"
-        );
-        assert_eq!(
-            refused(&set("base-signed-tree-root", "-"), 9192, now(), &repo()),
-            1,
-            "a base bound to no verified seal"
-        );
-        let late = aterm_types::rfc3339::parse_utc("2026-10-30T00:00:00Z").unwrap();
-        assert_eq!(refused(&none, 9192, late, &repo()), 1, "too old");
-        assert_eq!(refused(&set("date", "yesterday"), 9192, now(), &repo()), 1);
-        let elsewhere = Repo {
-            head_contains: vec![],
-            ..repo()
-        };
-        assert_eq!(
-            refused(&none, 9192, now(), &elsewhere),
-            1,
-            "another history"
-        );
-        assert_eq!(
-            refused(&set("retractions", "def /x"), 9192, now(), &repo()),
-            1,
-            "a ledger by hand"
-        );
-        let moved = Repo {
-            ledgers: BTreeMap::from([(AT, "abc"), ("HEAD", "def")]),
-            ..repo()
-        };
-        assert_eq!(
-            refused(&none, 9192, now(), &moved),
-            1,
-            "the ledger changed since"
-        );
-        let unshown = Repo {
-            ledgers: BTreeMap::new(),
-            ..repo()
-        };
-        assert_eq!(refused(&none, 9192, now(), &unshown), 1);
-    }
-
     const C_COMMIT: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const B_COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const R_COMMIT: &str = "dddddddddddddddddddddddddddddddddddddddd";
@@ -1741,7 +1411,13 @@ mod tests {
             ),
             (
                 "that `targo trust` refuses",
-                Box::new(|s| s.out_refused = Some(("/tmp".into(), "mode 1777".into()))),
+                Box::new(|s| {
+                    s.out_refused = Some(trust_lane::Refused {
+                        dir: "/tmp".into(),
+                        why: "mode 1777: group- or world-writable".into(),
+                        chmod: None,
+                    });
+                }),
             ),
             (
                 "below --min-free-gib 30",
@@ -1753,9 +1429,25 @@ mod tests {
             let mut seen = seen_ok();
             edit(&mut seen);
             let got = preflight(&seen, &args);
+            assert_eq!(got.len(), 1, "{said}: {got:?}");
+        }
+        // A refused component of --out names its fix: `chmod go-w` on one of the
+        // caller's that only its mode keeps out, another directory for another owner's.
+        for (chmod, fix) in [
+            (Some("go-w"), "run: chmod go-w /home/u"),
+            (None, "give --out a directory under one you own"),
+        ] {
+            let mut seen = seen_ok();
+            seen.out_refused = Some(trust_lane::Refused {
+                dir: "/home/u".into(),
+                why: "mode 775: group- or world-writable".into(),
+                chmod,
+            });
+            let got = preflight(&seen, &args);
             assert!(
-                got.len() == 1 && got[0].contains(said),
-                "want one refusal saying {said:?}: {got:?}"
+                got.len() == 1
+                    && got[0].ends_with(&format!("(mode 775: group- or world-writable): {fix}")),
+                "{got:?}"
             );
         }
         // A base named by hand is held to nothing published, and no rows ask nothing
@@ -1765,31 +1457,6 @@ mod tests {
         by_hand.rows = 0;
         by_hand.trust_has.clear();
         assert_eq!(preflight(&by_hand, &args), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_receipt_round_trips_and_the_newest_run_governs() {
-        let d = aterm_tempfile::Builder::new()
-            .prefix("trust-candidate-receipts")
-            .tempdir()
-            .unwrap();
-        let write = |run: &str, verdict: &str, date: &str| {
-            let mut r = pass();
-            r.fields.insert("verdict".into(), verdict.into());
-            r.fields.insert("date".into(), date.into());
-            fs::create_dir_all(d.path().join(run)).unwrap();
-            fs::write(d.path().join(run).join("RECEIPT"), r.render()).unwrap();
-        };
-        write("a", "PASS", "2026-10-13T00:00:00Z");
-        write("b", "REFUSED", "2026-10-14T00:00:00Z");
-        let (_, newest) = newest_receipt(d.path(), ROOT).unwrap();
-        assert_eq!(
-            newest.get("verdict"),
-            "REFUSED",
-            "an older PASS never outlives a newer run"
-        );
-        assert_eq!(Receipt::parse(&newest.render()), newest);
-        assert!(newest_receipt(d.path(), "another").is_none());
     }
 
     #[test]
@@ -1805,42 +1472,5 @@ mod tests {
             (Some(9192), Some(ROOT.to_string()))
         );
         assert_eq!(installed_trust(""), (None, None));
-    }
-
-    #[test]
-    fn the_candidate_flags_parse_strictly() {
-        let p = |args: &[&str]| parse(&mut args.iter().copied());
-        let a = p(&["--candidate", "/s/stage", "--jobs", "2", "--no-guard"]).unwrap();
-        assert_eq!(
-            (a.dir.as_path(), a.admits, a.jobs, a.guard),
-            (Path::new("/s/stage"), false, Some(2), false)
-        );
-        let a = p(&["--admits", "/s/stage", "--base-build", "9192"]).unwrap();
-        assert_eq!((a.admits, a.base_build), (true, Some(9192)));
-        assert!(p(&[]).is_err());
-        assert!(p(&["--candidate", "/a", "--admits", "/b"]).is_err());
-        assert!(p(&["--candidate", "/a", "--base", "/b", "--base-build", "1"]).is_err());
-        assert!(p(&["--candidate", "/a", "--crate-budget", "0"]).is_err());
-        assert!(p(&["--candidate", "/a", "--replay"]).is_err());
-        let a = p(&[
-            "--candidate",
-            "/a",
-            "--guard-footprint-gib",
-            "40",
-            "--guard-level",
-            "5",
-        ])
-        .unwrap();
-        let g = guard_of(&a, 128 << 30);
-        assert_eq!(
-            (g.tree_bytes, g.swap_bytes, g.level_min, g.free_bytes),
-            (40 << 30, 8 << 30, 5, 28 << 30)
-        );
-        let d = guard_of(&p(&["--candidate", "/a"]).unwrap(), 100 << 30);
-        assert_eq!((d.tree_bytes, d.level_min), ((100 << 30) / 10 * 6, 10));
-        assert_eq!(
-            guard_of(&p(&["--candidate", "/a"]).unwrap(), 0).tree_bytes,
-            u64::MAX
-        );
     }
 }

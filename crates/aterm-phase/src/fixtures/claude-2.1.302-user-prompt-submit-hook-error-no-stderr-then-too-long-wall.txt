@@ -1,0 +1,21 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a UserPromptSubmit hook (command ./ue) that exits 1 with nothing on stderr, the request too long (the stub's too-long mode): the hook's error row, its lead row (Failed with non-blocking status code: No stderr output), then Claude Code's own wall, each a column-2 row under the person's turn
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ say nothing
+  ⎿  UserPromptSubmit hook error
+  ⎿  Failed with non-blocking status code: No stderr output
+  ⎿  Prompt is too long · the request is ~250000 tokens (limit 200000) but this conversation is only ~2811 tokens — the rest is system prompt,
+     tool definitions, and attachment content. A single-exchange conversation cannot be compacted; reduce attached files/tools or start with
+     less context. · /clear to start fresh
+
+✻ Brewed for 0s · done 10:31 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

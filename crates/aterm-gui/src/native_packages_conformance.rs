@@ -14,7 +14,8 @@
 
 #![cfg(test)]
 
-use aterm_spec::derive::{Model, native_packages_worker_model};
+use aterm_models_native::native_packages_worker_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits};
 
 use crate::packages_screen::{

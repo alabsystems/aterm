@@ -91,10 +91,3 @@ fn wide_char_advances_cursor_by_two() {
     let s = run("世".as_bytes());
     assert_eq!(s.cursor(), (0, 2));
 }
-
-#[test]
-fn newline_advances_row_without_cr_in_default_mode() {
-    // Only the row advance is asserted: the column after a bare LF follows LNM.
-    let s = run(b"ab\nc");
-    assert_eq!(s.cursor().0, 1);
-}

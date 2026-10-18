@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cold update lane retires the control socket right before its `exec`, inside the
-//! resident operator's commit permit (`App::run_cold_exec`, `control_listener::Endpoint`), and
-//! reopens it when the `exec` returns (`App::resume_after_cold_exec`). Driven over the real
-//! supervised accept loop and request lanes on a temporary socket; only the request handling is
-//! a stand-in, whose `hold` keeps its lane the way a verb waiting on the main thread does.
+//! The cold update lane retires the control socket right before its `exec`
+//! (`App::run_cold_exec`, `control_listener::Endpoint`), and reopens it when the `exec` returns
+//! (`App::resume_after_cold_exec`). Driven over the real supervised accept loop and request
+//! lanes on a temporary socket; only the request handling is a stand-in, whose `hold` keeps its
+//! lane the way a verb waiting on the main thread does.
 
 use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +17,6 @@ use aterm_uds::{CtlListener, CtlStream};
 use super::control_lanes::{LaneLimits, LaneReader, LaneService, Lanes};
 use super::{Scope, ServeDisposition, read_request_line};
 use crate::control_listener::{Endpoint, Supervisor, rebind_socket, socket_file_id};
-use crate::operator_host::ControlHandle as OperatorControl;
 
 /// How long a wait for something that must happen may take before the test
 /// calls it a hang.
@@ -61,8 +60,12 @@ impl LaneService for MainThreadVerbs {
         &self,
         _stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)> {
-        (read_request_line(reader)? == "AUTH ok").then_some((Scope::Owner, None))
+    ) -> Option<(Scope, crate::control::Principal, Option<String>)> {
+        (read_request_line(reader)? == "AUTH ok").then_some((
+            Scope::Owner,
+            crate::control::Principal::Instance,
+            None,
+        ))
     }
 
     fn serve_line(
@@ -112,10 +115,8 @@ fn assert_answers(path: &std::path::Path, what: &str) {
 }
 
 /// A client holds an authenticated connection whose verb the main thread owes while the main
-/// thread prepares the `exec`. While the operator's commit permit refuses, no `exec` runs: the
-/// held connection stays open (WouldBlock) and the socket keeps answering. Once it is granted,
-/// by the time the `exec` runs the held connection reads EOF and a new client is refused; when
-/// the `exec` returns the same path serves again.
+/// thread prepares the `exec`. By the time the `exec` runs the held connection reads EOF and a
+/// new client is refused; when the `exec` returns the same path serves again.
 ///
 /// Runs alone in its own process: a forked child holds a copy of the listening socket until it
 /// execs, so a sibling test's not-yet-exec'd child keeps a retired listener accepting. macOS has
@@ -167,24 +168,15 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     let mut app = crate::App::headless_for_test();
     app.control_endpoint = endpoint;
     app.prepare_cold_exec(7, true, false);
-
-    let (notify_tx, _notify_rx) = std::sync::mpsc::sync_channel(8);
-    let operator = OperatorControl::new("test-cold-exec-refused".to_string(), notify_tx.clone());
-    let quiesce = operator.try_begin_update_quiesce().expect("quiesce");
-    operator.begin_shutdown();
-    let refused = app.run_cold_exec(Some(&quiesce), || unreachable!("a refused permit"));
-    assert!(refused.is_err(), "the shutting-down operator refuses");
     assert_eq!(
         held_read(),
         Err(ErrorKind::WouldBlock),
-        "a refused permit leaves the held connection open"
+        "preparing the exec leaves the held connection open"
     );
-    assert_answers(&path, "a refused permit leaves the socket answering");
-    app.resume_after_cold_exec();
 
-    let operator = OperatorControl::new("test-cold-exec-granted".to_string(), notify_tx);
-    let granted = operator.try_begin_update_quiesce().expect("quiesce");
-    let exec_ran = app.run_cold_exec(Some(&granted), || {
+    let exec_ran = std::cell::Cell::new(false);
+    app.run_cold_exec(|| {
+        exec_ran.set(true);
         assert_eq!(
             held_read(),
             Ok(0),
@@ -199,7 +191,7 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
         );
         std::io::Error::from(ErrorKind::NotFound)
     });
-    assert!(exec_ran.is_ok(), "the granted permit ran the exec");
+    assert!(exec_ran.get(), "the exec ran");
 
     app.resume_after_cold_exec();
     assert_answers(&path, "the reopened socket answers");

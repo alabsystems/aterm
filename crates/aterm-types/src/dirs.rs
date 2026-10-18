@@ -51,6 +51,13 @@ fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|home| home.is_absolute())
 }
 
+/// The development seam ([`crate::dev_seam!`]) naming the file [`home_dir`]'s passwd
+/// fallback reads instead of `/etc/passwd`. A test that needs an account the file does
+/// not list (macOS keeps local accounts in Directory Services, a container may run an
+/// unlisted uid) points it at an empty file on a host whose file lists every account
+/// (Linux). A shipped binary reads `/etc/passwd` whatever the environment holds.
+pub const PASSWD_FILE_SEAM: &str = "ATERM_PASSWD_FILE";
+
 /// Parse `/etc/passwd` to find the home directory for a given UID.
 ///
 /// Byte-wise (`fs::read`, not `read_to_string`): `/etc/passwd` is Unix
@@ -60,8 +67,15 @@ fn home_from_env(value: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
 /// stray legacy byte in another user's GECOS field cannot fail the lookup.
 #[cfg(unix)]
 fn passwd_home_dir(uid: u32) -> Option<PathBuf> {
-    let contents = std::fs::read("/etc/passwd").ok()?;
+    let contents = std::fs::read(passwd_file()).ok()?;
     home_from_passwd(&contents, uid)
+}
+
+/// The account file [`passwd_home_dir`] reads: `/etc/passwd`, or in a development build
+/// the file [`PASSWD_FILE_SEAM`] names when it is set.
+#[cfg(unix)]
+fn passwd_file() -> PathBuf {
+    crate::dev_seam!(PASSWD_FILE_SEAM).map_or_else(|| PathBuf::from("/etc/passwd"), PathBuf::from)
 }
 
 /// Testable helper: extract home dir for `uid` from passwd-format bytes.
@@ -292,9 +306,8 @@ pub fn runs_under_private_state_root() -> bool {
 }
 
 /// aterm's own STATE root — where it keeps what it owns across launches (the
-/// operator profiles, the document journal, the session identities). ONE rule,
-/// the one `aterm_agent::operator::default_state_root` and the GUI's document
-/// journal already follow, so every state reader agrees on the directory:
+/// harness state, the document journal, the session identities). ONE rule, so
+/// every state reader agrees on the directory:
 ///
 /// - in a development build only, the `ATERM_STATE_HOME` seam
 ///   ([`crate::dev_seam!`], absolute; a relative value is refused as `None`,
@@ -792,7 +805,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_passwd_parsing_finds_uid() {
+    fn passwd_parsing_finds_the_uids_home() {
         let passwd = b"root:x:0:0:root:/root:/bin/bash\n\
                       nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
                       testuser:x:1000:1000:Test User:/home/testuser:/bin/zsh\n";
@@ -802,18 +815,9 @@ mod tests {
             Some(PathBuf::from("/home/testuser"))
         );
         assert_eq!(home_from_passwd(passwd, 9999), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_passwd_parsing_empty_home_returns_none() {
+        // An empty home field is no home; a malformed line is skipped.
         let passwd = ["broken:", "x", ":500:500:Broken User::/bin/sh\n"].concat();
         assert_eq!(home_from_passwd(passwd.as_bytes(), 500), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_passwd_parsing_malformed_lines_skipped() {
         let passwd = b"short:x\n\
                       valid:x:42:42:User:/home/valid:/bin/sh\n\
                       \n";

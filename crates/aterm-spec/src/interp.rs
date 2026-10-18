@@ -1364,58 +1364,7 @@ pub fn pick(m: &Model, state: &State, action: &str, var: &str, value: i64) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::derive::{config_catalog_snapshot_model, ring_model, subscribe_model};
-
-    /// `fired_actions` is the reachability question the strict-vacuity
-    /// dead-action audit asks: at the committed config the Buggy-guarded
-    /// mutants are dead; at `Buggy = 1` they fire.
-    #[test]
-    fn fired_actions_separates_committed_dead_mutants_from_buggy_live_ones() {
-        let m = config_catalog_snapshot_model();
-        let fired0 = fired_actions(&with_buggy(&m, 0));
-        assert!(fired0.contains("AdmitPatch"));
-        assert!(fired0.contains("PublishOne"));
-        assert!(!fired0.contains("AdmitStaleTrail"));
-        assert!(!fired0.contains("AdmitStaleKitty"));
-        assert!(!fired0.contains("AdmitStaleTheme"));
-        assert!(!fired0.contains("AdmitStaleSparkle"));
-        assert!(!fired0.contains("PublishLiveUnadmitted"));
-        let fired1 = fired_actions(&with_buggy(&m, 1));
-        assert!(fired1.contains("AdmitStaleTrail"));
-        assert!(fired1.contains("AdmitStaleKitty"));
-        assert!(fired1.contains("AdmitStaleTheme"));
-        assert!(fired1.contains("AdmitStaleSparkle"));
-        assert!(fired1.contains("PublishLiveUnadmitted"));
-    }
-
-    /// `admits` accepts a real ring transition and rejects two corrupted ones.
-    #[test]
-    fn admits_is_a_real_conformance_check() {
-        let m = ring_model();
-        let prev = m.init_state();
-        // The canonical successor of some enabled action is admitted...
-        let (a, next) = m
-            .actions
-            .iter()
-            .find_map(|a| {
-                m.successors(a.name, &prev)
-                    .into_iter()
-                    .next()
-                    .map(|s| (a.name, s))
-            })
-            .expect("ring Init has an enabled action");
-        assert_eq!(admits(&m, &prev, &next), Some(a));
-        // ...and a corrupted target is rejected.
-        let mut bad = next.clone();
-        for v in bad.values_mut() {
-            *v += 7;
-        }
-        assert_eq!(
-            admits(&m, &prev, &bad),
-            None,
-            "corrupted transition must not conform"
-        );
-    }
+    use crate::test_models::{config_catalog_snapshot_model, ring_model, subscribe_model};
 
     // ---- find_nonprogress_cycle: the livelock checker, on toy models ----
 
@@ -1890,7 +1839,7 @@ mod tests {
     /// test below covers `\A`.)
     #[test]
     fn compiled_walks_are_the_by_name_walks_on_committed_models() {
-        use crate::derive::{
+        use crate::test_models::{
             native_update_status_reconciliation_model, pane_tree_model, tab_nav_model,
         };
         for m in [

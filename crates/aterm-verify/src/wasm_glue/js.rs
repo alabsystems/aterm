@@ -38,7 +38,7 @@ use super::wasm::FuncType;
 
 /// Which module system the glue is written for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Flavor {
+pub enum Flavor {
     /// An ES module with `init()`/`initSync()` (wasm-bindgen's `--target web`).
     Web,
     /// A CommonJS module that loads `<stem>_bg.wasm` beside it at `require`
@@ -62,6 +62,11 @@ struct Needs {
     get_string: bool,
     ret_slot: bool,
     data_view: bool,
+    /// The object table a JS object argument or `aterm_host.object_drop`
+    /// uses.
+    heap: bool,
+    /// The WebGL2 state the `aterm_gl` imports share.
+    gl: bool,
     /// Element suffixes (`U8`, `F64`, ..) by direction.
     pass_array: BTreeSet<&'static str>,
     get_array: BTreeSet<&'static str>,
@@ -96,7 +101,7 @@ fn ts(ty: &Ty) -> String {
         Ty::Slice(e) | Ty::Vec(e) => elem(e).1.into(),
         Ty::Option(inner) => format!("{} | undefined", ts(inner)),
         Ty::Result(ok, _) => ts(ok),
-        Ty::Class(c) => c.clone(),
+        Ty::Class(c) | Ty::JsObject(c) => c.clone(),
         _ => "number".into(),
     }
 }
@@ -221,6 +226,10 @@ impl Needs {
                 )
             }
             t if t.is_scalar() => (vec![], [n.to_string(), zero]),
+            Ty::JsObject(_) => {
+                self.heap = true;
+                (vec![], [format!("addHeapObject({n})"), zero])
+            }
             Ty::Str | Ty::String => (
                 vec![
                     format!("const ptr${i} = {};", self.pass_string_call(n)),
@@ -657,6 +666,19 @@ fn imports(needs: &mut Needs, hosts: &[Host]) -> String {
             }
             Host::PerformanceNow => t::PERFORMANCE_NOW_SHIM.to_string(),
             Host::DateNow => t::DATE_NOW_SHIM.to_string(),
+            Host::ObjectDrop => {
+                needs.heap = true;
+                t::OBJECT_DROP_SHIM.to_string()
+            }
+            Host::Gl(i) => {
+                needs.gl = true;
+                needs.heap = true;
+                needs.data_view = true;
+                for typed in super::webgl::VIEWS {
+                    needs.view(typed);
+                }
+                super::webgl::IMPORTS[i].body.to_string()
+            }
         };
         let entry = format!("        {}: {body},", js_key(name));
         match modules.iter_mut().find(|(m, _)| *m == module) {
@@ -730,6 +752,14 @@ fn helpers(needs: &mut Needs, flavor: Flavor) -> String {
     }
     if needs.is_like_none {
         out.push_str(t::IS_LIKE_NONE);
+        out.push('\n');
+    }
+    if needs.heap {
+        out.push_str(t::HEAP);
+        out.push('\n');
+    }
+    if needs.gl {
+        out.push_str(super::webgl::STATE);
         out.push('\n');
     }
     for s in needs.pass_array.clone() {
@@ -807,4 +837,160 @@ fn raw_ts(ty: &FuncType) -> String {
         many => format!("[{}]", many.iter().map(one).collect::<Vec<_>>().join(", ")),
     };
     format!("({}) => {ret}", params.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::wasm_glue::model::Host;
+    use crate::wasm_glue::webgl;
+
+    /// The GL import at `name` in the table.
+    fn gl(name: &str) -> Host {
+        Host::Gl(
+            webgl::IMPORTS
+                .iter()
+                .position(|g| g.name == name)
+                .expect("a listed import"),
+        )
+    }
+
+    /// A JS object argument is stored in the object table and crosses as its
+    /// index, typed in the `.d.ts` by the name its descriptor carries; the
+    /// `aterm_gl` imports bring the WebGL2 state and the table they read the
+    /// canvas from, and a module importing neither gets none of it.
+    #[test]
+    fn a_js_object_crosses_by_its_table_slot_and_gl_imports_bring_their_state() {
+        let init = Func {
+            kind: kind::FUNCTION,
+            js_name: "init".into(),
+            symbol: "init".into(),
+            docs: String::new(),
+            receiver: false,
+            params: vec![("canvas".into(), Ty::JsObject("HTMLCanvasElement".into()))],
+            ret: Ty::Unit,
+        };
+        let iface = Interface {
+            classes: Vec::new(),
+            functions: vec![init.clone()],
+            imports: vec![Host::ObjectDrop, gl("context_create"), gl("make_current")],
+            raw: BTreeMap::new(),
+        };
+        let g = generate(&iface, "m", Flavor::Web);
+        assert!(
+            g.js.contains("wasm.init(addHeapObject(canvas), 0);"),
+            "{}",
+            g.js
+        );
+        assert!(
+            g.dts
+                .contains("export function init(canvas: HTMLCanvasElement): void;")
+        );
+        for want in [
+            "function addHeapObject(obj)",
+            "dropObject(arg0);",
+            "const glContexts = [null];",
+            "canvas.getContext('webgl2', { antialias: false })",
+            "make_current: function(arg0)",
+            "cachedFloat32ArrayMemory0 = null;",
+        ] {
+            assert!(g.js.contains(want), "the glue lacks {want:?}");
+        }
+        let plain = Interface {
+            imports: Vec::new(),
+            functions: vec![Func {
+                params: Vec::new(),
+                ..init
+            }],
+            ..iface
+        };
+        let g = generate(&plain, "m", Flavor::Web);
+        assert!(!g.js.contains("addHeapObject") && !g.js.contains("GLctx"));
+    }
+
+    /// Actual generated imports retire only their context/program's owned
+    /// strings and uniform locations. The Node fixture supplies RAM GL and
+    /// Wasm-export mocks; no browser, GPU, Wasm engine or network is reached.
+    #[test]
+    fn context_strings_and_program_locations_retire_with_their_owner() {
+        use std::time::{Duration, Instant};
+
+        let iface = Interface {
+            classes: Vec::new(),
+            functions: vec![Func {
+                kind: kind::FUNCTION,
+                js_name: "create_context".into(),
+                symbol: "create_context".into(),
+                docs: String::new(),
+                receiver: false,
+                params: vec![("canvas".into(), Ty::JsObject("HTMLCanvasElement".into()))],
+                ret: Ty::U32,
+            }],
+            imports: std::iter::once(Host::ObjectDrop)
+                .chain(
+                    [
+                        "context_create",
+                        "context_drop",
+                        "make_current",
+                        "glGetString",
+                        "glCreateProgram",
+                        "glDeleteProgram",
+                        "glGetUniformLocation",
+                        "glUniform1i",
+                    ]
+                    .into_iter()
+                    .map(gl),
+                )
+                .collect(),
+            raw: BTreeMap::new(),
+        };
+        let generated = generate(&iface, "lifetime", Flavor::Nodejs);
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("atv-gl-life-")
+            .tempdir()
+            .expect("exclusive fixture root");
+        let glue = dir.path().join("lifetime.cjs");
+        let driver = dir.path().join("driver.cjs");
+        std::fs::write(&glue, generated.js).expect("owned generated glue");
+        std::fs::write(&driver, include_str!("../../browser/gl-lifetimes.cjs"))
+            .expect("owned driver");
+        let node = std::env::var_os("ATERM_VERIFY_TEST_NODE")
+            .map(|path| {
+                let path = std::path::PathBuf::from(path);
+                assert!(path.is_absolute(), "explicit test Node must be absolute");
+                path.into_os_string()
+            })
+            .unwrap_or_else(|| "node".into());
+        let mut cmd = aterm_uds::spawnfd::command(&node);
+        cmd.arg(&driver).arg(&glue).current_dir(dir.path());
+        let mut outputs = aterm_uds::deadline::outputs_until(
+            &mut [&mut cmd],
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let kept = dir.keep();
+        eprintln!("GL_LIFETIME_OWNED_FIXTURE_RETAINED: {}", kept.display());
+        let output = outputs
+            .pop()
+            .expect("one owned child")
+            .expect("Node fixture completed; absence is setup failure");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        print!("{stdout}");
+        eprint!("{stderr}");
+        assert!(
+            stdout.contains("GL_LIFETIME_ADMITTED_CONTROLS_REACHED"),
+            "fixture controls not reached: {stderr}"
+        );
+        assert!(
+            stdout.contains("GL_LIFETIME_RETIREMENT_CASES_REACHED"),
+            "retirement cases not reached: {stderr}"
+        );
+        assert!(
+            output.status.success() && stdout.contains("GL_LIFETIME_ALL_RETIRED"),
+            "GL_LIFETIME_RETIREMENT_MISSING: {stderr}"
+        );
+    }
 }

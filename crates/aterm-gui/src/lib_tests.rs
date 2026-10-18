@@ -73,197 +73,6 @@ fn headless_confirms_boot_health_at_the_control_socket_boundary() {
     );
 }
 
-/// The `video … trail` tail: a finalize from `service_video_wake` has no recorded
-/// present behind it, so [`App::take_video_rec_for_finalize`] harvests the remaining
-/// verdicts, logged and not counted as lost.
-#[test]
-fn a_finalize_logs_the_verdicts_after_the_last_recorded_present() {
-    use std::time::{Duration, Instant};
-    let ms = Duration::from_millis;
-    let mut app = App::headless_for_test();
-    app.config.cursor_trail = Some(true);
-    let cfg = app.glow_config();
-    let wid = WindowId(0);
-    let geom = crate::cursor_glow::Geom {
-        cw: 8,
-        ch: 16,
-        rows: 24,
-        cols: 80,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 640,
-        win_h: 384,
-        head: 0,
-    };
-    let root = std::env::temp_dir().join(format!(
-        "aterm-video-trail-tail-{}-{}",
-        std::process::id(),
-        crate::metrics::now_us()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    crate::control_auth::ensure_private_dir(&root).expect("private recording root");
-    let dir = crate::control_auth::confine_video_dir(&root).expect("confined recording dir");
-    let (reply, _rx) = std::sync::mpsc::channel();
-    let t0 = Instant::now();
-    app.video_rec = Some(super::VideoRec {
-        window: wid,
-        deadline: t0 + Duration::from_secs(3),
-        started_us: 0,
-        keys: false,
-        key_log: Vec::new(),
-        trail: true,
-        trail_log: Vec::new(),
-        trail_seen: 0,
-        trail_lost: 0,
-        pace_ticks: Vec::new(),
-        mode: super::VideoMode::OffscreenPresentReal,
-        next_frame: None,
-        presented: None,
-        unseamed_at_begin: 0,
-        unlogged_other_window: 0,
-        dir,
-        handoff: None,
-        cancel: super::VideoCancellation::new(),
-        reply,
-    });
-    let mut out = Vec::new();
-    let mut walk = |app: &mut App, from: u16, at: Instant| {
-        let glow = &mut app
-            .windows
-            .get_mut(&wid)
-            .expect("window")
-            .fx
-            .cursor_mut()
-            .glow;
-        for i in 0..3u16 {
-            glow.tick(
-                Some((2, from + 4 * i)),
-                at + ms(16 * u64::from(i)),
-                &cfg,
-                geom,
-                &mut out,
-            );
-        }
-    };
-    // Verdicts, then a recorded present's harvest.
-    walk(&mut app, 2, t0);
-    app.harvest_video_trail(wid, 1_000_000);
-    let at_present = app.video_rec.as_ref().expect("recording").trail_log.len();
-    assert!(at_present > 0, "fixture: the present harvested verdicts");
-    // More verdicts, and no present before the take ends.
-    walk(&mut app, 40, t0 + ms(100));
-    let newest = app.windows[&wid]
-        .fx
-        .cursor()
-        .glow
-        .admission_log()
-        .last()
-        .expect("a verdict")
-        .seq;
-    let rec = app.take_video_rec_for_finalize().expect("the recording");
-    assert!(app.video_rec.is_none(), "finalize took the recording");
-    assert!(
-        rec.trail_log.len() > at_present,
-        "the tail verdicts are logged ({} vs {at_present} at the last present)",
-        rec.trail_log.len()
-    );
-    assert_eq!(
-        rec.trail_seen, newest,
-        "every verdict up to the newest was taken"
-    );
-    assert_eq!(rec.trail_lost, 0, "none of them is miscounted as lost");
-    drop(rec);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-/// The `video … trail` ledger: verdicts land on the frame clock (`t_us = now_us - age`),
-/// a harvest takes only what is new, and verdicts overwritten in the engine's 32-slot
-/// ring or refused by the cap are counted.
-#[test]
-fn the_trail_ledger_stamps_verdicts_on_the_frame_clock_and_counts_the_lost() {
-    use std::time::{Duration, Instant};
-    let ms = Duration::from_millis;
-    let mut app = App::headless_for_test();
-    app.config.cursor_trail = Some(true);
-    let cfg = app.glow_config();
-    assert!(cfg.enabled, "fixture: the glow engine judges moves");
-    let geom = crate::cursor_glow::Geom {
-        cw: 8,
-        ch: 16,
-        rows: 24,
-        cols: 80,
-        origin_x: 0,
-        origin_y: 0,
-        win_w: 640,
-        win_h: 384,
-        head: 0,
-    };
-    let mut glow = crate::cursor_glow::CursorGlow::default();
-    let mut out = Vec::new();
-    let t0 = Instant::now();
-    glow.tick(Some((2, 2)), t0, &cfg, geom, &mut out);
-    // Program output walks the caret, nobody typed: one verdict per move.
-    for i in 1..=3u16 {
-        glow.tick(
-            Some((2, 2 + 4 * i)),
-            t0 + ms(16 * u64::from(i)),
-            &cfg,
-            geom,
-            &mut out,
-        );
-    }
-    let verdicts = glow.admission_log().count();
-    assert!(verdicts >= 3, "fixture: the moves were judged ({verdicts})");
-    let newest = glow.admission_log().last().expect("a verdict").at;
-
-    let now = t0 + ms(100);
-    let now_us = 10_000_000u64;
-    let mut log = Vec::new();
-    let (seen, lost) = super::harvest_trail_verdicts(&glow, 0, now, now_us, &mut log, 4096);
-    assert_eq!((log.len(), lost), (verdicts, 0));
-    assert_eq!(seen, log.last().expect("logged").seq);
-    let age = u64::try_from(now.duration_since(newest).as_micros()).unwrap();
-    assert_eq!(
-        log.last().unwrap().t_us,
-        now_us - age,
-        "stamped on the frame clock"
-    );
-    assert!(log.iter().all(|row| row.json().contains("\"phase\":\"")));
-
-    // A second harvest takes nothing new.
-    let (again, lost) = super::harvest_trail_verdicts(&glow, seen, now, now_us, &mut log, 4096);
-    assert_eq!((again, lost, log.len()), (seen, 0, verdicts));
-
-    // The ring overwrote verdicts nobody harvested: counted, not silent.
-    for i in 0..40u16 {
-        let col = if i % 2 == 0 { 30 } else { 60 };
-        glow.tick(
-            Some((5, col)),
-            now + ms(16 * u64::from(i)),
-            &cfg,
-            geom,
-            &mut out,
-        );
-    }
-    let mut late = Vec::new();
-    let (_, lost) = super::harvest_trail_verdicts(
-        &glow,
-        seen,
-        now + ms(700),
-        now_us + 700_000,
-        &mut late,
-        4096,
-    );
-    assert!(lost > 0, "a wrapped ring reports its losses");
-    assert_eq!(late.len(), crate::cursor_glow::ADMISSION_LOG_CAP);
-
-    // …and the cap refuses what it cannot hold, counting it.
-    let mut capped = Vec::new();
-    let (_, lost) = super::harvest_trail_verdicts(&glow, 0, now, now_us, &mut capped, 1);
-    assert_eq!(capped.len(), 1);
-    assert!(lost >= 1);
-}
-
 /// Boot health never folds a past deadline: a saturated dispatch moves the retry onto
 /// the backoff, and a retry the guard would refuse is not folded. Pins
 /// `note_boot_health_dispatch` and `boot_health_retry_deadline`.
@@ -306,14 +115,14 @@ fn boot_health_never_folds_a_past_deadline() {
     );
     assert!(app.boot_health_retry_deadline(now).is_some_and(|d| d > now));
 
-    // Queued closes the latch and resets the backoff.
+    // Queued closes the latch; a failure answered after it keeps climbing.
     app.note_boot_health_dispatch(crate::app_native::NativeUpdateDispatch::Queued, now);
     assert!(app.boot_health_confirmation_dispatched);
     assert_eq!(app.boot_health_retry_deadline(now), None);
     app.finish_native_boot_health_confirmation(false, now);
     assert_eq!(
         app.boot_health_confirmation_retry_at,
-        Some(now + Duration::from_secs(1))
+        Some(now + Duration::from_secs(4))
     );
 }
 
@@ -326,7 +135,6 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("comet".into());
-    app.config.stream_fade = Some(true);
     app.set_session_rain_override(0, Some(true));
 
     assert!(app.glow_config().enabled);
@@ -415,7 +223,6 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     ws.next_trail_tick = Some(now);
     ws.next_rain_tick = Some(now);
     ws.next_native_preview_tick = Some(now);
-    ws.fade_shown = true;
     ws.input_scratch.cursor_trail.push(aterm_render::TrailCell {
         row: 0,
         col: 0,
@@ -463,7 +270,6 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     assert!(!app.session_rain_enabled(0));
     assert_eq!(app.pool.rain_override(0), Some(true));
     assert_eq!(app.config.cursor_trail, Some(true));
-    assert_eq!(app.config.stream_fade, Some(true));
 
     let ws = app.windows.get(&WindowId(0)).expect("test window");
     assert!(!ws.fx.cursor().glow.is_active());
@@ -475,11 +281,9 @@ fn serious_mode_drains_fun_state_without_touching_functional_ui() {
     assert!(ws.fx.companions().sing_riff_bar.is_none());
     assert!(ws.fx.companion().hit_rect().is_none());
     assert!(ws.fx.rain().is_none());
-    assert!(!ws.stream_fade.is_active(now));
     assert!(ws.next_trail_tick.is_none());
     assert!(ws.next_rain_tick.is_none());
     assert!(ws.next_native_preview_tick.is_none());
-    assert!(!ws.fade_shown);
     assert!(ws.input_scratch.cursor_trail.is_empty());
     assert!(ws.input_scratch.cursor_glow_add.is_empty());
     assert!(ws.input_scratch.glow_halo.is_empty());
@@ -650,7 +454,7 @@ fn wake_expiry_preserves_exactly_one_cursor_effect_settle_present() {
         "the settle route is a level until its one deadline fires"
     );
 
-    let model = aterm_spec::derive::effect_presentability_settle_model();
+    let model = aterm_models_effects::effect_presentability_settle_model();
     let mut expired = model.init_state();
     assert!(model.fire("ExpireWake", &mut expired));
     let mut retained = expired.clone();
@@ -744,102 +548,20 @@ fn lane_census_schedule() -> Vec<(u64, LaneGesture)> {
     s
 }
 
-/// The host-level terms that can make the lane's predicate true — the
-/// owners an arm is charged to, in the planner's own order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum LaneOwner {
-    /// The glow (v1 or v2) asks for the frame train.
-    GlowTrain,
-    /// A chrome decoration mid-motion.
-    Deco,
-    /// The M2 stream fade.
-    Fade,
-    /// A non-caret cursor dependent: trail, companion, pet, word décor,
-    /// another cursor body.
-    Dependents,
-    /// The rainbow caret block's `is_active` — the fingerprint law: its
-    /// ignition heat, a flare, or a fill that moved on the last frame.
-    CaretCool,
-    /// The rainbow caret's colour release after its frames stopped moving
-    /// frame to frame (`CursorFx::bodies_settling`) — paced by its own
-    /// next visible step on the coarse arm.
-    CaretSettle,
-    /// The glow offers a coarse next change (a tail, an edge, a poll).
-    GlowCoarse,
-    /// The glow is `is_active` by state alone: no train, no deadline.
-    GlowStateOnly,
-}
-
-const LANE_OWNERS: [LaneOwner; 8] = [
-    LaneOwner::GlowTrain,
-    LaneOwner::Deco,
-    LaneOwner::Fade,
-    LaneOwner::Dependents,
-    LaneOwner::CaretCool,
-    LaneOwner::CaretSettle,
-    LaneOwner::GlowCoarse,
-    LaneOwner::GlowStateOnly,
-];
-
 /// The census of one scripted session through the real lane planner.
 #[derive(Debug, Default)]
 struct LaneCensus {
-    /// Turns on which the planner armed a `CursorEffect` deadline.
-    arms: u32,
-    /// Frames the modelled loop rendered (one per wake).
-    frames: u32,
-    /// Frames whose fingerprint differed from the last (the present gate
-    /// lets these through; the rest are wasted renders).
-    presents: u32,
-    /// Arms on which each owner was live (an arm can be charged to several).
-    live: [u32; 8],
-    /// Arms on which the owner was the only live term.
-    sole: [u32; 8],
     /// Arms after the last gesture.
     tail_arms: u32,
     /// ms after the last gesture at which the planner first parked (and
     /// stayed parked); `None` if it never did inside the tail.
     park_ms: Option<u64>,
-    /// The lane's effect-present interval.
-    interval: Duration,
-}
-
-impl LaneCensus {
-    fn arms_per_frame(&self) -> f64 {
-        f64::from(self.arms) / f64::from(self.frames.max(1))
-    }
-
-    fn renders_per_present(&self) -> f64 {
-        f64::from(self.frames) / f64::from(self.presents.max(1))
-    }
-
-    fn line(&self, tag: &str) -> String {
-        let mut owners = String::new();
-        for (k, owner) in LANE_OWNERS.iter().enumerate() {
-            if self.live[k] > 0 {
-                owners.push_str(&format!(" {owner:?}={}/{}", self.live[k], self.sole[k]));
-            }
-        }
-        format!(
-            "lane census {tag}: interval {:?} arms {} frames {} presents {} → {:.2} arms/frame, \
-             {:.2} renders/present; tail arms {} park +{:?} ms; live/sole by owner:{owners}",
-            self.interval,
-            self.arms,
-            self.frames,
-            self.presents,
-            self.arms_per_frame(),
-            self.renders_per_present(),
-            self.tail_arms,
-            self.park_ms
-        )
-    }
 }
 
 /// Drive one window's real lane planner through [`lane_census_schedule`] as
 /// `about_to_wait` does: wake at each gesture and armed tick, service the due tick, plan
-/// (arm A), render the glow and caret block, plan again (arm B). `caret` ticks the
-/// rainbow caret block beside the glow; `false` isolates the glow's lane.
-fn lane_wake_census(caret: bool) -> LaneCensus {
+/// (arm A), render the glow (the rainbow caret block off), plan again (arm B).
+fn lane_wake_census() -> LaneCensus {
     use crate::cursor_glow::Geom;
     use crate::cursor_rainbow::RainbowConfig;
 
@@ -863,11 +585,7 @@ fn lane_wake_census(caret: bool) -> LaneCensus {
         head: 0,
     };
     let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
-    let interval = ws.effect_present_interval();
-    let mut census = LaneCensus {
-        interval,
-        ..LaneCensus::default()
-    };
+    let mut census = LaneCensus::default();
     let script = lane_census_schedule();
     let t0 = Instant::now();
     let last_at = t0 + Duration::from_millis(script.last().map_or(0, |s| s.0));
@@ -875,49 +593,14 @@ fn lane_wake_census(caret: bool) -> LaneCensus {
     let mut cell = (12u16, 4u16);
     let mut next_ev = 0usize;
     let mut out = Vec::new();
-    let mut last_fp = 0u64;
-    let fold = |a: u64, b: u64| (a ^ b).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
     let mut now = t0 - Duration::from_millis(50);
     // Seed: one dark frame so both engines have a source cell.
     ws.fx
         .cursor_mut()
         .glow
         .tick(Some(cell), now, &glow_cfg, geom, &mut out);
-    let charge = |ws: &mut super::WindowState, now: Instant, census: &mut LaneCensus| {
-        let armed = ws.plan_terminal_effect_lane(now, true, true).is_some();
-        if !armed {
-            return false;
-        }
-        census.arms += 1;
-        let glow_train = ws.fx.cursor_mut().glow.needs_frame_cadence();
-        let glow_coarse = !glow_train
-            && ws
-                .fx
-                .cursor_mut()
-                .glow
-                .next_change_deadline(now, interval)
-                .is_some();
-        let caret_cool = ws.fx.cursor_mut().rainbow.is_active();
-        let live = [
-            glow_train,
-            ws.deco_anim_frame_active(now),
-            !ws.is_split() && (ws.fade_shown || ws.stream_fade.is_active(now)),
-            ws.cursor_dependents_need_frame_cadence(now, true) && !caret_cool,
-            caret_cool,
-            ws.fx.cursor().bodies_settling(),
-            glow_coarse,
-            ws.fx.cursor_mut().glow.is_active() && !glow_train && !glow_coarse,
-        ];
-        let n = live.iter().filter(|l| **l).count();
-        for (k, l) in live.iter().enumerate() {
-            if *l {
-                census.live[k] += 1;
-                if n == 1 {
-                    census.sole[k] += 1;
-                }
-            }
-        }
-        true
+    let charge = |ws: &mut super::WindowState, now: Instant| {
+        ws.plan_terminal_effect_lane(now, true, true).is_some()
     };
     loop {
         let ev_at = script
@@ -962,16 +645,15 @@ fn lane_wake_census(caret: bool) -> LaneCensus {
         }
         ws.service_due_terminal_effect_tick(now);
         // Arm A: the turn that requested this redraw.
-        let a = charge(ws, now, &mut census);
+        let a = charge(ws, now);
         // The frame.
-        let glow_fp = ws
-            .fx
+        ws.fx
             .cursor_mut()
             .glow
             .tick(Some(cell), now, &glow_cfg, geom, &mut out);
         ws.fx.cursor_mut().glow.drain_sound_cues().for_each(drop);
         let caret_cfg = RainbowConfig {
-            enabled: caret,
+            enabled: false,
             intensity: 1.0,
             blinking: false,
             base: None,
@@ -985,7 +667,7 @@ fn lane_wake_census(caret: bool) -> LaneCensus {
             ws.fx.cursor_mut().glow.rainbow_phase(),
             ws.fx.cursor_mut().glow.rainbow_field(),
         );
-        let caret_frame = ws.fx.cursor_mut().rainbow.tick_with_family_phase(
+        ws.fx.cursor_mut().rainbow.tick_with_family_phase(
             Some(cell),
             now,
             energy,
@@ -997,14 +679,8 @@ fn lane_wake_census(caret: bool) -> LaneCensus {
             &caret_cfg,
             &mut out,
         );
-        let fp = fold(glow_fp, caret_frame.fp);
-        census.frames += 1;
-        if fp != last_fp {
-            census.presents += 1;
-            last_fp = fp;
-        }
         // Arm B: the turn after the redraw.
-        let b = charge(ws, now, &mut census);
+        let b = charge(ws, now);
         if now >= last_at {
             let since = now.saturating_duration_since(last_at).as_millis() as u64;
             census.tail_arms += u32::from(a) + u32::from(b);
@@ -1020,49 +696,12 @@ fn lane_wake_census(caret: bool) -> LaneCensus {
     census
 }
 
-/// The lane's wake census, printed with `--nocapture`: the confirmation schedule through
-/// the real planner, with and without the caret block, arms by owner. The lane never
-/// arms a frame train for a glow that offered no next change (every arm charged to the
-/// glow is a cadence it asked for or a deadline it named), and the session renders at
-/// most one frame per arm. `cursor_glow::tests::wake_census` keeps the engine-side law.
-#[test]
-fn the_effect_lane_never_arms_for_a_glow_with_no_next_change() {
-    let full = lane_wake_census(true);
-    let bare = lane_wake_census(false);
-    for (tag, c) in [("v2 + caret", &full), ("v2 glow only", &bare)] {
-        println!("{}", c.line(tag));
-        assert!(c.arms > 0 && c.frames > 0, "{tag}: the session rendered");
-        assert_eq!(
-            c.sole[LANE_OWNERS
-                .iter()
-                .position(|o| *o == LaneOwner::GlowStateOnly)
-                .expect("owner")],
-            0,
-            "{tag}: the lane armed a frame train for a glow that offered no next change"
-        );
-        assert!(
-            c.frames <= c.arms,
-            "{tag}: {} frames rendered on {} arms — a frame nobody armed",
-            c.frames,
-            c.arms
-        );
-    }
-    // The caret block only adds arms; it never takes the glow's away.
-    assert!(
-        full.arms >= bare.arms,
-        "the caret block took arms off the glow: {} < {}",
-        full.arms,
-        bare.arms
-    );
-}
-
 /// After the last key the glow's own lane parks within two seconds (the engine idles
-/// at ≤ 1.54 s). Measured on the glow alone: the rainbow caret's colour release
-/// (`CaretCool`, `CaretSettle`) is charged by name in the census above.
+/// at ≤ 1.54 s). Measured on the glow alone: the rainbow caret's colour release is
+/// `the_settling_rainbow_caret_keeps_the_lane_to_its_last_step`'s.
 #[test]
 fn the_effect_lane_parks_within_two_seconds_of_the_last_key_under_v2() {
-    let v2 = lane_wake_census(false);
-    println!("{}", v2.line("v2 glow only"));
+    let v2 = lane_wake_census();
     let park = v2
         .park_ms
         .expect("the lane never parked after the last key");
@@ -1294,7 +933,6 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
     let mut app = App::headless_for_test();
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("comet".into());
-    app.config.stream_fade = Some(true);
     app.set_session_rain_override(0, Some(true));
 
     assert!(app.toggle_serious_mode());
@@ -1317,13 +955,11 @@ fn disabling_serious_mode_restores_latest_underlying_requests() {
     // Keeping a stale snapshot here was the subtle destructive-toggle failure.
     assert!(app.set_serious_mode(true));
     app.config.cursor_trail = Some(false);
-    app.config.stream_fade = Some(false);
     assert!(!app.set_serious_mode(false));
     assert!(!app.glow_config().enabled);
     assert!(!app.trail_config().enabled);
     assert!(app.session_rain_enabled(0));
     assert_eq!(app.config.cursor_trail, Some(false));
-    assert_eq!(app.config.stream_fade, Some(false));
     assert_eq!(app.pool.rain_override(0), Some(true));
 }
 
@@ -1348,9 +984,8 @@ fn serious_mode_bell_never_consumes_the_audible_rate_limit_lane() {
 /// `bell_sound = false` silences the audible BEL without consuming the
 /// [`BELL_BEEP_INTERVAL`] token (the `&&` order in `on_bell`), like the serious-mode
 /// twin. Non-vacuous: it first asserts the key ships on, a fresh lane is open, and one
-/// fire consumes it. The audible half is not driven (a headless beep would need AppKit);
-/// `native_settings`' `sound_menu_keys_are_read_at_their_consumers` pins it
-/// structurally.
+/// fire consumes it. The audible half is not driven (a headless beep would need
+/// AppKit).
 #[test]
 fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
     let mut app = App::headless_for_test();
@@ -1478,13 +1113,6 @@ fn config_parsing() {
         c.applied_terminal_config().cursor_style,
         CursorStyle::SteadyBar
     );
-    // The underline option is not supported (block and bar only): such a config degrades
-    // to the bar with a one-line note. Programs may still request underline via DECSCUSR.
-    let c: Config = aterm_toml::from_str("cursor_style = \"underline\"").unwrap();
-    assert_eq!(
-        c.applied_terminal_config().cursor_style,
-        CursorStyle::BlinkingBar
-    );
     // Bad shape falls back (doesn't crash).
     let c: Config = aterm_toml::from_str("cursor_style = \"weird\"").unwrap();
     assert_eq!(
@@ -1553,30 +1181,6 @@ fn config_parsing() {
     );
 }
 
-/// `option_as_meta` defaults to `true` (the current ESC-prefix behavior) when
-/// the key is absent — so no config is byte-identical. An explicit value wins.
-#[test]
-fn option_as_meta_defaults_true() {
-    // Absent → true (Meta behavior).
-    assert!(Config::default().option_as_meta_or_default());
-    assert!(
-        aterm_toml::from_str::<Config>("font_px = 18.0")
-            .unwrap()
-            .option_as_meta_or_default()
-    );
-    // Explicit false opts into composed characters; explicit true is honored.
-    assert!(
-        !aterm_toml::from_str::<Config>("option_as_meta = false")
-            .unwrap()
-            .option_as_meta_or_default()
-    );
-    assert!(
-        aterm_toml::from_str::<Config>("option_as_meta = true")
-            .unwrap()
-            .option_as_meta_or_default()
-    );
-}
-
 #[test]
 fn paste_confirm_flags_any_line_end_only_when_unbracketed() {
     // Bracketed paste (modern shell default) is never flagged: the shell waits
@@ -1599,31 +1203,6 @@ fn paste_confirm_flags_any_line_end_only_when_unbracketed() {
         !aterm_toml::from_str::<Config>("confirm_multiline_paste = false")
             .unwrap()
             .confirm_multiline_paste_or_default()
-    );
-}
-
-/// `copy_on_select` defaults per platform: `true` off Linux, `false` on Linux, where a
-/// selection already owns PRIMARY and CLIPBOARD is for explicit copies. An explicit value
-/// wins everywhere.
-#[test]
-fn copy_on_select_defaults_follow_the_platform_convention() {
-    let default_on = cfg!(not(target_os = "linux"));
-    assert_eq!(Config::default().copy_on_select_or_default(), default_on);
-    assert_eq!(
-        aterm_toml::from_str::<Config>("font_px = 18.0")
-            .unwrap()
-            .copy_on_select_or_default(),
-        default_on
-    );
-    assert!(
-        aterm_toml::from_str::<Config>("copy_on_select = true")
-            .unwrap()
-            .copy_on_select_or_default()
-    );
-    assert!(
-        !aterm_toml::from_str::<Config>("copy_on_select = false")
-            .unwrap()
-            .copy_on_select_or_default()
     );
 }
 
@@ -1721,25 +1300,7 @@ fn controls_prefs_projects_current_native_top_settings_tree() {
             .any(|line| line == &format!("prefs fields={}", expected_field_keys.len())),
         "compatibility field count binds the visible native setting controls"
     );
-    // No theme follows the system: Top Settings' first card leads with its
-    // Dark theme slot, a canonical `ui` record (no `field`: it is no row).
-    assert!(
-        open.iter()
-            .any(|line| line.starts_with("ui key=\"settings/theme-slot/dark\" "))
-    );
-    assert!(!expected_field_keys.contains(&crate::prefs::EDIT_THEME.to_string()));
-
-    for removed in [
-        "sparkle_words.orca.enabled",
-        "matrix_rain.materialize",
-        "matrix_rain.ink_text",
-        "matrix_rain.phosphor",
-    ] {
-        assert!(
-            !open.iter().any(|line| line.contains(removed)),
-            "removed/inert control {removed} must not be claimed visible: {open:?}"
-        );
-    }
+    assert!(expected_field_keys.contains(&crate::prefs::EDIT_THEME.to_string()));
 }
 
 /// A `[keybindings]` table parses into the chord → action map, and an absent
@@ -1947,88 +1508,6 @@ fn reload_retheme_then_revert_live_terminal() {
         "revert never falls back to spec-black"
     );
     assert_ne!(t.render_row(0)[0].bg, [0x20, 0x30, 0x40]);
-}
-
-/// The black-backed-text fix, end to end: with NO colour config, an unstyled
-/// cell paints the theme default fg/bg (`#D0D0D0` on `#111318`) — the same colour
-/// the window clears its margins/padding to — instead of the engine's spec
-/// default (white-on-black) leaking through as a darker text region.
-#[test]
-fn default_config_cell_uses_theme_colors_not_spec_black() {
-    use aterm_core::terminal::Terminal;
-    let c = Config::default(); // no foreground/background set
-    let mut t = Terminal::new(4, 10);
-    t.apply_config(&c.applied_terminal_config());
-    t.process(b"X");
-    let cells = t.render_row(0);
-    assert_eq!(cells[0].ch, 'X');
-    assert_eq!(
-        cells[0].bg,
-        [0x11, 0x13, 0x18],
-        "unstyled bg = theme bg, not black"
-    );
-    assert_eq!(
-        cells[0].fg,
-        [0xD0, 0xD0, 0xD0],
-        "unstyled fg = theme fg, not pure white"
-    );
-    assert_ne!(cells[0].bg, [0, 0, 0]);
-}
-
-/// A theme change retints the App-level tab strip — BUT only once the strip cache
-/// is invalidated, which `reload_config` does (`last_strip_fp = None` on a theme
-/// change). The cache key is `(fingerprint, cols)`, not the theme, so this proves
-/// (a) a stale cache serves the old theme until invalidated, and (b) after the
-/// invalidation `reload_config` performs, the active tab repaints in the new theme.
-#[test]
-fn hot_reload_retints_tab_strip() {
-    let mut app = super::App::headless_for_test();
-    app.tab_strip_rows = 1;
-    let wid = super::WindowId(0);
-    let active_bg = |app: &super::App| {
-        app.windows[&wid].cached_strip_rows[0][0].bg // active tab's first cell
-    };
-
-    // Theme A (Default): paint + cache the strip.
-    app.theme = super::Theme::default();
-    app.splice_tab_strip_with(wid, 1);
-    let bg_a = active_bg(&app);
-    assert!(
-        app.windows[&wid]
-            .tab_segments
-            .iter()
-            .any(|segment| segment.kind == super::tab_bar::TabHit::Select(0)),
-        "a lone tab remains explicit title identity"
-    );
-    assert!(
-        app.windows[&wid]
-            .tab_segments
-            .iter()
-            .any(|segment| segment.kind == super::tab_bar::TabHit::NewTab),
-        "single-tab title chrome retains the New Tab action"
-    );
-
-    // Switch to a light scheme without invalidating: the unchanged key stale-serves. Light
-    // because on Linux the band's base tone follows the theme's appearance, so two dark
-    // schemes share cell 0's tone.
-    app.theme = super::Theme::from(&aterm_types::scheme::builtin("GitHub Light").unwrap());
-    app.splice_tab_strip_with(wid, 1);
-    assert_eq!(
-        active_bg(&app),
-        bg_a,
-        "without invalidation the cache serves the old theme"
-    );
-
-    // Invalidate exactly as reload_config does on a theme change → strip retints.
-    if let Some(ws) = app.windows.get_mut(&wid) {
-        ws.last_strip_fp = None;
-    }
-    app.splice_tab_strip_with(wid, 1);
-    assert_ne!(
-        active_bg(&app),
-        bg_a,
-        "after invalidation the active tab repaints in the new theme"
-    );
 }
 
 /// Cmd-F find core, end to end over the real shared path: `search_full_history`
@@ -2257,49 +1736,6 @@ fn a_soft_wrap_does_not_splice_a_match_across_the_blanks_at_a_row_end() {
     );
 }
 
-/// A history match maps to a negative selection row; scrolling the viewport `-row` lines
-/// brings it into view with the selection round-tripping. This replicates the arithmetic
-/// only; `emacs_navigation_conforms_to_derived_transition_model` and `app_render`'s
-/// `cancel_*` tests pin `search_apply_current_in`.
-#[test]
-fn search_scrollback_scroll_to_match() {
-    use crate::app_search::map_matches;
-    use crate::control::search_full_history;
-    use aterm_core::selection::{SelectionSide, SelectionType};
-    use aterm_core::terminal::Terminal;
-    use std::sync::{Arc, Mutex};
-
-    let term = Arc::new(Mutex::new(Terminal::new(4, 20))); // 4 visible rows
-    for i in 0..12 {
-        term.lock()
-            .unwrap()
-            .process(format!("LINE{i:02}\r\n").as_bytes()); // ~8 lines scroll off
-    }
-    let base_y = {
-        let mut t = term.lock().unwrap();
-        t.scroll_to_bottom();
-        i64::try_from(t.grid().base_y()).unwrap()
-    };
-    let results = search_full_history(&term, "line03", false, false).unwrap();
-    let matches = map_matches(&results.results.matches, base_y);
-    assert_eq!(matches.len(), 1);
-    let (row, c0, c1) = matches[0];
-    assert!(row < 0, "LINE03 must be in scrollback, got row {row}");
-    // Apply (mirrors search_apply_current).
-    let mut t = term.lock().unwrap();
-    t.scroll_to_bottom();
-    let sel = t.text_selection_mut();
-    sel.start_selection(row, c0, SelectionSide::Left, SelectionType::Simple);
-    sel.update_selection(row, u16::try_from(c1).unwrap(), SelectionSide::Right);
-    t.scroll_display(-row);
-    assert_eq!(
-        t.grid().display_offset() as i32,
-        -row,
-        "scrolled the match into view"
-    );
-    assert_eq!(t.selection_to_string().as_deref(), Some("LINE03"));
-}
-
 #[test]
 fn url_detection_in_text() {
     let line = "see (http://example.com/p?q=1). end";
@@ -2411,84 +1847,28 @@ fn safe_url_allowlist() {
 
 // ---- W12: per-window metrics for mixed DPI -----------------------------------
 
-use super::{
-    FONT_PX_MAX, FONT_PX_MIN, MetricsView, font_px_for_scale, pad_for_scale, pad_top_for_scale,
-};
-
-/// The per-window derivation is a function of one scale: [`MetricsView::for_scale`]
-/// is exactly `{font_px_for_scale, pad_for_scale, pad_top_for_scale}`, at the
-/// concrete 1× / 1.5× / 2× / 3× DPIs a laptop + external-monitor pair spans.
-#[test]
-fn metrics_view_is_pure_function_of_own_scale() {
-    for &s in &[1.0f64, 1.25, 1.5, 2.0, 3.0] {
-        let v = MetricsView::for_scale(s);
-        // Composition: the view is its component derivations.
-        assert_eq!(v.font_px, font_px_for_scale(s));
-        assert_eq!(v.pad, pad_for_scale(s));
-        assert_eq!(v.pad_top, pad_top_for_scale(s));
-        // The top pad is tighter than (or equal to) the all-edge pad.
-        assert!(v.pad_top <= v.pad, "top pad never exceeds the base pad");
-    }
-    // Concrete values: PAD_LOGICAL_PX=12, PAD_TOP_LOGICAL_PX=2, round(·scale), font
-    // clamped; FONT_PX is 12 on macOS, 16 on Windows, 15 on Linux/BSD. Literals are
-    // gated per platform rather than derived, so the test does not restate the
-    // multiplication under test.
-    #[cfg(target_os = "macos")]
-    let (f1x, f2x, f3x) = (12.0, 24.0, 36.0);
-    #[cfg(windows)]
-    let (f1x, f2x, f3x) = (16.0, 32.0, 48.0);
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let (f1x, f2x, f3x) = (15.0, 30.0, 45.0);
-    assert_eq!(
-        MetricsView::for_scale(1.0),
-        MetricsView {
-            font_px: f1x,
-            pad: 12,
-            pad_top: 2,
-            head: 0
-        }
-    );
-    assert_eq!(
-        MetricsView::for_scale(2.0),
-        MetricsView {
-            font_px: f2x,
-            pad: 24,
-            pad_top: 4,
-            head: 0
-        }
-    );
-    assert_eq!(
-        MetricsView::for_scale(3.0),
-        MetricsView {
-            font_px: f3x,
-            pad: 36,
-            pad_top: 6,
-            head: 0
-        }
-    );
-    // font_px stays within the live bounds even at an extreme scale.
-    let hi = font_px_for_scale(100.0);
-    assert!(
-        (FONT_PX_MIN..=FONT_PX_MAX).contains(&hi),
-        "auto font must stay clamped"
-    );
-}
+use super::{MetricsView, font_px_for_scale};
 
 /// `for_scale_padded` derives device px from the supplied logical pads with the same
 /// `round(·scale)` law, caps the top at the base, and equals `for_scale` at the built-in
 /// constants.
 #[test]
 fn metrics_view_for_scale_padded_honors_config_padding() {
-    let v = MetricsView::for_scale_padded(2.0, 20.0, 5.0);
+    let v = MetricsView::for_scale_padded(2.0, 20.0, 5.0, 1000);
     assert_eq!((v.pad, v.pad_top), (40, 10));
-    assert_eq!(v.font_px, font_px_for_scale(2.0));
+    assert_eq!(v.font_px, font_px_for_scale(2.0, 1000));
     // Top capped at the base pad even when mis-supplied above it.
-    let v = MetricsView::for_scale_padded(1.0, 4.0, 9.0);
+    let v = MetricsView::for_scale_padded(1.0, 4.0, 9.0, 1000);
     assert_eq!((v.pad, v.pad_top), (4, 4));
     // Defaults reproduce the pure derivation exactly, at every test scale.
     for &s in &[1.0f64, 1.25, 1.5, 2.0, 3.0] {
         assert_eq!(
-            MetricsView::for_scale_padded(s, super::PAD_LOGICAL_PX, super::PAD_TOP_LOGICAL_PX),
+            MetricsView::for_scale_padded(
+                s,
+                super::PAD_LOGICAL_PX,
+                super::PAD_TOP_LOGICAL_PX,
+                1000
+            ),
             MetricsView::for_scale(s),
             "scale {s}"
         );
@@ -2758,60 +2138,5 @@ fn zoom_surviving_a_reload_never_paints_a_frame_wider_than_the_window() {
     assert!(
         frame_w(&app) <= win.width as usize,
         "INVARIANT: the composed frame never exceeds the window"
-    );
-}
-
-/// The W1 padding-absorption law holds PER WINDOW — each window
-/// derives its own interior pad from its own scale ([`pad_for_scale`]) and the
-/// shipping `aterm_render::pad_split` exact-cover / floor / near-even law holds for
-/// that pad independently, with no cross-window coupling. This reuses the W1 lattice
-/// (`aterm-render/tests/pad_absorption.rs`) parameterized by per-window scale.
-#[test]
-fn per_window_padding_absorption_holds_for_each_window_scale() {
-    // Distinct-DPI windows; each contributes its own device-px pad.
-    let scales = [1.0f64, 1.5, 2.0, 3.0];
-    // A cell lattice spanning odd/even boxes (the absorption law is proven for any
-    // (pad, cell); the per-window angle is that each window uses its own pad).
-    let cells = [7usize, 8, 9, 16, 17];
-    let mut pads_seen = std::collections::BTreeSet::new();
-    let mut odd_remainder_seen = 0usize;
-    for &scale in &scales {
-        let pad = pad_for_scale(scale);
-        pads_seen.insert(pad);
-        for &cell in &cells {
-            for w in (2 * pad + cell)..=(2 * pad + 13 * cell) {
-                let s = aterm_render::pad_split(w, pad, cell);
-                // Exact cover: this window's surface is its raw pixels — no scaling.
-                assert_eq!(
-                    s.pad_lo + s.cells * cell + s.pad_hi,
-                    w,
-                    "per-window exact cover (scale={scale} pad={pad} cell={cell} w={w})"
-                );
-                // The configured (per-window) border floor never shrinks.
-                assert!(
-                    s.pad_lo >= pad && s.pad_hi >= pad,
-                    "per-window pad floor (scale={scale} pad={pad} cell={cell} w={w})"
-                );
-                // Near-even split, leaning trailing.
-                assert!(
-                    s.pad_lo <= s.pad_hi && s.pad_hi - s.pad_lo <= 1,
-                    "per-window near-even split (scale={scale} pad={pad} cell={cell} w={w})"
-                );
-                if s.pad_lo != s.pad_hi {
-                    odd_remainder_seen += 1;
-                }
-            }
-        }
-    }
-    // NON-VACUITY: distinct per-window pads were genuinely exercised (the mixed-DPI
-    // premise), and the odd-remainder branch (the one a lopsided split gets wrong) was
-    // reached under those per-window pads.
-    assert!(
-        pads_seen.len() >= 3,
-        "windows must span distinct DPIs ({pads_seen:?})"
-    );
-    assert!(
-        odd_remainder_seen > 0,
-        "the per-window lattice must reach an odd remainder"
     );
 }

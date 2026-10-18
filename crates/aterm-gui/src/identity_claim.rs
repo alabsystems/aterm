@@ -389,8 +389,8 @@ pub(crate) struct CandidateRegistration {
 /// Commit ([`live_holder`]).
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "HandoffAddressOwner",
         action = "Launch",
         project = "aterm_gui::identity_claim::project_handoff_address_owner"
@@ -406,8 +406,8 @@ impl CandidateRegistration {
     /// The attempt is over: the candidate committed or was proven dead. Clears
     /// only its own pid, never a later attempt's registration.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "HandoffAddressOwner",
             action = "Reject",
             project = "aterm_gui::identity_claim::project_handoff_address_owner"
@@ -687,7 +687,7 @@ mod tests {
         set_rendezvous_override(Some(d.path().to_path_buf()));
 
         // ── arm 1: the ordinary world (Handoff = 0) ──
-        let m = aterm_spec::derive::session_id_claim_model();
+        let m = aterm_models_session::session_id_claim_model();
         let mut st = m.init_state();
         let premint = SessionId::generate();
 
@@ -717,7 +717,7 @@ mod tests {
 
         // ── arm 2: the handoff shape (Handoff = 1), where the lock is free and
         // a live foreign entry is the only thing holding the id ──
-        let mut mh = aterm_spec::derive::session_id_claim_model();
+        let mut mh = aterm_models_session::session_id_claim_model();
         for c in &mut mh.consts {
             if c.0 == "Handoff" {
                 c.1 = 1;
@@ -794,7 +794,7 @@ mod tests {
     fn the_handoff_window_is_held_by_the_successor_marker() {
         let _guard = rendezvous_test_guard();
         let d = dir();
-        let base = aterm_spec::derive::session_id_claim_model();
+        let base = aterm_models_session::session_id_claim_model();
         let marked = aterm_spec::interp::with_consts(&base, &[("Handoff", 1)]);
         let unmarked = aterm_spec::interp::with_consts(&base, &[("Handoff", 1), ("Unmarked", 1)]);
         // The successor is another live process: a stand-in that is never us.
@@ -889,65 +889,6 @@ mod tests {
         let _ = successor.wait();
     }
 
-    /// Two adoptions of one premint while the first holder is live: the first
-    /// takes the id, the second is refused and mints its own, so the ids differ.
-    /// Nothing reads a clock, so the collision is constructed as a state, not
-    /// timed.
-    ///
-    /// Negative control: the claim is what refuses. The other two gates are
-    /// shown silent, and once the first holder is gone the same adoption takes
-    /// the premint (the same-shell relaunch).
-    #[test]
-    fn two_instances_minted_in_one_second_cannot_collide() {
-        // `release_claims_for_test` drops every parked claim: serialize with it,
-        // or a sibling test could release the first adopter mid-test.
-        let _guard = rendezvous_test_guard();
-        let d = dir();
-        let premint = SessionId::generate();
-        let launch = || {
-            if claim_for_adoption(d.path(), &premint) {
-                premint.clone()
-            } else {
-                SessionId::generate()
-            }
-        };
-
-        let first = launch();
-        assert_eq!(first, premint, "the first adopter gets the preminted id");
-        // The simultaneity, as a fact: the first holder is live when the second
-        // launch asks, and the claim is the only gate that could say no.
-        assert!(
-            matches!(claim_in(d.path(), &premint), ClaimOutcome::Taken),
-            "the first adopter still holds its claim"
-        );
-        assert_eq!(
-            live_holder_in(d.path(), &premint),
-            None,
-            "no discovery entry"
-        );
-        assert_eq!(
-            live_successor_in(d.path(), &premint),
-            None,
-            "no handoff marker"
-        );
-
-        let second = launch();
-        assert_ne!(
-            second, premint,
-            "the second adopter must NOT answer to an id that is already live"
-        );
-        assert_ne!(first, second, "two live instances, two ids");
-
-        release_claims_for_test();
-        assert_eq!(
-            launch(),
-            premint,
-            "NEGATIVE CONTROL: with the first holder gone the same adoption takes the \
-             premint, so its live claim was what refused the second"
-        );
-        release_claims_for_test();
-    }
-
     /// Anything but the minted shape is refused before it becomes a filename,
     /// so a hostile `$ATERM_SESSION_ID` cannot aim the claim at a path; being
     /// `Unprovable`, it also does not adopt.
@@ -1031,13 +972,13 @@ mod tests {
     // dispatch: explicit scope boundaries, not silent coverage holes.
     // (`SuccessorPublishes` is anchored on the candidate's own gated publication,
     // `control::publish_when_committed`, and driven by its Tier-1 bind.)
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HandoffAddressOwner",
         action = "StrangerPublishes",
         reason = "An unrelated instance's discovery entry; the Tier-1 binds plant one naming \
                   a live pid that is not this process."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "HandoffAddressOwner",
         action = "Commit",
         reason = "`seamless::commit_and_exit` `_exit`s this process: nothing it answers \

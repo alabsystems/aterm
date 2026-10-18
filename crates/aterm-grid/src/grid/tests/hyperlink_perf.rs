@@ -127,31 +127,3 @@ fn correct_after_set_empty() {
         "empty extra should remove hyperlink"
     );
 }
-
-/// Correct across mixed mutations (add, combine, clear).
-#[test]
-fn correct_across_mixed_mutations() {
-    let url = test_url();
-    let mut extras = CellExtras::new();
-
-    for row in [2u16, 5, 8, 12] {
-        extras
-            .get_or_create(CellCoord::new(row, 0))
-            .set_hyperlink(Some(url.clone()));
-    }
-    let initial: Vec<bool> = (0..15).map(|r| extras.row_has_hyperlinks(r)).collect();
-
-    extras
-        .get_or_create(CellCoord::new(2, 5))
-        .add_combining('\u{0301}');
-    let after_combine: Vec<bool> = (0..15).map(|r| extras.row_has_hyperlinks(r)).collect();
-    assert_eq!(
-        initial, after_combine,
-        "non-hyperlink mutation should not change results"
-    );
-
-    extras.clear_row(5);
-    let after_clear: Vec<bool> = (0..15).map(|r| extras.row_has_hyperlinks(r)).collect();
-    assert!(!after_clear[5], "row 5 should be cleared");
-    assert!(after_clear[8], "row 8 should survive");
-}

@@ -16,5 +16,9 @@ description = "Owns-correctness capabilities (ATERM_DESIGN WS-G): an UNFORGEABLE
 # every other crate's shipped code and shipped tables from naming or enabling it.
 launcher-mint = []
 
+[dev-dependencies]
+# The models its tests drive.
+aterm-models-core = { workspace = true }
+
 [lints]
 workspace = true

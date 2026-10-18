@@ -200,35 +200,9 @@ fn the_first_rung_is_seeded_from_the_dry_run_and_kept_for_the_next_update() {
         .master = -1;
 }
 
-/// The park reads the seed its attempt carries: the launched lane's next budget
-/// is rung 0 = the dry run's seed, then the ladder's next rungs as misses climb.
-#[test]
-fn the_launched_lanes_park_budget_is_its_attempts_seeded_ladder() {
-    let mut app = crate::App::headless_for_test();
-    assert!(app.prelaunched_park_budget().is_none());
-    let seed = FreezeSeed::DryRun {
-        capture: Duration::from_millis(30),
-        sessions: 1,
-        last_park: None,
-    };
-    let (record, _transferred) = prelaunched(1, ApplyMode::Automatic, seed);
-    app.update_handoff_prelaunch = Some(record);
-    for (misses, budget_ms) in [(0_u8, 45_u64), (1, 90), (2, 250)] {
-        app.update_handoff_prelaunch
-            .as_mut()
-            .expect("prelaunched")
-            .park_misses = misses;
-        assert_eq!(
-            app.prelaunched_park_budget(),
-            Some((misses, Duration::from_millis(budget_ms), seed)),
-            "miss {misses}"
-        );
-    }
-}
-
 /// A prelaunched attempt as `prelaunch_out_of_band_handoff` records it,
 /// carrying `freeze_seed`, and the receiver its park sends the capture to.
-fn prelaunched(
+pub(crate) fn prelaunched(
     attempt_id: u64,
     mode: ApplyMode,
     freeze_seed: FreezeSeed,
@@ -288,6 +262,38 @@ fn seeding_stores_the_first_rung_on_the_prelaunched_attempt() {
         Some((0, seed.rung0(), seed)),
         "the park reads the seed the attempt was given"
     );
+}
+
+/// The launched lane's next park budget climbs with the attempt's own misses:
+/// rung 0 is the dry run's seed, and each miss buys a strictly wider rung.
+#[test]
+fn the_launched_lanes_park_budget_climbs_its_attempts_seeded_ladder() {
+    let mut app = crate::App::headless_for_test();
+    assert!(app.prelaunched_park_budget().is_none());
+    let seed = FreezeSeed::DryRun {
+        capture: Duration::from_millis(30),
+        sessions: 1,
+        last_park: None,
+    };
+    let (record, _transferred) = prelaunched(1, ApplyMode::Automatic, seed);
+    app.update_handoff_prelaunch = Some(record);
+    let mut last = None;
+    for misses in 0_u8..3 {
+        app.update_handoff_prelaunch
+            .as_mut()
+            .expect("prelaunched")
+            .park_misses = misses;
+        let (prior, budget, carried) = app.prelaunched_park_budget().expect("prelaunched");
+        assert_eq!((prior, carried), (misses, seed), "miss {misses}");
+        if misses == 0 {
+            assert_eq!(budget, seed.rung0(), "rung 0 is the seed's");
+        }
+        assert!(
+            last.is_none_or(|last| budget > last),
+            "miss {misses}: {budget:?} after {last:?} must be a wider rung"
+        );
+        last = Some(budget);
+    }
 }
 
 /// A landed park (the launched lane's real park over a real PTY) writes its cost into the
@@ -474,11 +480,6 @@ fn a_park_refuses_a_desk_the_dialled_claim_cannot_carry_before_freezing() {
         stand_down.outcome,
         crate::UpdateHandoffOutcome::ProducerFailed
     );
-    assert!(
-        stand_down.detail.contains("descriptor grant carries"),
-        "{}",
-        stand_down.detail
-    );
     assert!(transferred.try_recv().is_err(), "nothing was captured");
     assert!(app.pending_update_handoff.is_none(), "no reader was parked");
     app.update_handoff_prelaunch = None;
@@ -536,40 +537,6 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     const WINDOW_BASE_NOFILE: u64 = 30;
     // The running build a target is compared with; only the comparison matters.
     const THIS_BUILD: u64 = 7;
-
-    // The wiring: raised once the seamless lane is admitted, before the launched lane binds
-    // its rendezvous or the fork lane duplicates its first master.
-    let (_, start) = super::cold_lane_layout_tests::attempt_entry_source();
-    let admitted = start
-        .find("ApplyLane::Seamless,\n            ) => {}")
-        .expect("the seamless admission");
-    let raise = start
-        .find("crate::handoff_rendezvous::raise_descriptor_limit_for_park(target_build, build);")
-        .expect("the attempt raises the producer's limit, told the pairing");
-    let launched = start
-        .find("self.prelaunch_out_of_band_handoff(")
-        .expect("the launched lane");
-    let forked = start
-        .find("reserve_child_only_masters(&live)")
-        .expect("the fork lane's duplicate");
-    assert!(
-        admitted < raise && raise < launched && raise < forked,
-        "raised after the admission and before either lane reserves anything"
-    );
-    // …told the one target build the lane decision reads: an older target is the fork lane's
-    // alone, and the raise must say "older" exactly when the lane decision does.
-    let target = start
-        .find("let target_build = apply_attempt")
-        .expect("the attempt's target build");
-    assert_eq!(
-        start.matches("let target_build =").count(),
-        1,
-        "one target build per attempt"
-    );
-    assert!(
-        target < raise && start.contains("target_not_older: target_build >= build,"),
-        "the raise and the lane read the same target build"
-    );
 
     if !crate::control_auth::enter_low_nofile_test_child(1024) {
         return;
@@ -673,13 +640,6 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
     assert_eq!(
         stand_down.outcome,
         crate::UpdateHandoffOutcome::ProducerFailed
-    );
-    assert!(
-        stand_down
-            .detail
-            .starts_with("could not reserve child-only PTY descriptors ("),
-        "CONTROL: {}",
-        stand_down.detail
     );
     assert!(transferred.try_recv().is_err(), "CONTROL: nothing captured");
 

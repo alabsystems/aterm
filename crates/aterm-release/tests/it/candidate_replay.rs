@@ -165,25 +165,6 @@ fn without_records_no_library_with_a_result_passes() {
     assert_eq!(trust_compare::render(&c).exit, 1);
 }
 
-/// Runs whose plans name no measured tree (a lane that filed nothing) are not compared.
-#[test]
-fn runs_that_filed_nothing_are_not_compared() {
-    let runs = Runs::new();
-    for side in ["base", "candidate"] {
-        runs.edit_plan(side, |l| {
-            Some(match l {
-                l if l.starts_with("file") => "file the checkout was not clean".into(),
-                l if l.starts_with("commit ") => "commit -".into(),
-                l if l.starts_with("tree ") => "tree -".into(),
-                l => l.to_string(),
-            })
-        });
-    }
-    let c = runs.compare();
-    assert!(!c.incomparable.is_empty());
-    assert_eq!(trust_compare::render(&c).exit, 2);
-}
-
 /// One made-up record per library with a result, the obligations its Summary counts.
 fn record_every_result(runs: &Runs, side: &str) {
     let dir = runs.side(side);

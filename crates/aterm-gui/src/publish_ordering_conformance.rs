@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `PublishOrdering` (`aterm_spec::derive::publish_ordering_model`,
+//! Tier-1 bind for `PublishOrdering` (`aterm_models_effects::publish_ordering_model`,
 //! published ⟹ bound): a discovery graph entry never names a socket that is not yet
 //! listening, because `proxy::sweep_stale_graph` deletes exactly such entries.
 //!
@@ -9,9 +9,10 @@
 //! `bound` is whether a dial of the socket the entry names (before it exists, the
 //! one it will name) succeeds, the liveness the sweep reads; `published` is whether
 //! its `graph/<sid>` file exists. The run drives the real bind
-//! (`bind_control_listener`), publication (`publish_discovery`, `publish_session`)
-//! and sweep for three entries: the root session's, one registered before the bind
-//! (published from the snapshot) and one registered after.
+//! (`bind_control_listener`), publication (`publish_discovery`, `publish_session`,
+//! whose queued write each step waits for) and sweep for three entries: the root
+//! session's, one registered before the bind (published from the snapshot) and one
+//! registered after.
 //!
 //! `control::spawn` needs the event loop and is not driven; its order is fixed by
 //! types: `publish_discovery` consumes the `BoundControl` only the bind produces and
@@ -25,8 +26,8 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+use aterm_models_effects::publish_ordering_model;
 use aterm_session::LaunchNonce;
-use aterm_spec::derive::publish_ordering_model;
 use aterm_spec::{interp, verify};
 
 use super::*;
@@ -118,8 +119,21 @@ struct ProcessDiscoveryReset;
 impl Drop for ProcessDiscoveryReset {
     fn drop(&mut self) {
         crate::proxy::clear_self_sock();
+        // A write queued against the test's socket lands while its mirror
+        // override still stands, never in the real control dir.
+        let _ = crate::proxy::flush_publications(aterm_spec::wait::MUST_HAPPEN);
         crate::proxy::set_mirror_dir_override(None);
     }
+}
+
+/// [`crate::proxy::publish_session`], then its queued write landed: what the
+/// next observation reads is the publication's own step.
+fn publish_session_landed(sid: &SessionId, nonce: &LaunchNonce) {
+    crate::proxy::publish_session(sid, nonce);
+    assert!(
+        crate::proxy::flush_publications(aterm_spec::wait::MUST_HAPPEN),
+        "the publication thread never answered"
+    );
 }
 
 #[test]
@@ -151,7 +165,7 @@ fn discovery_entries_are_published_only_after_the_bind() {
 
     // Before the bind: the register seam's publish must be refused — `Publish`
     // is disabled at Init, and the real entry must not appear.
-    crate::proxy::publish_session(&early.sid, &early.nonce);
+    publish_session_landed(&early.sid, &early.nonce);
     for e in &mut entries {
         assert!(!model.action_enabled("Publish", &e.state));
         e.observe(&sock_dir, &sock_path, "Publish");
@@ -172,7 +186,7 @@ fn discovery_entries_are_published_only_after_the_bind() {
         e.observe(&sock_dir, &sock_path, "Publish");
     }
     // A session registered after the bind publishes itself.
-    crate::proxy::publish_session(&late.sid, &late.nonce);
+    publish_session_landed(&late.sid, &late.nonce);
     for e in &mut entries {
         e.observe(&sock_dir, &sock_path, "Publish");
     }
@@ -191,6 +205,69 @@ fn discovery_entries_are_published_only_after_the_bind() {
     }
 
     drop(listener);
+}
+
+/// THE STORE IS LET GO BEFORE THE DISK (LAG-5): `publish_discovery` writes the
+/// snapshot's entries with the session store released, so a main-thread
+/// `store.write()` (a registration, the harness posture) never waits on a graph
+/// write a volume-wide flush is holding. A FIFO where the early session's
+/// mirror entry goes holds that write open until a reader comes; its own
+/// entry, written just before, says the publisher is in the loop. The store's
+/// write lock is free meanwhile. NEGATIVE CONTROL: the snapshot taken in the
+/// `for` header kept its read guard for the whole loop, and `try_write` failed.
+#[cfg(unix)]
+#[test]
+fn the_snapshot_entries_are_written_with_the_store_let_go() {
+    let _guard = crate::proxy::self_sock_test_guard();
+    let mirror = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    crate::proxy::set_mirror_dir_override(Some(mirror.path().to_path_buf()));
+    crate::proxy::clear_self_sock();
+    let _reset = ProcessDiscoveryReset;
+
+    let (_dir, plan) = fixture();
+    let sock_dir = control_auth::dir_of_socket(&plan.sock_path);
+    let store: Store = Arc::new(RwLock::new(SessionStore::default()));
+    let early = test_handle(1);
+    store
+        .write()
+        .unwrap_or_else(|p| p.into_inner())
+        .register(early.clone());
+    let graph = mirror.path().join("graph");
+    control_auth::ensure_private_dir(&graph).expect("the mirror's graph dir");
+    let fifo = graph.join(early.sid.as_str());
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0, "mkfifo");
+
+    let bound = bind_control_listener(&plan, None, || false, |_| false, None)
+        .expect("bind the control socket");
+    let publishing = Arc::clone(&store);
+    let (published, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = published.send(publish_discovery(bound, None, &publishing));
+    });
+    let in_loop = aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        std::time::Duration::from_millis(1),
+        || crate::proxy::read_graph_entry(&sock_dir, &early.sid).map(|_| ()),
+    );
+    assert!(in_loop.is_some(), "the early entry was written");
+    let free = store.try_write().is_ok();
+    // A reader lets the held write through either way. Non-blocking, so the
+    // open returns whether or not the publisher's write ever opens the FIFO.
+    let reader = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("open the FIFO to read")
+    };
+    let listener = done
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the publisher finished");
+    drop((reader, listener));
+    assert!(free, "the store was held across the graph write");
 }
 
 /// An entry written before the bind, from a real state: the `Buggy = 1` step.

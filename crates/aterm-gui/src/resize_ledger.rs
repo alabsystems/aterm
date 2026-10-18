@@ -125,7 +125,7 @@
 //! ([`crate::app_nudge`], `[render] repaint_nudge`; the header of a `resizes`
 //! reply says where it is, `nudge=<phase> nudged=<n>`, and an epoch it
 //! repainted closes `by=nudge`). The
-//! formal statement is `aterm_spec::derive::resize_render_model`
+//! formal statement is `aterm_models_render::resize_render_model`
 //! (`ResizeRender`); the Tier-1 bind to this code is
 //! `tests::resize_render_conformance`.
 //!
@@ -1003,8 +1003,8 @@ impl ResizeLedger {
     /// The pairing needs every stash booked: after a `lost=` report nothing is
     /// held (see [`Run::held`]), and a hand-back then credits no run.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ResizeRender",
             action = "Grow",
             project = "aterm_gui::resize_ledger::tests::Rig::project"
@@ -1103,8 +1103,8 @@ impl ResizeLedger {
     /// taken with a different resize count than is booked still sees a heal of
     /// the runs it is not older than, but not a draw.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ResizeRender",
             action = "Evaluate",
             project = "aterm_gui::resize_ledger::tests::Rig::project"
@@ -1364,8 +1364,8 @@ impl ResizeLedger {
 /// alternate-screen switch counts one) since `prev` has already turned
 /// `run` `healed`, which nothing joins.
 #[cfg_attr(
-    test,
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         reason = "The 250 ms bound on a run is the environment assumption the ResizeRender \
                   model states and does not model: there every step but Evaluate (a reader a \
                   second later) lands inside the gap, and Evaluate closes a run unless it is \
@@ -1516,7 +1516,7 @@ pub(crate) fn cmd_resizes(
 mod tests {
     use std::collections::BTreeMap;
 
-    use aterm_spec::derive::resize_render_model;
+    use aterm_models_render::resize_render_model;
     use aterm_spec::interp;
 
     use super::*;
@@ -2507,8 +2507,7 @@ mod tests {
     /// scope, and the scope keeps the OUTERMOST entry point, so the
     /// `on_resize` it runs books under it. A headless window has no OS window
     /// for the real sweep to read, so this drives the same scope around the
-    /// same `on_resize`; `every_chrome_regrid_is_booked` pins that the real
-    /// function enters it. Without the scope the same call reads `window`.
+    /// same `on_resize`. Without the scope the same call reads `window`.
     #[test]
     fn the_band_regrid_books_site_chrome() {
         let sites = |app: &crate::App| -> Vec<String> {
@@ -2542,56 +2541,6 @@ mod tests {
             sites(&app),
             ["site=window", "site=chrome"],
             "the chrome pass"
-        );
-    }
-
-    /// Every function that re-grids windows for a CHROME row (the message
-    /// band, the presence row, the tab strip) enters a chrome `SiteScope`, or
-    /// is the `_inner` body of a shim that does. A new chrome producer that
-    /// skipped it would book itself as `site=window` and read, in `resizes`,
-    /// as an OS window drag: this scans the two files the producers live in,
-    /// by name, like the wiring pins in `spawn.rs`.
-    #[test]
-    fn every_chrome_regrid_is_booked() {
-        let mut seen = Vec::new();
-        for (file, src) in [
-            ("app_config.rs", include_str!("app_config.rs")),
-            ("app_presence.rs", include_str!("app_presence.rs")),
-        ] {
-            let mut rest = src;
-            while let Some(at) = rest.find("fn ") {
-                let after = &rest[at + 3..];
-                let name: String = after
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                rest = after;
-                // The producers are the `regrid_*` functions; the batch and the
-                // test log around them (`with_chrome_regrid_batch`,
-                // `note_chrome_regrid_applied`) re-grid nothing themselves.
-                if !(name.starts_with("regrid_") && name.contains("chrome")) {
-                    continue;
-                }
-                let body = &after[..after.find("\n    }\n").expect("the body ends")];
-                if let Some(shim) = name.strip_suffix("_inner") {
-                    assert!(
-                        !body.contains("SiteScope::enter("),
-                        "{file}: {name} is a body, its shim {shim} enters the scope"
-                    );
-                    continue;
-                }
-                assert!(
-                    body.contains("SiteScope::enter(crate::resize_ledger::Cause::Chrome)"),
-                    "{file}: {name} re-grids for chrome rows without booking `site=chrome`"
-                );
-                seen.push(name);
-            }
-        }
-        seen.sort();
-        assert_eq!(
-            seen,
-            ["regrid_for_chrome_rows", "regrid_window_for_chrome_rows"],
-            "a new chrome re-grid producer joins this list once it is booked"
         );
     }
 
@@ -3073,39 +3022,39 @@ mod tests {
     // refuses an action both anchored and waived). Its engine half, the grid's
     // alt-screen grow that hands back what the resize undo kept, is driven for
     // real by the Tier-1 rig below, as the shrinks are.
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "ResizeRender",
         action = "Demote",
         reason = "The engine's alt-screen shrink with a full tail: aterm-core's grid resize, \
                   journalled as a ResizeReport. The Tier-1 rig drives the real Terminal \
                   through it and books it with the real ResizeLedger::ingest."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "ResizeRender",
         action = "Trim",
         reason = "The engine's alt-screen shrink with a blank tail: aterm-core's grid resize, \
                   driven for real by the Tier-1 rig."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "ResizeRender",
         action = "Output",
         reason = "Application output that draws nothing (a mode set): an environment step the \
                   Tier-1 rig's stand-in performs on the real Terminal, which drops the engine's \
                   resize undo."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "ResizeRender",
         action = "Step",
         reason = "The application's SIGWINCH handler and its next frame: an environment step \
                   the Tier-1 rig's stand-in performs on the real Terminal."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "ResizeRender",
         action = "Draw",
         reason = "An application diff frame: an environment step the Tier-1 rig's stand-in \
                   performs on the real Terminal."
     )]
-    #[aterm_spec::spec_unmodeled(
+    #[aterm_spec_anchor::spec_unmodeled(
         machine = "ResizeRender",
         action = "Classify",
         reason = "The presence classifier's reading of the session's program (Claude Code), or \

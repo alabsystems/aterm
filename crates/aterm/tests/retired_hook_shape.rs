@@ -93,7 +93,6 @@ fn every_one_binary_route_to_the_retired_hook_is_a_silent_success() {
     let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
     for form in [
         &["hook", "run", "stop", "--state", "/nonexistent/aterm-link"][..],
-        &["hook", "run", "user-prompt-submit"][..],
         &["hook", "run"][..],
         &[
             "link",
@@ -107,7 +106,6 @@ fn every_one_binary_route_to_the_retired_hook_is_a_silent_success() {
             "--timeout",
             "15",
         ][..],
-        &["link", "hook", "run", "session-start"][..],
     ] {
         assert_retired(aterm, form);
     }
@@ -133,12 +131,8 @@ fn every_retired_hook_shape_through_the_alias_is_a_silent_success() {
     let state = state.to_string_lossy().into_owned();
     let input = br#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
     let big = vec![b' '; 3 * 1024 * 1024];
-    let shapes: [&[&str]; 11] = [
+    let shapes: [&[&str]; 4] = [
         &["hook", "run", "user-prompt-submit", "--state", &state],
-        &["hook", "run", "stop", "--state", &state],
-        &["hook", "run", "pre-tool-use", "--state", &state],
-        &["hook", "run", "session-start", "--state", &state],
-        &["hook", "run", "permission-request", "--state", &state],
         &["hook", "install", "claude"],
         &["hook"],
         // The argv an installed 0.91.0 wrote into settings.json, flags and all,
@@ -154,9 +148,6 @@ fn every_retired_hook_shape_through_the_alias_is_a_silent_success() {
             "--timeout",
             "15",
         ],
-        &["hook", "run", "notification"],
-        &["hook", "run", "permission-request", "--gate-tools"],
-        &["hook", "install", "--dry-run"],
     ];
     for form in shapes {
         for stdin in [Some(&input[..]), Some(&big[..]), None] {

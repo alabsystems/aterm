@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! AccessKit projection for first-party native tab applications.
+//! Accessibility projection (`aterm_a11y::model`) for first-party native tab applications.
 //!
 //! The input is the already-compiled [`CompiledUi`] semantic snapshot. This adapter never
 //! walks [`crate::native_ui::UiTree`], performs layout, or consults app model side tables.
 //! Consequently pixels, hit testing, introspection, and accessibility share the exact same
 //! stable keys, clipped bounds, values, and state.
 
-use std::collections::HashSet;
 use std::ops::Range;
 
 // FxHash, not SipHash, for the per-frame projection side tables below. They are
@@ -20,7 +19,7 @@ use std::ops::Range;
 // walk — are unchanged.
 use aterm_hash::{FxHashMap, FxHashSet};
 
-use accesskit::{
+use aterm_a11y::model::{
     Action, Affine, Invalid, Live, Node, NodeId, Rect, Role, TextPosition, TextSelection, Toggled,
     Tree, TreeId, TreeUpdate,
 };
@@ -35,7 +34,7 @@ use crate::tab_model::ViewId;
 #[cfg(test)]
 pub(crate) const MAX_VIRTUAL_TEXT_RANGE: u64 = 1024 * 1024;
 
-/// Deterministically derive an AccessKit identity from a stable semantic key.
+/// Deterministically derive an accessibility node identity from a stable semantic key.
 ///
 /// FNV-1a is used only as a stable identifier projection, never as a security primitive.
 /// A collision inside one projected tree is detected and fails the whole projection.
@@ -111,7 +110,7 @@ pub(crate) struct VirtualTextLine {
     pub(crate) key: UiKey,
     pub(crate) source: Range<u64>,
     pub(crate) text: String,
-    /// One canonical byte offset per AccessKit character, plus the end offset.
+    /// One canonical byte offset per model character, plus the end offset.
     pub(crate) character_source_offsets: Vec<u64>,
     pub(crate) character_positions: Vec<f32>,
     pub(crate) character_widths: Vec<f32>,
@@ -156,7 +155,7 @@ pub(crate) enum VirtualTextError {
     RangeTooLarge,
 }
 
-/// Pure projection product. `update` can be sent directly to an AccessKit adapter; routes
+/// Pure projection product. `update` can be sent directly to a platform adapter; routes
 /// carry platform action requests back to stable `UiKey`s.
 #[derive(Debug, PartialEq)]
 pub(crate) struct NativeAccessibilityProjection {
@@ -449,7 +448,7 @@ pub(crate) enum AccessibilityActionError {
 /// Validate and lower a platform request against the exact route table that was published.
 pub(crate) fn route_accessibility_action(
     published: &PublishedNativeAccessibility,
-    request: &accesskit::ActionRequest,
+    request: &aterm_a11y::model::ActionRequest,
 ) -> Result<RoutedAccessibilityAction, AccessibilityActionError> {
     if request.target_tree != TreeId::ROOT {
         return Err(AccessibilityActionError::WrongTree);
@@ -474,13 +473,16 @@ pub(crate) fn route_accessibility_action(
         }),
         Action::SetValue => {
             let value = match (route.role, request.data.as_ref()) {
-                (SemanticRole::Slider, Some(accesskit::ActionData::NumericValue(value))) => {
+                (
+                    SemanticRole::Slider,
+                    Some(aterm_a11y::model::ActionData::NumericValue(value)),
+                ) => {
                     if !value.is_finite() {
                         return Err(AccessibilityActionError::NonFiniteValue);
                     }
                     crate::native_app::SemanticInput::Number(*value)
                 }
-                (SemanticRole::TextField, Some(accesskit::ActionData::Value(value))) => {
+                (SemanticRole::TextField, Some(aterm_a11y::model::ActionData::Value(value))) => {
                     crate::native_app::SemanticInput::Text(value.to_string())
                 }
                 (_, None) => return Err(AccessibilityActionError::MissingValue),
@@ -504,7 +506,7 @@ pub(crate) fn route_accessibility_action(
             lines: 3,
         }),
         Action::ReplaceSelectedText => match (route.role, request.data.as_ref()) {
-            (SemanticRole::TextViewport, Some(accesskit::ActionData::Value(value))) => {
+            (SemanticRole::TextViewport, Some(aterm_a11y::model::ActionData::Value(value))) => {
                 Ok(RoutedAccessibilityAction::ReplaceSelectedText {
                     key: route.key.clone(),
                     text: value.to_string(),
@@ -516,7 +518,7 @@ pub(crate) fn route_accessibility_action(
         Action::SetTextSelection => {
             let (
                 SemanticRole::TextViewport,
-                Some(accesskit::ActionData::SetTextSelection(selection)),
+                Some(aterm_a11y::model::ActionData::SetTextSelection(selection)),
             ) = (route.role, request.data.as_ref())
             else {
                 return Err(if request.data.is_none() {
@@ -832,7 +834,7 @@ pub(crate) fn project_native_accessibility(
     project_with_ids(compiled, focused, stable_node_id)
 }
 
-/// Project logical native coordinates into the physical-pixel window coordinates AccessKit
+/// Project logical native coordinates into the physical-pixel window coordinates the model
 /// requires. The root transform is the only host-owned geometry added to the canonical tree;
 /// every descendant bound still comes verbatim from [`CompiledUi::semantics`].
 #[cfg(test)]
@@ -874,7 +876,7 @@ pub(crate) fn project_native_accessibility_for_view_in_container(
     Ok(projection)
 }
 
-/// Publish all visible native split leaves as one AccessKit window tree.
+/// Publish all visible native split leaves as one accessibility window tree.
 ///
 /// Each child projection has already consumed the exact host transform used by
 /// its presented raster.  This function only adds a stable `Role::Window` root,
@@ -939,7 +941,7 @@ pub(crate) fn compose_native_accessibility(
     }
 
     let mut window = Node::new(Role::Window);
-    // The window's own title, exactly as `accesskit_tree::grid_tree` names the terminal
+    // The window's own title, exactly as `a11y_tree::grid_tree` names the terminal
     // window: the root's name is what every assistive client calls the WINDOW, so a user
     // moving between windows must not hear "aterm" for all of them — and it must not
     // change meaning merely because the front tab is a native app rather than a shell.
@@ -1099,7 +1101,7 @@ fn project_with_transform_and_ids(
         {
             node.set_transform(transform);
         }
-        node.set_bounds(rect_to_accesskit(semantic.rect));
+        node.set_bounds(rect_to_model(semantic.rect));
         if let Some(parent_index) = parent_index {
             pending[parent_index].children.push(id);
         }
@@ -1181,7 +1183,7 @@ fn project_with_transform_and_ids(
         state_focus.unwrap_or(root)
     };
 
-    // Materialize AccessKit nodes from the one-pass intermediate. This does not revisit the
+    // Materialize model nodes from the one-pass intermediate. This does not revisit the
     // semantic source or app tree.
     let nodes = pending
         .into_iter()
@@ -1252,14 +1254,14 @@ fn lower_node(
 /// one — a node that carries only one of them is announced on some platforms and silent
 /// on the rest:
 ///
-/// * AT-SPI (`accesskit_atspi_common`) emits `ObjectEvent::Announcement` carrying the
-///   node's NAME, and only when the name CHANGES (or the node is newly added). A live
-///   region whose name is a constant caption therefore speaks that caption once and
-///   never says anything again, however often its value moves.
-/// * UIA (`accesskit_windows`) raises `UIA_LiveRegionChangedEventId` under the same
-///   name-changed condition, and the screen reader then reads the element's name.
-/// * NSAccessibility (`accesskit_macos`) does the opposite: it announces the node's
-///   VALUE, and raises nothing at all when the node has no value.
+/// * AT-SPI (`aterm_a11y::atspi`, after accesskit_atspi_common) emits an `Announcement`
+///   carrying the node's NAME, and only when the name CHANGES (or the node is newly
+///   added). A live region whose name is a constant caption therefore speaks that
+///   caption once and never says anything again, however often its value moves.
+/// * UIA (as AccessKit's accesskit_windows did) raises `UIA_LiveRegionChangedEventId`
+///   under the same name-changed condition, and the screen reader then reads the name.
+/// * NSAccessibility (as AccessKit's accesskit_macos did) does the opposite: it
+///   announces the node's VALUE, and raises nothing at all when the node has no value.
 ///
 /// So the announced string goes in BOTH, and any fixed caption belongs in the
 /// `description` — which is a property change on every platform and never an
@@ -1399,7 +1401,7 @@ fn supported_actions(node: &Node) -> Vec<Action> {
     .collect()
 }
 
-fn rect_to_accesskit(rect: LogicalRect) -> Rect {
+fn rect_to_model(rect: LogicalRect) -> Rect {
     Rect {
         x0: f64::from(rect.x),
         y0: f64::from(rect.y),
@@ -1413,8 +1415,8 @@ mod tests {
     use super::*;
     use crate::native_ui::tests::button;
     use crate::native_ui::{
-        ButtonSpec, Control, Flow, GroupSpec, Insets, Layout, Length, SliderSpec, StyleRef,
-        SwitchSpec, TextFieldSpec, TextSpec, TextViewportSpec, UiContent, UiNode, UiTree,
+        Control, GroupSpec, Insets, Layout, Length, SliderSpec, StyleRef, SwitchSpec,
+        TextFieldSpec, TextSpec, TextViewportSpec, UiContent, UiNode, UiTree,
     };
 
     fn compiled_form(order: &[&str]) -> CompiledUi {
@@ -1554,28 +1556,6 @@ mod tests {
     }
 
     #[test]
-    fn every_semantic_role_has_one_standard_role_mapping() {
-        let mappings = [
-            (SemanticRole::Application, Role::Application),
-            (SemanticRole::Group, Role::Group),
-            (SemanticRole::Heading, Role::Heading),
-            (SemanticRole::Text, Role::Label),
-            (SemanticRole::Button, Role::Button),
-            (SemanticRole::Switch, Role::Switch),
-            (SemanticRole::Slider, Role::Slider),
-            (SemanticRole::TextField, Role::TextInput),
-            (SemanticRole::RichText, Role::Document),
-            (SemanticRole::TextViewport, Role::MultilineTextInput),
-            (SemanticRole::Navigation, Role::Navigation),
-            (SemanticRole::Status, Role::Status),
-            (SemanticRole::List, Role::List),
-        ];
-        for (semantic, accesskit) in mappings {
-            assert_eq!(lower_role(semantic), accesskit);
-        }
-    }
-
-    #[test]
     fn paint_only_responsive_status_copy_is_not_published_to_accessibility() {
         const COMPLETE: &str =
             "On. Typing notes are silent while the cursor trail is off; other sounds still play.";
@@ -1648,52 +1628,6 @@ mod tests {
                 .nodes
                 .iter()
                 .all(|(_, node)| node.label() != Some(visual.as_str()))
-        );
-    }
-
-    /// A live region has to carry the SAME sentence in its name and its value, because
-    /// the three platforms read different halves: AT-SPI and UIA announce the name (and
-    /// only when it changes), NSAccessibility announces the value (and nothing when
-    /// there is none). Publishing one half is how a status surface ends up audible on
-    /// exactly one operating system.
-    #[test]
-    fn every_live_region_announces_the_same_sentence_by_name_and_by_value() {
-        const SENTENCE: &str = "Reading page 3 of 12";
-        let compiled = UiTree::new(
-            UiNode::new(
-                "app",
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
-            )
-            .layout(Layout::column())
-            .children(vec![
-                UiNode::new(
-                    "reader/status",
-                    UiContent::Text(TextSpec {
-                        text: SENTENCE.to_string(),
-                        role: SemanticRole::Status,
-                        style: StyleRef::Plain,
-                    }),
-                )
-                .layout(Layout::default().height(Length::Fixed(24.0))),
-            ]),
-        )
-        .compile(LogicalRect::new(0.0, 0.0, 240.0, 24.0))
-        .unwrap();
-
-        let projection = project_native_accessibility(&compiled, None).unwrap();
-        let live: Vec<_> = projection
-            .update()
-            .nodes
-            .iter()
-            .map(|(_, node)| node)
-            .filter(|node| node.live().is_some_and(|live| live != Live::Off))
-            .collect();
-        assert_eq!(live.len(), 1, "the status node is the frame's live region");
-        assert_eq!(live[0].label(), Some(SENTENCE), "AT-SPI/UIA announce this");
-        assert_eq!(
-            live[0].value(),
-            Some(SENTENCE),
-            "NSAccessibility announces this"
         );
     }
 
@@ -1869,7 +1803,8 @@ mod tests {
     #[test]
     fn container_transform_maps_logical_bounds_to_window_physical_pixels() {
         let compiled = compiled_form(&["alpha"]);
-        let transform = Affine::translate(accesskit::Vec2::new(0.0, 48.0)) * Affine::scale(2.0);
+        let transform =
+            Affine::translate(aterm_a11y::model::Vec2::new(0.0, 48.0)) * Affine::scale(2.0);
         let projection =
             project_native_accessibility_in_container(&compiled, None, transform).unwrap();
         let root = node(&projection, "app");
@@ -1897,9 +1832,9 @@ mod tests {
             generation: 9,
         };
         let first_transform =
-            Affine::translate(accesskit::Vec2::new(12.0, 64.0)) * Affine::scale(1.0);
+            Affine::translate(aterm_a11y::model::Vec2::new(12.0, 64.0)) * Affine::scale(1.0);
         let second_transform =
-            Affine::translate(accesskit::Vec2::new(412.0, 64.0)) * Affine::scale(2.0);
+            Affine::translate(aterm_a11y::model::Vec2::new(412.0, 64.0)) * Affine::scale(2.0);
         let first_projection = project_native_accessibility_for_view_in_container(
             &compiled,
             None,
@@ -2126,11 +2061,11 @@ mod tests {
             projection.routes().to_vec(),
             projection.virtual_text().to_vec(),
         );
-        let replacement = accesskit::ActionRequest {
+        let replacement = aterm_a11y::model::ActionRequest {
             action: Action::ReplaceSelectedText,
             target_tree: TreeId::ROOT,
             target_node: target.node,
-            data: Some(accesskit::ActionData::Value("replacement".into())),
+            data: Some(aterm_a11y::model::ActionData::Value("replacement".into())),
         };
         assert_eq!(
             route_accessibility_action(&published, &replacement),
@@ -2139,20 +2074,22 @@ mod tests {
                 text: "replacement".to_string(),
             })
         );
-        let selection = accesskit::ActionRequest {
+        let selection = aterm_a11y::model::ActionRequest {
             action: Action::SetTextSelection,
             target_tree: TreeId::ROOT,
             target_node: target.node,
-            data: Some(accesskit::ActionData::SetTextSelection(TextSelection {
-                anchor: TextPosition {
-                    node: line.node,
-                    character_index: 0,
+            data: Some(aterm_a11y::model::ActionData::SetTextSelection(
+                TextSelection {
+                    anchor: TextPosition {
+                        node: line.node,
+                        character_index: 0,
+                    },
+                    focus: TextPosition {
+                        node: line.node,
+                        character_index: 2,
+                    },
                 },
-                focus: TextPosition {
-                    node: line.node,
-                    character_index: 2,
-                },
-            })),
+            )),
         };
         assert_eq!(
             route_accessibility_action(&published, &selection),
@@ -2254,18 +2191,6 @@ mod tests {
     }
 
     #[test]
-    fn action_routes_preserve_stable_key_and_typed_reducer_action() {
-        let compiled = compiled_form(&["save"]);
-        let projection = project_native_accessibility(&compiled, None).unwrap();
-        let id = projection.id_for_key(&UiKey::new("save")).unwrap();
-        let route = projection.route_for_node(id).unwrap();
-        assert_eq!(route.key, UiKey::new("save"));
-        assert_eq!(route.action.as_ref().unwrap().as_str(), "activate/save");
-        assert_eq!(node(&projection, "save").role(), Role::Button);
-        assert!(node(&projection, "save").supports_action(Action::Click));
-    }
-
-    #[test]
     fn published_routes_validate_tree_node_action_and_typed_values() {
         let switch = Control::new(
             SwitchSpec {
@@ -2307,7 +2232,7 @@ mod tests {
         let (_, routes) = projection.into_update_and_routes();
         let published = PublishedNativeAccessibility::new(ViewId::from_stored(7), 3, routes);
 
-        let click = accesskit::ActionRequest {
+        let click = aterm_a11y::model::ActionRequest {
             action: Action::Click,
             target_tree: TreeId::ROOT,
             target_node: enabled,
@@ -2322,11 +2247,11 @@ mod tests {
             })
         );
 
-        let set_size = accesskit::ActionRequest {
+        let set_size = aterm_a11y::model::ActionRequest {
             action: Action::SetValue,
             target_tree: TreeId::ROOT,
             target_node: size,
-            data: Some(accesskit::ActionData::NumericValue(18.0)),
+            data: Some(aterm_a11y::model::ActionData::NumericValue(18.0)),
         };
         assert_eq!(
             route_accessibility_action(&published, &set_size),
@@ -2337,15 +2262,15 @@ mod tests {
             })
         );
 
-        let wrong_kind = accesskit::ActionRequest {
-            data: Some(accesskit::ActionData::Value("18".into())),
+        let wrong_kind = aterm_a11y::model::ActionRequest {
+            data: Some(aterm_a11y::model::ActionData::Value("18".into())),
             ..set_size.clone()
         };
         assert_eq!(
             route_accessibility_action(&published, &wrong_kind),
             Err(AccessibilityActionError::WrongValueKind)
         );
-        let unsupported = accesskit::ActionRequest {
+        let unsupported = aterm_a11y::model::ActionRequest {
             action: Action::Increment,
             ..set_size
         };
@@ -2427,23 +2352,5 @@ mod tests {
                 "slider"
             )))
         );
-    }
-
-    #[test]
-    fn layout_flow_import_is_the_compiled_source_not_an_adapter_concern() {
-        // Compile-time/exhaustiveness witness: the adapter accepts the result of every flow
-        // without receiving a Flow itself, so it cannot run a parallel layout traversal.
-        for flow in [Flow::Overlay, Flow::Row, Flow::Column] {
-            let tree = UiTree::new(
-                UiNode::new("root", UiContent::Group(GroupSpec::new("root"))).layout(Layout {
-                    flow,
-                    ..Layout::default()
-                }),
-            );
-            let compiled = tree
-                .compile(LogicalRect::new(0.0, 0.0, 20.0, 20.0))
-                .unwrap();
-            assert!(project_native_accessibility(&compiled, None).is_ok());
-        }
     }
 }

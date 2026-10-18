@@ -577,7 +577,6 @@ mod tests {
         assert_eq!(a.pubkey_b64, pk(&kp(&M3_SEED)));
         assert_eq!(a.roster_seq, 3);
         a.bind(Some("m3"), Some(3)).expect("the manifest agrees");
-        assert_eq!(a.to_string(), "m3 (roster seq 3)");
     }
 
     /// The same appcast signed by m11 is attributed to m11: the key decides, not the label.

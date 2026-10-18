@@ -92,6 +92,14 @@
 //!   other 91k were gone. The same drops leave one dim `— aterm dropped N
 //!   lines here …` row in the history at each cut, naming the lines missing
 //!   there now; `lines` reports `truncated=<n>` when nonzero.
+//! - `journal_resident_bytes` (summary only) — the RAM the crash-restore journal
+//!   costs this window: every page the regions of its sessions have written,
+//!   summed with no lock as each region's store counts them
+//!   (`crash_restore::resident_bytes`). Not a latency figure and not zeroed by
+//!   `metrics reset`; it falls when memory pressure sheds a history ring (the
+//!   ring's region is replaced and unmapped) and when a session closes. Each
+//!   session's own share is `status journal_bytes=`; `pressure` says what the
+//!   shed did.
 //!
 //! A driver detects lag without OS profilers: `metrics reset`, drive the workload,
 //! then `metrics` — if `slow_frames > 0`, or `max_frame_render_ms` is large, or
@@ -448,7 +456,7 @@ static SLOW_EPISODE_RESET: AtomicBool = AtomicBool::new(false);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 55;
+const DEADLINE_OWNER_SLOTS: usize = DeadlineOwner::COUNT;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -671,72 +679,113 @@ pub(crate) fn instant_at_us(stamp_us: u64) -> Option<Instant> {
         .checked_add(Duration::from_micros(stamp_us))
 }
 
-/// Stable labels for the event loop's single earliest `WaitUntil` owner.
-/// Values are stored in atomics, so keep discriminants append-only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub(crate) enum DeadlineOwner {
-    None = 0,
-    BootHealth = 1,
-    PendingReveal = 2,
-    Blink = 3,
-    BellFlash = 4,
-    CloseWarning = 5,
-    SyncHold = 6,
-    Autoscroll = 7,
-    ResizeSettle = 8,
-    PresentRetry = 9,
-    FrameCap = 10,
+/// One row per deadline owner — `Variant = discriminant => "wire label"` —
+/// generates [`DeadlineOwner`], its `from_raw` / `as_str` tables and its slot
+/// count, so a new owner is one row here. Values are stored in atomics, so
+/// keep discriminants append-only.
+macro_rules! deadline_owners {
+    ($($(#[$meta:meta])* $variant:ident = $raw:literal => $label:literal,)*) => {
+        /// Stable labels for the event loop's single earliest `WaitUntil` owner.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[repr(u64)]
+        pub(crate) enum DeadlineOwner {
+            $($(#[$meta])* $variant = $raw,)*
+        }
+
+        impl DeadlineOwner {
+            /// One past the largest discriminant: the per-owner slot count.
+            const COUNT: usize = {
+                let raws: &[usize] = &[$($raw),*];
+                let mut max = 0;
+                let mut i = 0;
+                while i < raws.len() {
+                    if raws[i] > max {
+                        max = raws[i];
+                    }
+                    i += 1;
+                }
+                max + 1
+            };
+
+            fn from_raw(raw: u64) -> Self {
+                match raw {
+                    $($raw => Self::$variant,)*
+                    _ => Self::None,
+                }
+            }
+
+            #[must_use]
+            pub(crate) const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)*
+                }
+            }
+        }
+    };
+}
+
+deadline_owners! {
+    None = 0 => "none",
+    BootHealth = 1 => "boot_health",
+    PendingReveal = 2 => "pending_reveal",
+    Blink = 3 => "blink",
+    BellFlash = 4 => "bell_flash",
+    /// Retired close-warning deadline slot (the titlebar confirm the in-window
+    /// close banner replaced). The numeric tombstone is retained because
+    /// deadline-owner discriminants are an append-only diagnostics wire contract.
+    Retired5 = 5 => "retired-5",
+    SyncHold = 6 => "sync_hold",
+    Autoscroll = 7 => "autoscroll",
+    ResizeSettle = 8 => "resize_settle",
+    PresentRetry = 9 => "present_retry",
+    FrameCap = 10 => "frame_cap",
     /// Retired bottom-HUD deadline slot. The numeric tombstone is retained because
     /// deadline-owner discriminants are an append-only diagnostics wire contract.
-    Retired11 = 11,
-    CursorEffect = 12,
-    Rain = 13,
+    Retired11 = 11 => "retired-11",
+    CursorEffect = 12 => "cursor_effect",
+    Rain = 13 => "rain",
     /// Retired Settings-card demo-tick slot. The numeric tombstone is retained
     /// because deadline-owner discriminants are an append-only diagnostics wire
     /// contract.
-    Retired14 = 14,
-    NativePreview = 15,
+    Retired14 = 14 => "retired-14",
+    NativePreview = 15 => "native_preview",
     /// Retired native Settings Diagnostics refresh slot. Preserve both the
     /// numeric value and legacy wire label for recorded-metrics compatibility.
-    RetiredNativeDiagnostics16 = 16,
-    Predictor = 17,
-    ScrollGlide = 18,
-    Overscroll = 19,
-    ScrollPill = 20,
-    WordDecorations = 21,
+    RetiredNativeDiagnostics16 = 16 => "native_diagnostics",
+    Predictor = 17 => "predictor",
+    ScrollGlide = 18 => "scroll_glide",
+    Overscroll = 19 => "overscroll",
+    ScrollPill = 20 => "scroll_pill",
+    WordDecorations = 21 => "word_decorations",
     /// Retired config-warning banner slot (its warnings are message-band rows
     /// since 2026-09-22, folded under `MessageBand`). The numeric tombstone is
     /// retained because deadline-owner discriminants are an append-only
     /// diagnostics wire contract.
-    Retired22 = 22,
-    /// Robi's tip bubble (`crate::robi_bubble::RobiBubble::deadline`): a
-    /// frame cadence through its entrance and exit ramps, one wake at the exit
-    /// boundary through the hold. Slot 23 was the retired transient notice's
-    /// (`update_notice`, the floating card whose producers are message-band
-    /// rows since 2026-09-23); the bubble is what survived of it, and the name
-    /// moved with the surface — the precedent `MessageBand` records.
-    RobiBubble = 23,
-    LevelUp = 24,
-    AutoApply = 25,
-    ReaderResume = 26,
-    UpgradeRealized = 27,
-    WakeHeal = 28,
-    Video = 29,
+    Retired22 = 22 => "retired-22",
+    /// Retired tip-bubble slot (the helper robot's speech bubble, before it the
+    /// transient notice). The numeric tombstone is retained because
+    /// deadline-owner discriminants are an append-only diagnostics wire contract.
+    Retired23 = 23 => "retired-23",
+    LevelUp = 24 => "level_up",
+    AutoApply = 25 => "auto_apply",
+    ReaderResume = 26 => "reader_resume",
+    UpgradeRealized = 27 => "upgrade_realized",
+    WakeHeal = 28 => "wake_heal",
+    Video = 29 => "video",
     /// Retired Smart Titles observation-retry slot (the `title_summary` module
     /// was removed on 2026-10-15). The numeric tombstone is retained because
     /// deadline-owner discriminants are an append-only diagnostics wire
     /// contract.
-    Retired30 = 30,
-    SessionChrome = 31,
-    TitleDrift = 32,
+    Retired30 = 30 => "retired-30",
+    SessionChrome = 31 => "session_chrome",
+    TitleDrift = 32 => "title_drift",
     /// The program cat's tenure gate (`aterm_effects::companion_look::KittyTenure`): one wake at
     /// the instant a pending claim earns or releases the cursor.
-    KittyTenure = 33,
+    KittyTenure = 33 => "kitty_tenure",
     /// The macOS access card's watch (`consent_card::CardState::next_wake`):
     /// the probe cadence while the owner may be in System Settings, the
     /// decide timeout while a verdict is awaited.
-    ConsentCard = 36,
+    ConsentCard = 36 => "consent_card",
     /// The message band (`crate::messages_host::App::messages_deadline`): ONE
     /// wake at the nearest fold, staleness cap, overflow patience or D1 shrink
     /// instant the center has armed. A live row folds nothing (its paints ride
@@ -744,7 +793,7 @@ pub(crate) enum DeadlineOwner {
     /// never wakes for it (FL-1). Slot 34 was the retired floating progress
     /// card's, then the status bars' (`status_bars`, 2026-09-07 → 2026-09-22);
     /// the name moved with the surface each time, and this is the third.
-    MessageBand = 34,
+    MessageBand = 34 => "message_band",
     /// The per-session STATUS observer (`SessionStatus::next_wake`): a candidate
     /// serving its dwell, or a Running session aging into Quiet. Split out of
     /// slot 30 (item 8; the retired `title_summary` owner, now `Retired30`)
@@ -752,20 +801,20 @@ pub(crate) enum DeadlineOwner {
     /// share one label — so the 2026-08 event-loop spin, whose producer was
     /// THIS observer, was reported as `title_summary` and cost the
     /// investigation its first hour on the wrong module.
-    SessionStatus = 35,
+    SessionStatus = 35 => "session_status",
     /// PRESENCE (`crate::presence`): the band's `since` text tick (once a
     /// second while it prints seconds, once a minute after) and the nine steps
     /// of the turn-submit ripple — armed only while a band row or a ripple is
     /// up. A quiet window folds nothing here (`presence_fp == 0`).
-    Presence = 37,
+    Presence = 37 => "presence",
     /// The late park's gate re-run (`App::try_park_for_prelaunched_successor`):
     /// a prelaunched update attempt waiting for a quiet moment to park.
     ///
     /// 38 and not 37: this and `Presence` were written against the same tree
     /// and both took the next free slot. The table is an APPEND-ONLY WIRE
-    /// CONTRACT (`every_deadline_owner_has_its_own_label_and_its_own_slot`), so
-    /// the one that reached main first keeps its number and this one moves.
-    HandoffPark = 38,
+    /// CONTRACT, so the one that reached main first keeps its number and this
+    /// one moves.
+    HandoffPark = 38 => "handoff_park",
     /// The MESSAGE BAND's MOTION (design §10.8): the frames of a live row's
     /// indicator — a sweeping comet, a gliding fill, a travelling glint, an
     /// echo — at most one per 33 ms frame (the 30 fps cap), plus the text ticks
@@ -777,19 +826,17 @@ pub(crate) enum DeadlineOwner {
     /// busy frame, which folded under `MessageBand`, retired into it — the
     /// busy comet steps on this grid — and nothing is armed while a handoff
     /// freezes the band.
-    MessageBandMotion = 39,
-    /// STRAIN (design §10.14, ruling 211): the next reading of the machine
-    /// while the strain engine is Suspect or Open — every 2 s, a sweep on every
-    /// other — and only while the `explain_heavy_load` switch is on, a focused
-    /// window's band is on screen and no reading is in flight. A calm machine,
-    /// an unfocused, occluded, minimized or headless window and a folded row
-    /// arm nothing (`crate::strain_host`).
-    SystemStrain = 40,
+    MessageBandMotion = 39 => "message_band_motion",
+    /// Retired strain-engine reading slot (the strain row, design §10.14, was
+    /// removed on 2026-10-16). The numeric tombstone is retained because
+    /// deadline-owner discriminants are an append-only diagnostics wire
+    /// contract.
+    Retired40 = 40 => "retired-40",
     /// A SESSION'S WAITS (design rulings 231–234): the next sample of a large
     /// paste on its way to a program or of a scrollback rewrap the person
     /// waits on — every 250 ms while its row is up, every second while none
     /// is — and nothing while nothing is watched (`crate::session_waits`).
-    SessionWaits = 41,
+    SessionWaits = 41 => "session_waits",
     /// The INPUT WATCH (`crate::input_stall::InputWatches`, 2026-09-24): one
     /// wake at the instant a session's oldest unread input byte turns a stall
     /// (`STALL_AFTER` old), then every `RECHECK` while a stall, a stopped job
@@ -798,14 +845,14 @@ pub(crate) enum DeadlineOwner {
     /// ends it — so an idle machine folds nothing here.
     ///
     /// 42 and not 40: this was written against a tree where 40 was free, and
-    /// main's `SystemStrain` (40) and `SessionWaits` (41) reached main first.
+    /// slot 40 (the retired strain owner) and `SessionWaits` (41) reached main first.
     /// The table is an APPEND-ONLY WIRE CONTRACT, so this one moves.
-    InputWatch = 42,
+    InputWatch = 42 => "input_watch",
     /// THE CRASH JOURNAL (`crate::crash_journal::Lane::next_wake`, PTY keeper
     /// P1): the trailing edge of a capture a change inside the write interval
     /// owes, and the end of a reopened layout's probation, when the image still
     /// carries its mark. An idle window owes neither.
-    CrashJournal = 43,
+    CrashJournal = 43 => "crash_journal",
     /// The update checker's watchdog (`crate::update_checker_watch`, plan P2-1):
     /// ONE wake at the instant the background check loop's heartbeat would go
     /// stale — twice its phase's budget past its last stamp. A healthy loop
@@ -814,19 +861,19 @@ pub(crate) enum DeadlineOwner {
     /// off, an uninstalled copy) never arms it.
     ///
     /// 44 and not 40: this was written against a tree where 40 was free, and
-    /// main's `SystemStrain` (40) through `CrashJournal` (43) reached main
+    /// slot 40 (the retired strain owner) through `CrashJournal` (43) reached main
     /// first. The table is an APPEND-ONLY WIRE CONTRACT, so this one moves.
-    UpdateChecker = 44,
+    UpdateChecker = 44 => "update_checker",
     /// THE SPLIT'S TAKE-BACK HOLD (`crate::split_regrid_hold`): one wake at
     /// the end of the quiet that withheld a collapse's grow of a pane back to
     /// its pre-split grid. Its own slot, not `ResizeSettle`'s, so the settle's
     /// same-owner heal and its attribution never mix the two.
-    SplitRegridHold = 45,
+    SplitRegridHold = 45 => "split_regrid_hold",
     /// KITTY ANIMATION PLAYBACK (`crate::kitty_animation`): one wake at the
     /// soonest frame a shown session's Kitty graphics animation has due. A
     /// still image, a stopped animation or a session no window shows arms
     /// nothing.
-    KittyAnimation = 46,
+    KittyAnimation = 46 => "kitty_animation",
     /// A RENDER EPOCH's look (`crate::resize_epoch`, 2026-09-29): ONE wake at
     /// the instant a session's open epoch (rows the engine owes its program)
     /// has waited out the risk window since its last resize, or its short retry
@@ -837,7 +884,7 @@ pub(crate) enum DeadlineOwner {
     /// 47 and not 46: this was written against a tree where 46 was free, and
     /// main's `KittyAnimation` (46) reached main first. The table is an
     /// APPEND-ONLY WIRE CONTRACT, so this one moves.
-    RenderEpoch = 47,
+    RenderEpoch = 47 => "render_epoch",
     /// The owner's debugger-access change (`debugger_access`, design
     /// `docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.4 step 4): the
     /// park's `RESULT_RECHECK` re-read while the lane `wants_poll`: the
@@ -845,26 +892,26 @@ pub(crate) enum DeadlineOwner {
     /// shared records while a read is out or due again (an unsettled read, a
     /// drift re-read). An idle lane arms nothing. 48 and not 47:
     /// main's `RenderEpoch` reached 47 first, and the table is append-only.
-    DebuggerChange = 48,
+    DebuggerChange = 48 => "debugger_change",
     /// The Developer Tools hand-over (`crate::devtools_helper`, owner ask
     /// 2026-10-15): a waiting hand-over's next look for its quiet moment, every
     /// `RECHECK_EVERY` and only while an aterm window is focused; the helper
     /// panel's turn every `PANEL_TICK` while it is up (placement, System
     /// Settings still running, one list read); and a worker's slot re-read
     /// while one is out. Nothing waiting and no panel arm nothing.
-    DevToolsHandOver = 49,
+    DevToolsHandOver = 49 => "devtools_hand_over",
     /// THE HARNESS CARD (`crate::claude_card`, design
     /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §3): a frame ahead while
     /// a card on show plays its episode, then one wake for the settled frame
     /// it owes. A settled card, and a window off screen, arm nothing. 50 and
     /// not 49: main's `DevToolsHandOver` reached 49 first, and the table is
     /// append-only.
-    ClaudeCard = 50,
+    ClaudeCard = 50 => "claude_card",
     /// A transient theme preview's TTL (`theme preview … ttl=`,
     /// `crate::control_theme`): one wake at the instant the preview reverts to
     /// the configured theme by itself. No preview arms nothing. 51 and not 50:
     /// main's `ClaudeCard` reached 50 first, and the table is append-only.
-    ThemePreview = 51,
+    ThemePreview = 51 => "theme_preview",
     /// THE SESSION LOG's settle tick (`crate::session_log::Wakes`): one wake at
     /// the instant a session's turn tracker has waited out the settle on a
     /// resting word (`aterm_slog::SETTLE_MS` after it first held), so the turn
@@ -873,141 +920,25 @@ pub(crate) enum DeadlineOwner {
     /// never slot 30's tombstone (`Retired30`), which no owner reuses. 52 and
     /// not 50: main's `ClaudeCard` and `ThemePreview` reached 50 and 51
     /// first, and the table is append-only.
-    SessionLog = 52,
+    SessionLog = 52 => "session_log",
     /// THE HARNESS'S GLASS (`crate::harness_glass`, design
     /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.3): one wake at the
     /// end of an act's label on an Autopilot chip, or at a re-read of WHAT
     /// THE HARNESS DID that Settings ▸ Harness owes. No label up and no read
     /// owed arms nothing. 53: the next free slot after `SessionLog`, and the
     /// table is append-only.
-    HarnessActs = 53,
+    HarnessActs = 53 => "harness_acts",
     /// AUTOPILOT'S TIMER (`crate::autopilot_timers`, design §9.3.6): one wake
-    /// at the earliest instant a timed Cruise lands. No timer armed arms
-    /// nothing. 54: the next free slot after `HarnessActs`.
-    AutopilotTimer = 54,
-}
-
-impl DeadlineOwner {
-    fn from_raw(raw: u64) -> Self {
-        match raw {
-            1 => Self::BootHealth,
-            2 => Self::PendingReveal,
-            3 => Self::Blink,
-            4 => Self::BellFlash,
-            5 => Self::CloseWarning,
-            6 => Self::SyncHold,
-            7 => Self::Autoscroll,
-            8 => Self::ResizeSettle,
-            9 => Self::PresentRetry,
-            10 => Self::FrameCap,
-            11 => Self::Retired11,
-            12 => Self::CursorEffect,
-            13 => Self::Rain,
-            14 => Self::Retired14,
-            15 => Self::NativePreview,
-            16 => Self::RetiredNativeDiagnostics16,
-            17 => Self::Predictor,
-            18 => Self::ScrollGlide,
-            19 => Self::Overscroll,
-            20 => Self::ScrollPill,
-            21 => Self::WordDecorations,
-            22 => Self::Retired22,
-            23 => Self::RobiBubble,
-            24 => Self::LevelUp,
-            25 => Self::AutoApply,
-            26 => Self::ReaderResume,
-            27 => Self::UpgradeRealized,
-            28 => Self::WakeHeal,
-            29 => Self::Video,
-            30 => Self::Retired30,
-            31 => Self::SessionChrome,
-            32 => Self::TitleDrift,
-            33 => Self::KittyTenure,
-            36 => Self::ConsentCard,
-            34 => Self::MessageBand,
-            35 => Self::SessionStatus,
-            37 => Self::Presence,
-            38 => Self::HandoffPark,
-            39 => Self::MessageBandMotion,
-            40 => Self::SystemStrain,
-            41 => Self::SessionWaits,
-            42 => Self::InputWatch,
-            43 => Self::CrashJournal,
-            44 => Self::UpdateChecker,
-            45 => Self::SplitRegridHold,
-            46 => Self::KittyAnimation,
-            47 => Self::RenderEpoch,
-            48 => Self::DebuggerChange,
-            49 => Self::DevToolsHandOver,
-            50 => Self::ClaudeCard,
-            51 => Self::ThemePreview,
-            52 => Self::SessionLog,
-            53 => Self::HarnessActs,
-            54 => Self::AutopilotTimer,
-            _ => Self::None,
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::BootHealth => "boot_health",
-            Self::PendingReveal => "pending_reveal",
-            Self::Blink => "blink",
-            Self::BellFlash => "bell_flash",
-            Self::CloseWarning => "close_warning",
-            Self::SyncHold => "sync_hold",
-            Self::Autoscroll => "autoscroll",
-            Self::ResizeSettle => "resize_settle",
-            Self::PresentRetry => "present_retry",
-            Self::FrameCap => "frame_cap",
-            Self::Retired11 => "retired-11",
-            Self::CursorEffect => "cursor_effect",
-            Self::Rain => "rain",
-            Self::Retired14 => "retired-14",
-            Self::NativePreview => "native_preview",
-            Self::RetiredNativeDiagnostics16 => "native_diagnostics",
-            Self::Predictor => "predictor",
-            Self::ScrollGlide => "scroll_glide",
-            Self::Overscroll => "overscroll",
-            Self::ScrollPill => "scroll_pill",
-            Self::WordDecorations => "word_decorations",
-            Self::Retired22 => "retired-22",
-            Self::RobiBubble => "robi_bubble",
-            Self::LevelUp => "level_up",
-            Self::AutoApply => "auto_apply",
-            Self::ReaderResume => "reader_resume",
-            Self::UpgradeRealized => "upgrade_realized",
-            Self::WakeHeal => "wake_heal",
-            Self::Video => "video",
-            Self::Retired30 => "retired-30",
-            Self::SessionChrome => "session_chrome",
-            Self::TitleDrift => "title_drift",
-            Self::KittyTenure => "kitty_tenure",
-            Self::ConsentCard => "consent_card",
-            Self::MessageBand => "message_band",
-            Self::SessionStatus => "session_status",
-            Self::Presence => "presence",
-            Self::HandoffPark => "handoff_park",
-            Self::MessageBandMotion => "message_band_motion",
-            Self::SystemStrain => "system_strain",
-            Self::SessionWaits => "session_waits",
-            Self::InputWatch => "input_watch",
-            Self::CrashJournal => "crash_journal",
-            Self::UpdateChecker => "update_checker",
-            Self::SplitRegridHold => "split_regrid_hold",
-            Self::KittyAnimation => "kitty_animation",
-            Self::RenderEpoch => "render_epoch",
-            Self::DebuggerChange => "debugger_change",
-            Self::DevToolsHandOver => "devtools_hand_over",
-            Self::ClaudeCard => "claude_card",
-            Self::ThemePreview => "theme_preview",
-            Self::SessionLog => "session_log",
-            Self::HarnessActs => "harness_acts",
-            Self::AutopilotTimer => "autopilot_timer",
-        }
-    }
+    /// at the earliest instant a timed Cruise lands, or at the minute an open
+    /// Autopilot menu's or Settings ▸ Harness page's `land_at` offer turns
+    /// its words (§9.3.3). No timer armed and no offer open arms nothing.
+    /// 54: the next free slot after `HarnessActs`.
+    AutopilotTimer = 54 => "autopilot_timer",
+    /// THE WARM SPARE's tick (`crate::spare`): a landing's settle, a booking's
+    /// boot grace or replacement spacing, and the slot's own deadlines (the
+    /// parked mark's second, the warm run's `T_READY`, the ages). A parked or
+    /// ready spare on an idle machine arms only its age. 55: the next free slot.
+    Spare = 55 => "spare",
 }
 
 /// Winit's reason for starting the current event-loop iteration.
@@ -1125,15 +1056,21 @@ pub(crate) fn mark_process_start() {
 /// `first_present_ns` boundary stays comparable across versions and thin GUI
 /// binaries. Dyld/process-loader work precedes this stamp and remains outside
 /// both metrics; [`process_birth_to_rust_main_ns`] measures it instead, from
-/// the wall-clock twin taken here.
+/// the boot-clock and wall-clock twins taken here.
 pub fn mark_rust_main_start() {
     let _ = RUST_MAIN_START.set(Instant::now());
+    let _ = RUST_MAIN_BOOT.set(aterm_uds::process::boot_clock_now());
     let _ = RUST_MAIN_WALL.set(SystemTime::now());
 }
 
 static RUST_MAIN_START: OnceLock<Instant> = OnceLock::new();
-/// Rust `main` on the wall clock: the kernel records a process's birth only
-/// there (`pbi_start`), so this is the one clock the two can be subtracted on.
+/// Rust `main` on the kernel's boot clock (mach ticks on Apple), the clock
+/// `ri_proc_start_abstime` records a birth on: it never steps, so the two
+/// subtract to the pre-main time whatever NTP did between them. `None` where
+/// this process cannot read that clock in the kernel's unit (Rosetta).
+static RUST_MAIN_BOOT: OnceLock<Option<aterm_uds::process::BootClock>> = OnceLock::new();
+/// Rust `main` on the wall clock, the fallback where [`RUST_MAIN_BOOT`] is
+/// `None`: the kernel's other birth record (`pbi_start`) is on that clock.
 static RUST_MAIN_WALL: OnceLock<SystemTime> = OnceLock::new();
 
 static GUI_READY_FOR_WINIT: OnceLock<Instant> = OnceLock::new();
@@ -1146,22 +1083,57 @@ static INITIAL_ATTACH_MILESTONES: OnceLock<StartupAttachMilestones> = OnceLock::
 /// `xpcproxy`, a shell's fork), a Gatekeeper hold on the exec (a quarantine
 /// prompt waits here for the person's click), dyld and page-in. An image that
 /// re-exec'd itself (the boot apply's swap) counts the image before it too:
-/// `execve` keeps the birth. `None` where the kernel keeps no wall-clock birth
-/// (off Apple), on the thin dev GUI binary (no Rust-main stamp), or when the
-/// wall clock stepped back between the two. Read at snapshot time, so the
-/// startup path pays only the one clock read in [`mark_rust_main_start`].
+/// `execve` keeps the birth. `None` off Apple (no mach timebase and no
+/// wall-clock birth), on the thin dev GUI binary (no Rust-main stamp), or when
+/// the two readings do not order. Subtracted on the boot clock (mach ticks), so a
+/// wall-clock step between birth and `main` moves nothing; a translated
+/// process, whose ticks read in another unit, falls back to the wall clock.
+/// Read at snapshot time, so the startup path pays only the clock reads in
+/// [`mark_rust_main_start`].
 pub(crate) fn process_birth_to_rust_main_ns() -> Option<u64> {
-    let main = *RUST_MAIN_WALL.get()?;
-    let birth = aterm_uds::process::read_process_birth(i32::try_from(std::process::id()).ok()?)?;
-    birth_to_main_ns(birth, main)
+    let main_wall = *RUST_MAIN_WALL.get()?;
+    let main_boot = RUST_MAIN_BOOT.get().copied().flatten();
+    let start = aterm_uds::process::read_process_start(i32::try_from(std::process::id()).ok()?)?;
+    birth_to_main_ns(start, main_boot, main_wall, mach_timebase())
 }
 
-/// [`process_birth_to_rust_main_ns`]'s subtraction, on given readings.
-fn birth_to_main_ns(birth: aterm_uds::process::ProcessBirth, main: SystemTime) -> Option<u64> {
+/// [`process_birth_to_rust_main_ns`]'s subtraction, on given readings: the
+/// boot clock's ticks through `timebase` (`numer`, `denom`: ticks × numer /
+/// denom = ns) when both `main_boot` and the timebase exist, else the wall
+/// clock.
+fn birth_to_main_ns(
+    start: aterm_uds::process::ProcessStart,
+    main_boot: Option<aterm_uds::process::BootClock>,
+    main_wall: SystemTime,
+    timebase: Option<(u32, u32)>,
+) -> Option<u64> {
+    if let (Some(main), Some((numer, denom))) = (main_boot, timebase) {
+        let ticks = main.0.checked_sub(start.boot.0)?;
+        let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom.max(1));
+        return u64::try_from(ns).ok();
+    }
+    let birth = start.wall?;
     let born = UNIX_EPOCH
         .checked_add(Duration::from_secs(birth.seconds))?
         .checked_add(Duration::from_micros(birth.microseconds))?;
-    u64::try_from(main.duration_since(born).ok()?.as_nanos()).ok()
+    u64::try_from(main_wall.duration_since(born).ok()?.as_nanos()).ok()
+}
+
+/// The mach timebase (`numer`, `denom`), which turns the boot clock's ticks
+/// into nanoseconds; `None` where there is none (off Apple) or the call fails.
+#[cfg(target_vendor = "apple")]
+fn mach_timebase() -> Option<(u32, u32)> {
+    let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
+    // SAFETY: `base` is a live, writable `mach_timebase_info` record; the call
+    // only fills it.
+    let rc = unsafe { libc::mach_timebase_info(&raw mut base) };
+    (rc == 0 && base.denom != 0).then_some((base.numer, base.denom))
+}
+
+/// See the Apple twin: no mach timebase here.
+#[cfg(not(target_vendor = "apple"))]
+fn mach_timebase() -> Option<(u32, u32)> {
+    None
 }
 
 /// Mark the end of synchronous GUI preparation immediately before entering
@@ -1700,19 +1672,27 @@ static CLAIM_DIALLED_AT: OnceLock<Instant> = OnceLock::new();
 /// recorded beside the claim; zero on a launch whose warm prologue ran after
 /// its intake.
 static CLAIM_WARM_PRE_DIAL: OnceLock<std::time::Duration> = OnceLock::new();
+/// Elapsed parent park→sample time, sampled before encoding and sending the grant.
+/// Unset when the parent sent no park stamp.
+static CLAIM_PARKED_BEFORE: OnceLock<std::time::Duration> = OnceLock::new();
 static CLAIM_STAMPS: [OnceLock<Instant>; ClaimStamp::COUNT] =
     [const { OnceLock::new() }; ClaimStamp::COUNT];
 
 /// Record the rendezvous claim: the zero point of every [`ClaimStamp`]. First
-/// write wins, as for every startup stamp.
+/// write wins, as for every startup stamp. `parked_before_grant` projects a `park`
+/// point relative to this claim; parent sample→successor claim is not measured.
 #[cfg(target_os = "macos")]
 pub(crate) fn mark_handoff_claimed(
     dialled_at: Instant,
     claimed_at: Instant,
     warm_pre_dial: std::time::Duration,
+    parked_before_grant: Option<std::time::Duration>,
 ) {
     let _ = CLAIM_DIALLED_AT.set(dialled_at);
     let _ = CLAIM_WARM_PRE_DIAL.set(warm_pre_dial);
+    if let Some(parked) = parked_before_grant {
+        let _ = CLAIM_PARKED_BEFORE.set(parked);
+    }
     let _ = CLAIM_AT.set(claimed_at);
 }
 
@@ -1734,6 +1714,9 @@ struct ClaimTimelineInputs {
     /// dial (P2): the dial minus [`claim_warm_pre_dial`]. `None` otherwise.
     warm: Option<Instant>,
     dial: Option<Instant>,
+    /// A projected park point: this claim minus the parent's sampled park duration.
+    /// It excludes parent sample→this claim; `None` when the parent sent no stamp.
+    park: Option<Instant>,
     own: [Option<Instant>; ClaimStamp::COUNT],
     worker_spawn: Option<Instant>,
     worker_done: Option<Instant>,
@@ -1764,12 +1747,15 @@ fn claim_timeline_points(inputs: &ClaimTimelineInputs) -> Vec<ClaimPoint> {
     let own = |stamp: ClaimStamp| inputs.own[stamp as usize];
     let attach = inputs.attach.map(|milestones| milestones.points);
     let attach_point = |index: usize| attach.map(|points| points[index]);
-    let ordered: [(&'static str, Option<Instant>); 30] = [
+    let ordered: [(&'static str, Option<Instant>); 31] = [
         ("main", inputs.exec),
         // Before the dial on the launched lane (P2): the worker's spawn below
         // then reads negative too, which is the point.
         ("warm", inputs.warm),
         ("dial", inputs.dial),
+        // `proof - park` sums parent park→sample and successor claim→proof.
+        // Parent sample→claim is excluded; this is a projected point.
+        ("park", inputs.park),
         ("intake", own(ClaimStamp::Intake)),
         ("worker_spawn", inputs.worker_spawn),
         ("loop_build", own(ClaimStamp::LoopBuild)),
@@ -1836,6 +1822,9 @@ fn claim_timeline_inputs() -> Option<ClaimTimelineInputs> {
         exec: process_main_start(),
         warm,
         dial,
+        park: CLAIM_PARKED_BEFORE
+            .get()
+            .and_then(|parked| claim.checked_sub(*parked)),
         own,
         worker_spawn: BACKEND_WORKER_SPAWN.get().copied(),
         worker_done: BACKEND_WORKER_DONE.get().copied(),
@@ -2788,19 +2777,12 @@ pub(crate) const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333; // 1/30 s
 /// `window_input` is the PRESENTING window's pending input stamp (`None` when the
 /// window state is gone). Only it — plus the session-routed global stamp — can be
 /// closed by this present; another window's pending key is untouched.
-///
-/// Returns the slice it closed for that window when the key came through the
-/// HARDWARE path and the present is untainted — one strain sample (design
-/// §10.14, ruling 211): the host hands it to `StrainTracker::note_key` on a
-/// frame that is drawn anyway. A controller's key, a tainted present and a
-/// frame that closed nothing return `None`.
 pub(crate) fn record_present(
     latency_ns: u64,
     render_ns: u64,
     startup_timing: StartupPresentTiming,
     window_input: Option<&mut PendingInputStamp>,
-) -> Option<u64> {
-    let mut hardware_slice = None;
+) {
     // First startup-metrics publication point inside the successful-present
     // finalizer (see `mark_process_start`). Capture one end Instant and derive
     // both scopes from it, then publish the pair atomically through OnceLock
@@ -2894,19 +2876,9 @@ pub(crate) fn record_present(
         let now = now_ns();
         let reset_at = INPUT_RESET_AT_NS.load(Ordering::Relaxed);
         let slices =
-            window_input.map_or_else(Vec::new, |pending| pending.drain_attributed(now, reset_at));
-        // EVERY edge is a sample (coordinated omission corrected); the strain
-        // engine keeps its one sample per present: the OLDEST edge's, which is
-        // the longest wait. The strain sample IS taint-gated, unlike the
-        // metric: an occluded or captured window's echo describes the episode,
-        // not the machine.
-        if let Some(&(d, hardware)) = slices.first()
-            && hardware
-            && !present_latency_tainted()
-        {
-            hardware_slice = Some(d);
-        }
-        for (d, _) in slices {
+            window_input.map_or_else(Vec::new, |pending| pending.drain_slices(now, reset_at));
+        // EVERY edge is a sample (coordinated omission corrected).
+        for d in slices {
             book_input_present(d);
         }
         // The session-routed stamp (no window known at arm time): any content
@@ -2937,7 +2909,6 @@ pub(crate) fn record_present(
         MAX_FRAME_GAP_NS.fetch_max(now.saturating_sub(prev_stamp), Ordering::Relaxed);
     }
     note_slow_episode_quiet(now);
-    hardware_slice
 }
 
 /// An `output→application-present-return` reading big enough to be what a user
@@ -3545,12 +3516,6 @@ struct InputEdge {
     /// When the edge was armed — compared against the last [`reset`], because a
     /// backdated arrival can precede a reset the key itself followed.
     armed_ns: u64,
-    /// The key came through the HARDWARE path (the winit `KeyboardInput` arm — a
-    /// physical key, or `ctl hwkey`'s real `NSEvent`), never a control
-    /// `send`/`feed`/`key`. Only such a slice is a sample for the strain engine's
-    /// FELT (design §10.14, ruling 206): a controller's key is not a person
-    /// waiting.
-    hardware: bool,
 }
 
 /// One window's pending input→present EDGES: every unpresented keystroke routed
@@ -3567,19 +3532,13 @@ pub(crate) struct PendingInputStamp {
 }
 
 impl PendingInputStamp {
-    /// Arm one edge (a controller key); `false` when the ring was full.
-    #[cfg(test)]
-    fn arm(&mut self, arrival_ns: u64, armed_ns: u64) -> bool {
-        self.arm_from(arrival_ns, armed_ns, false)
-    }
-
-    /// [`Self::arm`], saying whether the key came through the hardware path.
+    /// Arm one edge; `false` when the ring was full.
     /// Appends. A full ring first lets go of the edges already past
     /// `INPUT_SLICE_CAP_NS` (keys that never echoed: the drain would discard
     /// them anyway, so they must not hold the slots a fresh key needs); a ring
     /// still full keeps its oldest edges, counts this one in
     /// `input_edges_dropped` and answers `false`.
-    fn arm_from(&mut self, arrival_ns: u64, armed_ns: u64, hardware: bool) -> bool {
+    fn arm(&mut self, arrival_ns: u64, armed_ns: u64) -> bool {
         if self.len == INPUT_EDGE_RING {
             self.evict_aged(armed_ns);
         }
@@ -3590,7 +3549,6 @@ impl PendingInputStamp {
         *slot = InputEdge {
             arrival_ns: arrival_ns.max(1),
             armed_ns,
-            hardware,
         };
         self.len += 1;
         true
@@ -3619,32 +3577,17 @@ impl PendingInputStamp {
         self.len != 0
     }
 
-    /// Whether the OLDEST pending edge was armed by a HARDWARE key.
-    #[cfg(test)]
-    pub(crate) const fn armed_by_hardware(self) -> bool {
-        self.len != 0 && self.edges[0].hardware
-    }
-
-    /// Drain every edge at a content present of THIS window, oldest first, as
-    /// `(slice, hardware)`. An edge armed before the last reset (`reset_at_ns`)
-    /// or aged past `INPUT_SLICE_CAP_NS` (a keystroke that never echoed) yields
-    /// nothing; the ring is empty afterwards either way.
-    fn drain_attributed(&mut self, now_ns: u64, reset_at_ns: u64) -> Vec<(u64, bool)> {
+    /// Drain every edge at a content present of THIS window, oldest first. An
+    /// edge armed before the last reset (`reset_at_ns`) or aged past
+    /// `INPUT_SLICE_CAP_NS` (a keystroke that never echoed) yields nothing; the
+    /// ring is empty afterwards either way.
+    fn drain_slices(&mut self, now_ns: u64, reset_at_ns: u64) -> Vec<u64> {
         let taken = std::mem::take(self);
         taken.edges[..taken.len]
             .iter()
             .filter(|edge| edge.armed_ns >= reset_at_ns)
-            .map(|edge| (now_ns.saturating_sub(edge.arrival_ns), edge.hardware))
-            .filter(|&(d, _)| d <= INPUT_SLICE_CAP_NS)
-            .collect()
-    }
-
-    /// The drained slices alone (tests).
-    #[cfg(test)]
-    fn drain_slices(&mut self, now_ns: u64, reset_at_ns: u64) -> Vec<u64> {
-        self.drain_attributed(now_ns, reset_at_ns)
-            .into_iter()
-            .map(|(d, _)| d)
+            .map(|edge| now_ns.saturating_sub(edge.arrival_ns))
+            .filter(|&d| d <= INPUT_SLICE_CAP_NS)
             .collect()
     }
 }
@@ -3670,14 +3613,10 @@ fn input_arrival_ns(now: u64) -> u64 {
 /// `App::input_to_session` seam, hardware keys and controller `key` alike) into
 /// that window's [`PendingInputStamp`], so only that window's content present
 /// closes the slice. Same arrival and keep-oldest rules as [`note_input`].
-///
-/// `hardware` is whether the key came through the winit `KeyboardInput` arm
-/// (see [`PendingInputStamp`]'s field): only such a slice comes back out of
-/// [`record_present`] for the strain engine.
-pub(crate) fn note_window_input(pending: &mut PendingInputStamp, hardware: bool) {
+pub(crate) fn note_window_input(pending: &mut PendingInputStamp) {
     let now = now_ns();
     // A full ring counts the edge itself (`input_edges_dropped`).
-    let _ = pending.arm_from(input_arrival_ns(now), now, hardware);
+    let _ = pending.arm(input_arrival_ns(now), now);
     note_typing_hot();
 }
 
@@ -3771,14 +3710,6 @@ pub(crate) fn note_typing_hot() {
 pub(crate) fn input_pending() -> bool {
     let until = TYPING_HOT_UNTIL_NS.load(Ordering::Relaxed);
     until != 0 && now_ns() < until
-}
-
-/// TEST SEAM: the raw interactive-input-pending deadline (ns), so a handler test
-/// can pin "this event ARMED the hint" as a monotone advance of the stamp —
-/// robust to other tests arming it concurrently, unlike a bare `input_pending()`.
-#[cfg(test)]
-pub(crate) fn interactive_input_deadline_ns() -> u64 {
-    TYPING_HOT_UNTIL_NS.load(Ordering::Relaxed)
 }
 
 // ---- The latency trace: isolate the UI-thread key->write component -----------
@@ -4260,16 +4191,8 @@ pub(crate) fn record_deadline(
 /// subset separately. Kept next to the global counters it disambiguates so the
 /// two can never drift: every path that bumps `PAST_DEADLINE_ARMS` bumps this.
 fn note_owner_arm(owner: DeadlineOwner, past: bool) {
-    // `owner as u64` is a discriminant of this enum, so the index is in range
-    // for any variant the slot count covers; the guard keeps a future variant
-    // added without bumping `DEADLINE_OWNER_SLOTS` from panicking a release
-    // build's event loop (the unit test below fails loudly instead).
-    let Some(slot) = usize::try_from(owner as u64)
-        .ok()
-        .filter(|i| *i < DEADLINE_OWNER_SLOTS)
-    else {
-        return;
-    };
+    // The slot count is derived from the enum, so every discriminant is in range.
+    let slot = owner as usize;
     DEADLINE_ARMS_BY_OWNER[slot].fetch_add(1, Ordering::Relaxed);
     if past {
         PAST_DEADLINE_ARMS_BY_OWNER[slot].fetch_add(1, Ordering::Relaxed);
@@ -4285,12 +4208,7 @@ fn note_past_arm_window(owner: DeadlineOwner, past: bool) -> bool {
     if matches!(owner, DeadlineOwner::None) {
         return false;
     }
-    let Some(slot) = usize::try_from(owner as u64)
-        .ok()
-        .filter(|i| *i < DEADLINE_OWNER_SLOTS)
-    else {
-        return false;
-    };
+    let slot = owner as usize;
     let packed = PAST_ARM_HISTORY_BY_OWNER[slot].load(Ordering::Relaxed);
     let (next, trigger) = past_arm_window_step(packed, past);
     PAST_ARM_HISTORY_BY_OWNER[slot].store(next, Ordering::Relaxed);
@@ -4302,13 +4220,7 @@ fn note_past_arm_window(owner: DeadlineOwner, past: bool) -> bool {
 /// `deadline_arms_by_owner`: a heal that cannot name its producer sends the
 /// investigation to the wrong module.
 fn note_past_arm_streak_heal(owner: DeadlineOwner) {
-    let Some(slot) = usize::try_from(owner as u64)
-        .ok()
-        .filter(|i| *i < DEADLINE_OWNER_SLOTS)
-    else {
-        return;
-    };
-    PAST_ARM_STREAK_HEALS_BY_OWNER[slot].fetch_add(1, Ordering::Relaxed);
+    PAST_ARM_STREAK_HEALS_BY_OWNER[owner as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// One owner's arm ledger since the last [`reset`].
@@ -4366,7 +4278,7 @@ pub(crate) fn frame_refill_full_causes() -> Vec<RefillCause> {
 ///
 /// Sparse output keeps the wire field small on a healthy instance — an idle
 /// terminal arms two or three owners — and makes a spin's producer the FIRST
-/// thing a reader sees rather than a needle in 36 zeroes.
+/// thing a reader sees rather than a needle in a row of zeroes.
 #[must_use]
 pub(crate) fn deadline_arm_attribution() -> Vec<OwnerArms> {
     (0..DEADLINE_OWNER_SLOTS)
@@ -4576,6 +4488,7 @@ pub(crate) fn note_handoff_input_dropped() {
 }
 
 /// Count one pre-Commit replay whose modifiers had to be disarmed.
+#[cfg(any(unix, test))]
 pub(crate) fn note_handoff_input_incoherent() {
     HANDOFF_INPUT_INCOHERENT.fetch_add(1, Ordering::Relaxed);
 }
@@ -4613,6 +4526,15 @@ pub(crate) fn handoff_input_fields_json() -> String {
 /// dropped yet (a test stub, whose sink borrows or has no master, holds none).
 static PTY_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// How many warm spares hold a PTY ([`PtyCensus::spare`]): their masters are
+/// left out of `pty_masters`, so masters equal sessions at rest.
+static SPARE_PTYS: AtomicUsize = AtomicUsize::new(0);
+
+/// The warm spares' PTYs (`spare_ptys=`).
+pub(crate) fn spare_ptys() -> usize {
+    SPARE_PTYS.load(Ordering::Acquire)
+}
+
 /// One live session's place in [`PTY_SESSIONS`]: taken by `spawn_session` for
 /// the `Session` it builds, given back when that `Session` drops. The session
 /// closes its master only through its sink's last clone, so a count of masters
@@ -4620,25 +4542,46 @@ static PTY_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 /// one, once the closing sessions' readers have wound down, is a master a
 /// closed tab left open ([`pty_census_fields_text`]).
 #[derive(Debug)]
-pub(crate) struct PtyCensus(bool);
+pub(crate) struct PtyCensus(CensusPlace);
+
+/// Where a session is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CensusPlace {
+    None,
+    Session,
+    Spare,
+}
 
 impl PtyCensus {
     /// A session that owns a PTY master: counted until it drops.
     pub(crate) fn counted() -> Self {
         PTY_SESSIONS.fetch_add(1, Ordering::AcqRel);
-        Self(true)
+        Self(CensusPlace::Session)
+    }
+
+    /// A warm spare's master (`crate::spare`): counted apart, in `spare_ptys=`,
+    /// until its adoption swaps in [`Self::counted`].
+    pub(crate) fn spare() -> Self {
+        SPARE_PTYS.fetch_add(1, Ordering::AcqRel);
+        Self(CensusPlace::Spare)
     }
 
     /// A session with no PTY of its own (a stub, a held pane): not counted.
     pub(crate) const fn none() -> Self {
-        Self(false)
+        Self(CensusPlace::None)
     }
 }
 
 impl Drop for PtyCensus {
     fn drop(&mut self) {
-        if std::mem::take(&mut self.0) {
-            PTY_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+        match std::mem::replace(&mut self.0, CensusPlace::None) {
+            CensusPlace::Session => {
+                PTY_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+            }
+            CensusPlace::Spare => {
+                SPARE_PTYS.fetch_sub(1, Ordering::AcqRel);
+            }
+            CensusPlace::None => {}
         }
     }
 }
@@ -4648,7 +4591,7 @@ impl Drop for PtyCensus {
 #[must_use]
 pub(crate) fn pty_census() -> (usize, usize) {
     (
-        aterm_session::sink::owned_masters_open(),
+        aterm_session::sink::owned_masters_open().saturating_sub(spare_ptys()),
         PTY_SESSIONS.load(Ordering::Acquire),
     )
 }
@@ -4857,7 +4800,6 @@ pub(crate) fn reset() {
     // line: a driver that resets, drives a workload and reads must see THAT
     // workload's worst main-thread turn, not the launch storm's.
     crate::watchdog::reset_turn_census();
-    crate::strain_host::reset_metrics();
     // Gauges (`SYNC_HOLDING`, `PERF_REDUCED`), legacy momentary `last_*`
     // readings, and `first_present` (a startup FACT, not a window stat) survive
     // a reset, like `backend`. Redraw-audit last/drop fields intentionally reset
@@ -5358,7 +5300,7 @@ pub(crate) fn past_arm_books(owner: DeadlineOwner) -> (u64, u64, u64) {
 mod claim_timeline_tests {
     use super::{
         ClaimStamp, ClaimTimelineInputs, StartupAttachMilestones, claim_timeline_points,
-        claim_worker_vs_join, render_claim_timeline_log,
+        claim_worker_vs_join,
     };
     use std::time::{Duration, Instant};
 
@@ -5393,6 +5335,7 @@ mod claim_timeline_tests {
             exec: Some(exec),
             warm: None,
             dial: Some(dial),
+            park: Some(claim - ms(2)),
             own,
             worker_spawn: Some(claim + ms(32)),
             worker_done: Some(claim + ms(90)),
@@ -5413,6 +5356,7 @@ mod claim_timeline_tests {
             [
                 "main",
                 "dial",
+                "park",
                 "intake",
                 "worker_spawn",
                 "loop_build",
@@ -5453,6 +5397,9 @@ mod claim_timeline_tests {
         assert_eq!(at("proof"), 223_000);
         // The successor's own reading of the freeze's last segment.
         assert_eq!(at("commit") - at("proof"), 33_000);
+        // The projected sum: parent park→sample was 2 ms, plus claim→proof.
+        assert_eq!(at("park"), -2_000);
+        assert_eq!(at("proof") - at("park"), 225_000, "park→proof");
     }
 
     #[test]
@@ -5461,8 +5408,11 @@ mod claim_timeline_tests {
         boot.own[ClaimStamp::RestoreStart as usize] = None;
         boot.own[ClaimStamp::RestoreDrained as usize] = None;
         boot.attach = None;
+        // A parent from before the park stamp.
+        boot.park = None;
         let points = claim_timeline_points(&boot);
         for gone in [
+            "park",
             "restore",
             "drained",
             "attach",
@@ -5475,45 +5425,15 @@ mod claim_timeline_tests {
         assert!(claim_worker_vs_join(&boot).is_none());
     }
 
-    /// P2: a successor that warmed before its dial prints where the warm
-    /// started, and its worker spawn reads before the claim.
-    #[test]
-    fn a_warm_before_the_dial_is_a_negative_point_before_it() {
-        let mut boot = a_boot();
-        boot.warm = Some(boot.claim - ms(30));
-        boot.worker_spawn = Some(boot.claim - ms(28));
-        let points = claim_timeline_points(&boot);
-        let labels: Vec<_> = points.iter().map(|(label, _)| *label).collect();
-        assert_eq!(labels[..3], ["main", "warm", "dial"]);
-        let at = |label: &str| points.iter().find(|(l, _)| *l == label).unwrap().1;
-        assert_eq!(at("warm"), -30_000);
-        assert_eq!(at("worker_spawn"), -28_000);
-        assert!(
-            render_claim_timeline_log(&boot).starts_with("main -36.0, warm -30.0, dial -5.0,"),
-            "{}",
-            render_claim_timeline_log(&boot)
-        );
-    }
-
     #[test]
     fn the_worker_is_judged_against_the_join_on_both_sides() {
         let boot = a_boot();
         // Done at +90, join entered at +140 and left at +141.
         assert_eq!(claim_worker_vs_join(&boot), Some((1_000, 50_000)));
-        let line = render_claim_timeline_log(&boot);
-        assert!(
-            line.starts_with("main -36.0, dial -5.0, intake +12.0,"),
-            "{line}"
-        );
-        assert!(
-            line.ends_with("the backend join waited 1.0 ms, the worker done 50.0 ms before it"),
-            "{line}"
-        );
         // A worker still running at the join is AFTER it (the negative control).
         let mut late = boot;
         late.worker_done = Some(boot.claim + ms(141));
-        let line = render_claim_timeline_log(&late);
-        assert!(line.ends_with("the worker done 1.0 ms after it"), "{line}");
+        assert_eq!(claim_worker_vs_join(&late), Some((1_000, -1_000)));
     }
 }
 
@@ -5571,27 +5491,114 @@ mod startup_prepare_tests {
         );
     }
 
-    #[test]
-    fn birth_to_main_is_the_kernel_birth_to_the_microsecond() {
-        let birth = aterm_uds::process::ProcessBirth {
-            seconds: 1_792_118_934,
-            microseconds: 927_250,
-        };
-        let main = UNIX_EPOCH + Duration::from_secs(1_792_118_936) + Duration::from_micros(857_000);
-        assert_eq!(birth_to_main_ns(birth, main), Some(1_929_750_000));
-        // A wall clock stepped back between the two is no reading at all.
-        let before = UNIX_EPOCH + Duration::from_secs(1_792_118_934);
-        assert_eq!(birth_to_main_ns(birth, before), None);
+    /// A birth at boot-clock tick `boot`, with its wall-clock record.
+    fn start(boot: u64) -> aterm_uds::process::ProcessStart {
+        aterm_uds::process::ProcessStart {
+            boot: aterm_uds::process::BootClock(boot),
+            wall: Some(aterm_uds::process::ProcessBirth {
+                seconds: 1_792_118_934,
+                microseconds: 927_250,
+            }),
+        }
     }
 
-    /// The kernel's record of this very process reads on the clock it is
-    /// subtracted from: born before now.
+    /// Apple silicon's timebase: 24 MHz ticks, 125/3 ns each.
+    const APPLE_SILICON: Option<(u32, u32)> = Some((125, 3));
+
+    /// THE BOOT CLOCK, NOT THE WALL (sweep item 36): the subtraction is on
+    /// the kernel's mach ticks through the timebase, so a wall clock NTP
+    /// stepped an hour ahead between birth and `main` reads the same 5 ms.
+    /// NEGATIVE CONTROL: the wall clock alone (no boot-clock stamp, the
+    /// translated-process fallback, and all the old code had) reads the step.
+    #[test]
+    fn birth_to_main_is_read_on_the_boot_clock_through_a_wall_step() {
+        let born = start(1 << 30);
+        // 120,000 ticks of 125/3 ns: exactly 5 ms.
+        let main_boot = Some(aterm_uds::process::BootClock((1 << 30) + 120_000));
+        let stepped = UNIX_EPOCH
+            + Duration::from_secs(1_792_118_934 + 3_600)
+            + Duration::from_micros(927_250 + 5_000);
+        assert_eq!(
+            birth_to_main_ns(born, main_boot, stepped, APPLE_SILICON),
+            Some(5_000_000)
+        );
+        assert_eq!(
+            birth_to_main_ns(born, None, stepped, APPLE_SILICON),
+            Some(3_600_005_000_000),
+            "the wall clock alone reads the step"
+        );
+        // A `main` before the birth on the boot clock is no reading at all.
+        let early = Some(aterm_uds::process::BootClock((1 << 30) - 1));
+        assert_eq!(birth_to_main_ns(born, early, stepped, APPLE_SILICON), None);
+    }
+
+    /// The wall-clock fallback (a translated process; no timebase) is the
+    /// kernel birth to the microsecond.
+    #[test]
+    fn birth_to_main_falls_back_to_the_kernel_birth_to_the_microsecond() {
+        let main = UNIX_EPOCH + Duration::from_secs(1_792_118_936) + Duration::from_micros(857_000);
+        assert_eq!(
+            birth_to_main_ns(start(0), None, main, APPLE_SILICON),
+            Some(1_929_750_000)
+        );
+        let boot = Some(aterm_uds::process::BootClock(5));
+        assert_eq!(
+            birth_to_main_ns(start(0), boot, main, None),
+            Some(1_929_750_000),
+            "no timebase: the wall clock"
+        );
+        // A wall clock stepped back between the two is no reading at all.
+        let before = UNIX_EPOCH + Duration::from_secs(1_792_118_934);
+        assert_eq!(
+            birth_to_main_ns(start(0), None, before, APPLE_SILICON),
+            None
+        );
+    }
+
+    /// On this machine: the kernel's start record of this very process orders
+    /// before a boot-clock reading taken now, and the timebase turns ticks
+    /// into the nanoseconds `Instant` counts. Bracketed: the boot-clock
+    /// interval lies between the `Instant` interval inside its reads and the
+    /// one around them, however the reads were preempted; the 20 ms sleep
+    /// puts a missing or inverted conversion (125/3 on Apple silicon) far
+    /// outside it.
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn this_process_was_born_before_now_on_the_wall_clock() {
+    fn the_boot_clock_reads_in_nanoseconds_through_this_machines_timebase() {
         let pid = i32::try_from(std::process::id()).expect("a pid");
-        let birth = aterm_uds::process::read_process_birth(pid).expect("our own birth record");
-        assert!(birth_to_main_ns(birth, std::time::SystemTime::now()).is_some());
+        let born = aterm_uds::process::read_process_start(pid).expect("our own start record");
+        let now = aterm_uds::process::boot_clock_now();
+        assert!(
+            birth_to_main_ns(
+                born,
+                now,
+                std::time::SystemTime::now(),
+                super::mach_timebase()
+            )
+            .is_some(),
+            "born before now on the boot clock"
+        );
+        let boot = || aterm_uds::process::boot_clock_now().expect("a native boot clock");
+        let (outer0, first, inner0) = (Instant::now(), boot(), Instant::now());
+        std::thread::sleep(ms(20));
+        let (inner1, second, outer1) = (Instant::now(), boot(), Instant::now());
+        let at_first = aterm_uds::process::ProcessStart {
+            boot: first,
+            wall: None,
+        };
+        let read = birth_to_main_ns(
+            at_first,
+            Some(second),
+            std::time::SystemTime::now(),
+            super::mach_timebase(),
+        )
+        .expect("a later reading orders");
+        let inner = u64::try_from((inner1 - inner0).as_nanos()).expect("fits");
+        let outer = u64::try_from((outer1 - outer0).as_nanos()).expect("fits");
+        assert!(
+            (inner.saturating_sub(1_000)..=outer + 1_000).contains(&read),
+            "{read} ns outside [{inner}, {outer}]"
+        );
     }
 }
 
@@ -5842,37 +5849,6 @@ mod startup_phase_tests {
     }
 
     #[test]
-    fn startup_phases_fail_closed_on_missing_or_out_of_order_milestones() {
-        let (_, timing, published_at) = timeline();
-        assert_eq!(
-            derive_startup_phases(StartupMilestones::default(), timing, published_at),
-            StartupPhaseSample::default()
-        );
-
-        let (milestones, timing, published_at) = timeline();
-        let reversed = StartupPresentTiming::new(
-            timing.pre_present,
-            timing.frame_started,
-            timing.surface_return,
-        );
-        assert_eq!(
-            derive_startup_phases(milestones, reversed, published_at),
-            StartupPhaseSample::default()
-        );
-    }
-
-    #[test]
-    fn startup_phase_sum_overflow_fails_closed() {
-        let phases = StartupPhaseSample {
-            valid: true,
-            router_ns: u64::MAX,
-            successful_finalize_ns: 1,
-            ..StartupPhaseSample::default()
-        };
-        assert_eq!(phases.total_ns(), None);
-    }
-
-    #[test]
     fn startup_attach_is_an_exact_exclusive_parent_partition() {
         let (winit_resumed, milestones, surface_ready) = attach_timeline();
         let attach =
@@ -5921,29 +5897,6 @@ mod startup_phase_tests {
         assert_eq!(overflow.total_ns(), None);
     }
 
-    #[test]
-    fn failed_attempt_stamp_cannot_replace_the_successful_redraw_boundary() {
-        let (milestones, timing, published_at) = timeline();
-        let failed_attempt =
-            milestones.surface_ready.unwrap() + std::time::Duration::from_millis(1);
-        assert!(failed_attempt < timing.frame_started);
-        let phases = derive_startup_phases(milestones, timing, published_at);
-        assert!(phases.valid);
-        assert_eq!(phases.surface_to_successful_redraw_ns, 5_000_000);
-
-        let wrong_projection = derive_startup_phases(
-            milestones,
-            StartupPresentTiming::new(failed_attempt, timing.pre_present, timing.surface_return),
-            published_at,
-        );
-        assert!(wrong_projection.valid);
-        assert_eq!(wrong_projection.surface_to_successful_redraw_ns, 1_000_000);
-        assert_ne!(
-            wrong_projection, phases,
-            "negative control: selecting the failed attempt must change the partition"
-        );
-    }
-
     /// `input_dropped=` / `input_incoherent=` are CUMULATIVE (gap #33): they
     /// describe the one handoff this process adopted, at its birth, so a
     /// `metrics reset` taken afterwards must not erase a lost keystroke.
@@ -5972,7 +5925,7 @@ mod startup_phase_tests {
         // The derived model intentionally covers only interval completeness.
         // Ordering and exact arithmetic remain real host obligations exercised
         // by the reordered controls below and the exact-partition tests above.
-        let model = aterm_spec::derive::startup_phase_publication_model();
+        let model = aterm_models_core::startup_phase_publication_model();
         let (milestones, timing, published_at) = timeline();
         let mut incomplete_milestones = milestones;
         incomplete_milestones.surface_ready = None;
@@ -6007,7 +5960,7 @@ mod startup_phase_tests {
             "negative control: real out-of-order stamps must fail closed"
         );
 
-        let attach_model = aterm_spec::derive::startup_phase_publication_model();
+        let attach_model = aterm_models_core::startup_phase_publication_model();
         let (winit_resumed, attach_milestones, surface_ready) = attach_timeline();
         let mut attach_state = attach_model.init_state();
         for _ in 0..7 {
@@ -6146,16 +6099,6 @@ mod histogram_tests {
             wake_owner(EventWakeKind::Timer, DeadlineOwner::PresentRetry),
             DeadlineOwner::PresentRetry
         );
-        assert_eq!(
-            DeadlineOwner::from_raw(DeadlineOwner::TitleDrift as u64),
-            DeadlineOwner::TitleDrift
-        );
-        assert_eq!(DeadlineOwner::TitleDrift.as_str(), "title_drift");
-        assert_eq!(
-            DeadlineOwner::from_raw(DeadlineOwner::KittyTenure as u64),
-            DeadlineOwner::KittyTenure
-        );
-        assert_eq!(DeadlineOwner::KittyTenure.as_str(), "kitty_tenure");
     }
 
     /// HEAL-AT-THE-FOLD (busy-rearm audit, item 3). One late arm is legal — a
@@ -6394,132 +6337,6 @@ mod histogram_tests {
         for owner in [video, word, left, right] {
             clear(owner);
         }
-    }
-
-    /// ITEM 8, and the append-only wire contract that protects it. `SessionStatus`
-    /// exists so the status observer stopped reporting as `title_summary`; the slot
-    /// table behind the per-owner attribution must cover it and every future
-    /// sibling, or `note_owner_arm` silently drops that owner's arms on the floor.
-    #[test]
-    fn every_deadline_owner_has_its_own_label_and_its_own_slot() {
-        assert_eq!(
-            DeadlineOwner::from_raw(DeadlineOwner::SessionStatus as u64),
-            DeadlineOwner::SessionStatus
-        );
-        assert_eq!(DeadlineOwner::SessionStatus.as_str(), "session_status");
-        // Slot 34 moved with its surface (2026-09-22): the message band
-        // inherits the status bars' number, under the band's own label.
-        assert_eq!(
-            DeadlineOwner::from_raw(34),
-            DeadlineOwner::MessageBand,
-            "slot 34 is the message band's"
-        );
-        assert_eq!(DeadlineOwner::MessageBand.as_str(), "message_band");
-        // Slot 39 is the band's MOTION (design §10.8): its own label, so a
-        // spin in the frames is never attributed to the band's state wakes.
-        assert_eq!(
-            DeadlineOwner::from_raw(39),
-            DeadlineOwner::MessageBandMotion
-        );
-        assert_eq!(
-            DeadlineOwner::MessageBandMotion.as_str(),
-            "message_band_motion"
-        );
-        // Slot 40 is the strain engine's reading cadence (design §10.14): its
-        // own label, so an idle machine's `system_strain` arms read 0 and a
-        // spin in the probe is never charged to the band.
-        assert_eq!(DeadlineOwner::from_raw(40), DeadlineOwner::SystemStrain);
-        assert_eq!(DeadlineOwner::SystemStrain.as_str(), "system_strain");
-        assert_eq!(DeadlineOwner::from_raw(41), DeadlineOwner::SessionWaits);
-        assert_eq!(DeadlineOwner::SessionWaits.as_str(), "session_waits");
-        // Slot 42 is the input watch (2026-09-24), under its own label, so a
-        // wake it owes is never read as the status observer's.
-        assert_eq!(DeadlineOwner::from_raw(42), DeadlineOwner::InputWatch);
-        assert_eq!(DeadlineOwner::InputWatch.as_str(), "input_watch");
-        // Slot 43 is the crash journal's (PTY keeper P1): a capture's trailing
-        // edge is never charged to another owner.
-        assert_eq!(DeadlineOwner::from_raw(43), DeadlineOwner::CrashJournal);
-        assert_eq!(DeadlineOwner::CrashJournal.as_str(), "crash_journal");
-        // Slot 44 is the update checker's watchdog (plan P2-1): its one wake at
-        // the heartbeat's stale instant is never charged to another owner.
-        assert_eq!(DeadlineOwner::from_raw(44), DeadlineOwner::UpdateChecker);
-        assert_eq!(DeadlineOwner::UpdateChecker.as_str(), "update_checker");
-        // Slot 45 is the split's take-back hold: its wake is never charged to
-        // the resize settle it used to fold under.
-        assert_eq!(DeadlineOwner::from_raw(45), DeadlineOwner::SplitRegridHold);
-        assert_eq!(DeadlineOwner::SplitRegridHold.as_str(), "split_regrid_hold");
-        // Slot 46 is Kitty animation playback: a frame's wake is its own.
-        assert_eq!(DeadlineOwner::from_raw(46), DeadlineOwner::KittyAnimation);
-        assert_eq!(DeadlineOwner::KittyAnimation.as_str(), "kitty_animation");
-        // Slot 47 is a render epoch's look (`resize_epoch`): the wake at which a
-        // displaced screen has waited out the risk window, never charged to the
-        // status observer that only reads the verdict.
-        assert_eq!(DeadlineOwner::from_raw(47), DeadlineOwner::RenderEpoch);
-        assert_eq!(DeadlineOwner::RenderEpoch.as_str(), "render_epoch");
-        // Slot 48 is the debugger-access change's result re-read.
-        assert_eq!(DeadlineOwner::from_raw(48), DeadlineOwner::DebuggerChange);
-        assert_eq!(DeadlineOwner::DebuggerChange.as_str(), "debugger_change");
-        // Slot 49 is the Developer Tools hand-over: its quiet-moment look and the
-        // helper panel's turn are never charged to the debugger change.
-        assert_eq!(DeadlineOwner::from_raw(49), DeadlineOwner::DevToolsHandOver);
-        assert_eq!(
-            DeadlineOwner::DevToolsHandOver.as_str(),
-            "devtools_hand_over"
-        );
-        // Slot 50 is the harness card's episode frames and its settled frame.
-        assert_eq!(DeadlineOwner::from_raw(50), DeadlineOwner::ClaudeCard);
-        assert_eq!(DeadlineOwner::ClaudeCard.as_str(), "claude_card");
-        // Slot 52 is the session log's settle tick: a resting turn's close is
-        // never charged to the status observer whose sweep published the word.
-        assert_eq!(DeadlineOwner::from_raw(52), DeadlineOwner::SessionLog);
-        assert_eq!(DeadlineOwner::SessionLog.as_str(), "session_log");
-        // Slots 53 and 54 are the harness's glass and Autopilot's timer
-        // (design §9.2.3, §9.3.6): a label's end and a timed landing are
-        // never charged to the harness card or the session log.
-        assert_eq!(DeadlineOwner::from_raw(53), DeadlineOwner::HarnessActs);
-        assert_eq!(DeadlineOwner::HarnessActs.as_str(), "harness_acts");
-        assert_eq!(DeadlineOwner::from_raw(54), DeadlineOwner::AutopilotTimer);
-        assert_eq!(DeadlineOwner::AutopilotTimer.as_str(), "autopilot_timer");
-        // Slot 22 is a tombstone (2026-09-22): the config banner's owner
-        // retired with `config_notice.rs`, and the number stays taken under a
-        // label no live owner wears, so an older wire reader never attributes
-        // a later owner's arms to the banner.
-        assert_eq!(DeadlineOwner::from_raw(22), DeadlineOwner::Retired22);
-        assert_eq!(DeadlineOwner::Retired22.as_str(), "retired-22");
-        // Slot 30 is a tombstone too (2026-10-15): the Smart Titles retry lane
-        // retired with `title_summary.rs`, and the status observer that once
-        // shared its label keeps its own.
-        assert_eq!(DeadlineOwner::from_raw(30), DeadlineOwner::Retired30);
-        assert_eq!(DeadlineOwner::Retired30.as_str(), "retired-30");
-        assert_ne!(
-            DeadlineOwner::SessionStatus.as_str(),
-            DeadlineOwner::Retired30.as_str(),
-            "the two folds that shared a label must not share one again"
-        );
-        // Every slot below the count decodes to a DISTINCT owner whose own
-        // discriminant is that slot — this is what makes `note_owner_arm`'s
-        // index a bijection onto the enum.
-        let mut seen = std::collections::BTreeSet::new();
-        for slot in 1..DEADLINE_OWNER_SLOTS {
-            let owner = DeadlineOwner::from_raw(slot as u64);
-            assert_eq!(
-                owner as u64, slot as u64,
-                "slot {slot} does not round-trip: DEADLINE_OWNER_SLOTS is stale"
-            );
-            assert!(
-                seen.insert(owner.as_str()),
-                "duplicate wire label at slot {slot}: {}",
-                owner.as_str()
-            );
-        }
-        // …and the count is EXACTLY one past the last variant: appending a
-        // variant without widening the table fails here instead of losing its
-        // attribution at runtime.
-        assert_eq!(
-            DeadlineOwner::from_raw(DEADLINE_OWNER_SLOTS as u64),
-            DeadlineOwner::None,
-            "DEADLINE_OWNER_SLOTS must be one past the last discriminant"
-        );
     }
 
     /// ITEM 6. The failure this prevents: `past_deadline_arms` was one global
@@ -6850,26 +6667,6 @@ mod window_input_attribution_tests {
         assert_eq!(pending.drain_slices(10_050, 61), vec![10_000]);
     }
 
-    /// Every edge carries its OWN key's path: a controller key never becomes a
-    /// hardware sample by sharing a burst with a real key, and vice versa.
-    #[test]
-    fn each_edge_carries_its_own_keys_path() {
-        let mut pending = PendingInputStamp::default();
-        pending.arm_from(10, 10, true);
-        pending.arm_from(20, 20, false);
-        assert_eq!(
-            pending.drain_attributed(110, 0),
-            vec![(100, true), (90, false)]
-        );
-        pending.arm_from(10, 10, false);
-        pending.arm_from(20, 20, true);
-        assert_eq!(
-            pending.drain_attributed(110, 0),
-            vec![(100, false), (90, true)],
-            "a ctl send/feed/key never counts as hardware, even ahead of a real key"
-        );
-    }
-
     #[test]
     fn a_keystroke_that_never_echoed_ages_out() {
         let mut pending = PendingInputStamp::default();
@@ -6898,10 +6695,9 @@ mod lateness_attribution_tests {
         SLOW_PRESENT_EPISODE_QUIET_NS, SLOW_PRESENT_LOG_THRESHOLD_NS, SlowEpisode, SlowEpisodeStep,
         StartupPresentTiming, clear_key_arrival, deadline_fire_attribution, gpu_repaint_counts,
         key_queue_distribution, key_queue_last_max_ns, lateness_fields_json, lateness_fields_text,
-        log_span, note_event_wake, note_gpu_repaint_totals, note_key_arrival_queued,
-        note_slow_episode_quiet, note_slow_present, note_turn, note_user_wake, now_ns,
-        record_deadline, record_present, reset, slow_episode_close, slow_episode_step,
-        turn_distribution, user_wake_attribution,
+        note_event_wake, note_gpu_repaint_totals, note_key_arrival_queued, note_slow_episode_quiet,
+        note_slow_present, note_turn, note_user_wake, now_ns, record_deadline, record_present,
+        reset, slow_episode_close, slow_episode_step, turn_distribution, user_wake_attribution,
     };
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -7245,13 +7041,6 @@ mod lateness_attribution_tests {
         reset();
         note_slow_episode_quiet(0);
         LAST_DEADLINE_OWNER.store(owner, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn log_spans_read_as_seconds_minutes_or_hours() {
-        assert_eq!(log_span(1_500_000_000), "1.5 s");
-        assert_eq!(log_span(27 * 60 * 1_000_000_000), "27 min");
-        assert_eq!(log_span(27 * 3600 * 1_000_000_000), "27.0 h");
     }
 
     /// THE CONFLATION THIS FIXES. `note_key_arrival_queued` backdates the arrival

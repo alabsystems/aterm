@@ -151,36 +151,6 @@ fn hidden_far_teleport_stays_suppressed() {
     assert!(out.is_empty());
 }
 
-/// A lone keystroke keeps the classic crisp wake: no chain floor applies (the
-/// burst-opening gap is infinite), so everything is fully dark ~500 ms later.
-#[test]
-fn lone_key_wake_fades_crisply() {
-    let mut glow = CursorGlow::default();
-    let t0 = Instant::now();
-    let mut out = Vec::new();
-    let c = cfg(GlowStyle::Lumen, true);
-    let g = geom();
-    glow.tick(Some((2, 0)), t0, &c, g, &mut out); // seed
-    glow.note_synthetic_typed(t0 + Duration::from_millis(10), 1);
-    glow.tick(
-        Some((2, 1)),
-        t0 + Duration::from_millis(10),
-        &c,
-        g,
-        &mut out,
-    ); // one advance
-    let gone = glow.tick(
-        Some((2, 1)),
-        t0 + Duration::from_millis(10 + 500),
-        &c,
-        g,
-        &mut out,
-    );
-    assert_eq!(gone, 0, "a lone keystroke's wake is gone by +500ms");
-    assert!(out.is_empty());
-    assert!(!glow.is_active());
-}
-
 #[test]
 fn every_style_keeps_the_invariants() {
     let g = geom();

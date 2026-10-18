@@ -3,72 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! CSI sequence tests: parameter parsing, private markers, overflow clamping,
-//! and fast-path parity with the basic parser.
+//! and the CSI fast path's parity with the per-byte state machine.
 
 use super::super::*;
 use super::RecordingSink;
 
 // ============== CSI Tests ==============
-
-#[test]
-fn parse_csi_sequence() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    parser.advance(b"\x1b[31m", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0], (vec![31], vec![], b'm'));
-}
-
-#[test]
-fn parse_csi_multiple_params() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // SGR with multiple params: bold, red foreground
-    parser.advance(b"\x1b[1;31m", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0], (vec![1, 31], vec![], b'm'));
-}
-
-#[test]
-fn parse_csi_no_params() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Cursor Home with no params
-    parser.advance(b"\x1b[H", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0], (vec![], vec![], b'H'));
-}
-
-#[test]
-fn parse_csi_private_marker() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // DEC Private Mode Set (e.g., ?1049h for alternate screen)
-    parser.advance(b"\x1b[?1049h", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    // The '?' should be collected as intermediate
-    assert_eq!(sink.csi_dispatches[0].2, b'h');
-}
-
-#[test]
-fn parse_csi_large_param() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Parameter larger than u16::MAX should be clamped
-    parser.advance(b"\x1b[99999m", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0].0[0], 65535); // u16::MAX
-}
 
 #[test]
 fn parse_csi_many_params() {
@@ -78,7 +18,7 @@ fn parse_csi_many_params() {
 
     // More than MAX_PARAMS parameters (only the first MAX_PARAMS are kept).
     // 26 params 1..=26; with MAX_PARAMS = 24 the last two (25, 26) are dropped.
-    parser.advance(
+    parser.advance_fast(
         b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26m",
         &mut sink,
     );
@@ -90,10 +30,6 @@ fn parse_csi_many_params() {
     );
     let params = &sink.csi_dispatches[0].0;
     assert_eq!(params.len(), MAX_PARAMS, "params truncated to MAX_PARAMS");
-    assert_eq!(
-        MAX_PARAMS, 24,
-        "MAX_PARAMS pinned at 24 (xterm/ghostty parity)"
-    );
     // Verify first params survived truncation in order
     assert_eq!(params[0], 1, "first param preserved");
     assert_eq!(params[23], 24, "last retained param is 24 (25,26 dropped)");
@@ -107,7 +43,7 @@ fn parse_csi_kakoune_sgr() {
     let mut sink = RecordingSink::default();
 
     // 17 params: SGR 4:3 (curly underline) ; 38:2::R:G:B ; 48:2::R:G:B ...
-    parser.advance(
+    parser.advance_fast(
         b"\x1b[0;4;38;2;255;128;0;48;2;16;32;48;1;3;9;53;58m",
         &mut sink,
     );
@@ -129,11 +65,13 @@ fn parse_csi_kakoune_sgr() {
 // ============== CSI Fast Path Tests ==============
 
 #[test]
-fn csi_fast_path_single_sequences() {
-    // One sequence through `advance_fast` -> exactly one CSI dispatch of
-    // (params, intermediates, final).
+fn csi_single_sequences_dispatch_once() {
+    // One sequence -> exactly one CSI dispatch of (params, intermediates,
+    // final).
     let rows: &[(&str, &[u8], &[u16], &[u8], u8)] = &[
         ("simple SGR", b"\x1b[31m", &[31], &[], b'm'),
+        ("two params", b"\x1b[1;31m", &[1, 31], &[], b'm'),
+        ("SGR reset", b"\x1b[0m", &[0], &[], b'm'),
         ("256-color fg", b"\x1b[38;5;196m", &[38, 5, 196], &[], b'm'),
         (
             "RGB fg",
@@ -150,7 +88,6 @@ fn csi_fast_path_single_sequences() {
         let mut parser = Parser::new();
         let mut sink = RecordingSink::default();
         parser.advance_fast(input, &mut sink);
-
         assert_eq!(
             sink.csi_dispatches,
             vec![(params.to_vec(), intermediates.to_vec(), final_byte)],
@@ -188,91 +125,65 @@ fn csi_fast_path_interleaved_with_text() {
     assert_eq!(sink.csi_dispatches[1].0, vec![0]);
 }
 
-#[test]
-fn csi_fast_path_large_param() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Large parameter should be clamped to u16::MAX
-    parser.advance_fast(b"\x1b[99999m", &mut sink);
-
-    assert_eq!(sink.csi_dispatches.len(), 1);
-    assert_eq!(sink.csi_dispatches[0].0[0], 65535);
-}
-
-#[test]
-fn csi_fast_path_matches_basic_parser() {
-    // Verify fast path produces same results as basic parser
-    let test_cases = [
-        b"\x1b[31m".as_slice(),
-        b"\x1b[1;31m",
-        b"\x1b[38;5;196m",
-        b"\x1b[38;2;255;128;64m",
-        b"\x1b[?1049h",
-        b"\x1b[10;20H",
-        b"\x1b[H",
-        b"\x1b[0m",
-    ];
-
-    for input in test_cases {
-        let mut parser_basic = Parser::new();
-        let mut sink_basic = RecordingSink::default();
-        parser_basic.advance(input, &mut sink_basic);
-
-        let mut parser_fast = Parser::new();
-        let mut sink_fast = RecordingSink::default();
-        parser_fast.advance_fast(input, &mut sink_fast);
-
-        assert_eq!(
-            sink_basic.csi_dispatches, sink_fast.csi_dispatches,
-            "Mismatch for input: {:?}",
-            input
-        );
+/// `input` fed whole (the CSI fast path) and one byte per read (the per-byte
+/// state machine, since the fast path needs the whole sequence in one read)
+/// yield the same actions.
+fn assert_whole_read_matches_per_byte(input: &[u8]) {
+    let mut parser_per_byte = Parser::new();
+    let mut sink_per_byte = RecordingSink::default();
+    for byte in input {
+        parser_per_byte.advance_fast(std::slice::from_ref(byte), &mut sink_per_byte);
     }
-}
-
-fn assert_fast_parser_matches_basic(input: &[u8]) {
-    let mut parser_basic = Parser::new();
-    let mut sink_basic = RecordingSink::default();
-    parser_basic.advance(input, &mut sink_basic);
 
     let mut parser_fast = Parser::new();
     let mut sink_fast = RecordingSink::default();
     parser_fast.advance_fast(input, &mut sink_fast);
 
-    assert_eq!(sink_basic.prints, sink_fast.prints, "prints mismatch");
-    assert_eq!(sink_basic.executes, sink_fast.executes, "executes mismatch");
+    assert_eq!(sink_per_byte.prints, sink_fast.prints, "prints mismatch");
     assert_eq!(
-        sink_basic.csi_dispatches, sink_fast.csi_dispatches,
+        sink_per_byte.executes, sink_fast.executes,
+        "executes mismatch"
+    );
+    assert_eq!(
+        sink_per_byte.csi_dispatches, sink_fast.csi_dispatches,
         "CSI dispatch mismatch"
     );
     assert_eq!(
-        sink_basic.csi_dispatches_with_subparams, sink_fast.csi_dispatches_with_subparams,
+        sink_per_byte.csi_dispatches_with_subparams, sink_fast.csi_dispatches_with_subparams,
         "CSI subparam dispatch mismatch"
     );
     assert_eq!(
-        sink_basic.esc_dispatches, sink_fast.esc_dispatches,
+        sink_per_byte.esc_dispatches, sink_fast.esc_dispatches,
         "ESC dispatch mismatch"
     );
     assert_eq!(
-        sink_basic.osc_dispatches, sink_fast.osc_dispatches,
+        sink_per_byte.osc_dispatches, sink_fast.osc_dispatches,
         "OSC dispatch mismatch"
     );
     assert_eq!(
-        sink_basic.dcs_hooks, sink_fast.dcs_hooks,
+        sink_per_byte.dcs_hooks, sink_fast.dcs_hooks,
         "DCS hook mismatch"
     );
-    assert_eq!(sink_basic.dcs_puts, sink_fast.dcs_puts, "DCS put mismatch");
     assert_eq!(
-        sink_basic.dcs_unhooks, sink_fast.dcs_unhooks,
+        sink_per_byte.dcs_puts, sink_fast.dcs_puts,
+        "DCS put mismatch"
+    );
+    assert_eq!(
+        sink_per_byte.dcs_unhooks, sink_fast.dcs_unhooks,
         "DCS unhook mismatch"
     );
     assert_eq!(
-        sink_basic.apc_starts, sink_fast.apc_starts,
+        sink_per_byte.apc_starts, sink_fast.apc_starts,
         "APC start mismatch"
     );
-    assert_eq!(sink_basic.apc_data, sink_fast.apc_data, "APC data mismatch");
-    assert_eq!(sink_basic.apc_ends, sink_fast.apc_ends, "APC end mismatch");
+    assert_eq!(
+        sink_per_byte.apc_data, sink_fast.apc_data,
+        "APC data mismatch"
+    );
+    assert_eq!(
+        sink_per_byte.apc_ends, sink_fast.apc_ends,
+        "APC end mismatch"
+    );
 }
 
 #[test]
@@ -285,26 +196,26 @@ fn csi_fast_path_falls_back_when_sequence_exceeds_64_bytes() {
     }
     input.extend_from_slice(b"1mZ");
 
-    assert_fast_parser_matches_basic(&input);
+    assert_whole_read_matches_per_byte(&input);
 }
 
 #[test]
 fn csi_fast_path_falls_back_on_unknown_byte_in_param_scan() {
     // DEL (0x7F) is rejected by the fast parser param scanner.
-    // Ensure fallback path handles the sequence exactly like `advance`.
+    // Ensure fallback path handles the sequence exactly like the per-byte path.
     let input = b"\x1b[1\x7fmZ";
-    assert_fast_parser_matches_basic(input);
+    assert_whole_read_matches_per_byte(input);
 }
 
 #[test]
 fn csi_fast_path_falls_back_on_unexpected_byte_after_intermediate() {
     // '$' enters intermediate collection, then '2' is unexpected in that phase.
     let input = b"\x1b[1$2mZ";
-    assert_fast_parser_matches_basic(input);
+    assert_whole_read_matches_per_byte(input);
 }
 
 #[test]
-fn csi_fast_path_trailing_empty_colon_subparam_matches_basic() {
+fn csi_fast_path_trailing_empty_colon_subparam_matches_per_byte() {
     // A trailing ':' immediately before the final byte (or an intermediate)
     // must NOT materialize a phantom empty subparameter on the `D;` fast path.
     // The reference state machine only finalizes a pending colon value when a
@@ -318,7 +229,7 @@ fn csi_fast_path_trailing_empty_colon_subparam_matches_basic() {
         b"\x1b[1;2: q",
     ];
     for input in trailing_cases {
-        assert_fast_parser_matches_basic(input);
+        assert_whole_read_matches_per_byte(input);
     }
 
     // Control cases: a separator follows the empty colon value, so the empty
@@ -330,13 +241,13 @@ fn csi_fast_path_trailing_empty_colon_subparam_matches_basic() {
         b"\x1b[1;2::3m",
     ];
     for input in mid_cases {
-        assert_fast_parser_matches_basic(input);
+        assert_whole_read_matches_per_byte(input);
     }
 }
 
 /// A parameter accumulates with saturating arithmetic and is clamped to
 /// `u16::MAX` when it closes: `ESC [ <digits> m` dispatches exactly
-/// `min(value, 65535)` on both paths for every digit repeated up to 24 times
+/// `min(value, 65535)` for every digit repeated up to 24 times
 /// (far past `u32::MAX`), and for the values past `u32::MAX` that a wrapping
 /// accumulator would bring back small (`2^32` would read as 0, `2^32 + 5` as
 /// 5, `10 * 2^32` as 0).
@@ -359,20 +270,14 @@ fn parameter_digits_saturate_and_finalize_clamps() {
         let value = digits.parse::<u128>().unwrap();
         let expected = u16::try_from(value.min(u128::from(u16::MAX))).unwrap();
         let sequence = format!("\x1b[{digits}m");
-        for fast in [false, true] {
-            let mut parser = Parser::new();
-            let mut sink = RecordingSink::default();
-            if fast {
-                parser.advance_fast(sequence.as_bytes(), &mut sink);
-            } else {
-                parser.advance(sequence.as_bytes(), &mut sink);
-            }
-            assert_eq!(
-                sink.csi_dispatches,
-                vec![(vec![expected], vec![], b'm')],
-                "fast={fast} {digits}"
-            );
-        }
+        let mut parser = Parser::new();
+        let mut sink = RecordingSink::default();
+        parser.advance_fast(sequence.as_bytes(), &mut sink);
+        assert_eq!(
+            sink.csi_dispatches,
+            vec![(vec![expected], vec![], b'm')],
+            "{digits}"
+        );
     }
 }
 

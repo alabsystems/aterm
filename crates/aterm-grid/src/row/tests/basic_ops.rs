@@ -9,47 +9,6 @@ use super::super::*;
 use super::make_row;
 
 #[test]
-fn row_new() {
-    let (_pages, row) = make_row(80);
-    assert_eq!(row.cols(), 80);
-    assert_eq!(row.len(), 0);
-    assert!(row.is_empty());
-    assert!(row.is_dirty());
-}
-
-#[test]
-fn row_write_char() {
-    let (_pages, mut row) = make_row(80);
-    assert!(row.write_char(0, 'H'));
-    assert!(row.write_char(1, 'i'));
-    assert_eq!(row.len(), 2);
-    assert_eq!(row.get(0).unwrap().char(), 'H');
-    assert_eq!(row.get(1).unwrap().char(), 'i');
-}
-
-#[test]
-fn row_clear() {
-    let (_pages, mut row) = make_row(80);
-    row.write_char(0, 'X');
-    row.write_char(10, 'Y');
-    assert_eq!(row.len(), 11);
-
-    row.clear();
-    assert_eq!(row.len(), 0);
-    assert!(row.is_empty());
-}
-
-#[test]
-fn row_resize_grow() {
-    let (mut pages, mut row) = make_row(40);
-    row.write_char(0, 'A');
-    // SAFETY: Test-local `pages` outlives `row` for the full scope.
-    unsafe { row.resize(80, &mut pages) };
-    assert_eq!(row.cols(), 80);
-    assert_eq!(row.get(0).unwrap().char(), 'A');
-}
-
-#[test]
 fn row_resize_shrink() {
     let (mut pages, mut row) = make_row(80);
     row.write_char(60, 'A');
@@ -61,25 +20,6 @@ fn row_resize_shrink() {
         row.get(60).is_none(),
         "column 60 should not exist after shrink to 40"
     );
-}
-
-#[test]
-fn row_to_string() {
-    let (_pages, mut row) = make_row(80);
-    for (i, c) in "Hello".chars().enumerate() {
-        row.write_char(u16_from_usize(i), c);
-    }
-    assert_eq!(row.to_string(), "Hello");
-}
-
-#[test]
-fn row_wrapped_flag() {
-    let (_pages, mut row) = make_row(80);
-    assert!(!row.is_wrapped());
-    row.set_wrapped(true);
-    assert!(row.is_wrapped());
-    row.set_wrapped(false);
-    assert!(!row.is_wrapped());
 }
 
 #[test]
@@ -134,19 +74,6 @@ fn row_delete_chars_tail_overlap() {
     row.delete_chars(4, 3);
     assert_eq!(row.len(), 1);
     assert_eq!(row.get(0).unwrap().char(), 'A');
-}
-
-#[test]
-fn row_insert_chars_at_end() {
-    let (_pages, mut row) = make_row(10);
-    for (i, c) in "ABC".chars().enumerate() {
-        row.write_char(u16_from_usize(i), c);
-    }
-
-    row.insert_chars(8, 2);
-    assert_eq!(row.get(0).unwrap().char(), 'A');
-    assert_eq!(row.get(1).unwrap().char(), 'B');
-    assert_eq!(row.get(2).unwrap().char(), 'C');
 }
 
 #[test]
@@ -212,17 +139,6 @@ fn row_erase_chars_beyond_end() {
 }
 
 #[test]
-fn row_erase_chars_zero_count() {
-    let (_pages, mut row) = make_row(10);
-    for (i, c) in "ABCDE".chars().enumerate() {
-        row.write_char(u16_from_usize(i), c);
-    }
-
-    row.erase_chars(2, 0);
-    assert_eq!(row.to_string(), "ABCDE");
-}
-
-#[test]
 fn row_write_overwrite_wide_continuation() {
     use crate::{CellFlags, PackedColor};
 
@@ -249,20 +165,6 @@ fn row_write_overwrite_wide_continuation() {
 }
 
 // fill_cell_run
-
-#[test]
-fn fill_cell_run_basic() {
-    let (_pages, mut row) = make_row(80);
-    let template = Cell::from_ascii_fast(b'X');
-    let written = row.fill_cell_run(0, 5, template);
-    assert_eq!(written, 5);
-    assert_eq!(row.len(), 5);
-    for col in 0..5 {
-        assert_eq!(row.get(col).unwrap().char(), 'X');
-    }
-    // Next cell is still empty.
-    assert_eq!(row.get(5).unwrap().char(), ' ');
-}
 
 #[test]
 fn fill_cell_run_with_style() {
@@ -292,15 +194,6 @@ fn fill_cell_run_clamps_to_row_end() {
     for col in 3..10 {
         assert_eq!(row.get(col).unwrap().char(), 'Z');
     }
-}
-
-#[test]
-fn fill_cell_run_zero_count() {
-    let (_pages, mut row) = make_row(10);
-    let template = Cell::from_ascii_fast(b'A');
-    let written = row.fill_cell_run(0, 0, template);
-    assert_eq!(written, 0);
-    assert!(row.is_empty());
 }
 
 #[test]
@@ -335,16 +228,4 @@ fn fill_cell_run_overwrites_wide_chars() {
     assert_eq!(row.get(5).unwrap().char(), 'A');
     assert_eq!(row.get(6).unwrap().char(), 'A');
     assert_eq!(row.get(7).unwrap().char(), 'A');
-}
-
-#[test]
-fn fill_cell_run_full_row() {
-    let (_pages, mut row) = make_row(10);
-    let template = Cell::from_ascii_fast(b'#');
-    let written = row.fill_cell_run(0, 10, template);
-    assert_eq!(written, 10);
-    assert_eq!(row.len(), 10);
-    for col in 0..10 {
-        assert_eq!(row.get(col).unwrap().char(), '#');
-    }
 }

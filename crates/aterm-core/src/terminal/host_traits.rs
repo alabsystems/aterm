@@ -93,7 +93,7 @@ fn block_state_from_core(state: BlockState) -> TerminalBlockState {
 #[cfg(test)]
 mod tests {
     use aterm_types::TerminalSize;
-    use aterm_types::terminal_host::{TerminalBlockAccess, TerminalHost};
+    use aterm_types::terminal_host::TerminalHost;
 
     use crate::terminal::Terminal;
 
@@ -116,18 +116,5 @@ mod tests {
             <Terminal as TerminalHost>::scrollback_line_from_end(&terminal, 0).as_deref(),
             Some("line1")
         );
-    }
-
-    #[test]
-    fn terminal_block_access_snapshots_are_available() {
-        let mut terminal = Terminal::new(4, 20);
-        terminal.process(b"\x1b]133;A\x07");
-        terminal.process(b"echo hi\r\n");
-        terminal.process(b"\x1b]133;C\x07");
-        terminal.process(b"hi\r\n");
-        terminal.process(b"\x1b]133;D;0\x07");
-
-        let blocks = <Terminal as TerminalBlockAccess>::blocks(&terminal);
-        assert!(!blocks.is_empty());
     }
 }

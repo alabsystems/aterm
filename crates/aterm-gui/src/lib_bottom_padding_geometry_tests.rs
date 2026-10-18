@@ -76,7 +76,7 @@ fn gpu_crop_alignment_is_exact_for_every_parity_and_crop_direction() {
 /// one Crop transition through the tiered conformance validator.
 #[test]
 fn visible_pad_crop_shipping_helpers_conform_to_model() {
-    let model = aterm_spec::derive::visible_pad_crop_model();
+    let model = aterm_models_render::visible_pad_crop_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let choices = model.successors("ChooseGeometry", &model.init_state());
     assert_eq!(choices.len(), 4 * 5 * 4 * 3, "complete bounded lattice");
@@ -85,8 +85,7 @@ fn visible_pad_crop_shipping_helpers_conform_to_model() {
     let Some(mut renderer) =
         aterm_render::Renderer::from_system(16.0, aterm_render::Theme::default())
     else {
-        crate::logging::stderr_line!("SKIP: no system monospace font");
-        return;
+        aterm_spec::host::could_not_run("no system monospace font on this host");
     };
 
     let mut validated_fixture = false;

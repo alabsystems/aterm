@@ -51,6 +51,11 @@
 //! `Ok(0)`); a cut inside a record is truncation and errors. What an early EOF
 //! means is decided by the protocol above, exactly as it is on a plain socket.
 //!
+//! A direction is exhausted when its next sequence is `u64::MAX`: no further
+//! record is sealed or read, before any transport or record-state mutation.
+//! The last usable record has sequence `u64::MAX - 1`; every accepted record
+//! therefore has a representable, strictly greater successor.
+//!
 //! # Shared counters across clones
 //! The send and receive counters are shared (`Arc`) across
 //! [`SealedStream::try_clone`], so a second handle to the same socket (the
@@ -79,6 +84,30 @@ pub const HELLO_LEN: usize = 4 + SESSION_NONCE_LEN;
 const DIR_CLIENT_TO_SERVER: u8 = 0x01;
 const DIR_SERVER_TO_CLIENT: u8 = 0x02;
 const LEN_PREFIX: usize = 4;
+
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+#[path = "stream_island.rs"]
+mod stream_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::aead_seq_monotone;
+#[cfg(clean_islands)]
+pub use stream_island::aead_seq_monotone;
+
+contract_fn! {
+    /// Kernel-certified check that the receiver's expected sequence `recv_seq` is
+    /// strictly below the sender's sealed sequence frontier `send_seq`.
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `aead_can_open_in_order_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub fn aead_can_open_in_order(recv_seq: u64, send_seq: u64) -> bool
+    clauses [ensures result == (recv_seq < send_seq)]
+    {
+        recv_seq < send_seq
+    }
+}
 
 /// A stream whose `try_clone` yields a second handle to the SAME underlying
 /// connection (independent read/write directions on one fd). Implemented for the
@@ -134,7 +163,7 @@ impl Session {
         } else {
             (DIR_SERVER_TO_CLIENT, DIR_CLIENT_TO_SERVER)
         };
-        let mut send = Vec::with_capacity(binding.len() + 1);
+        let mut send = Vec::with_capacity(2 * HELLO_LEN + 1);
         send.extend_from_slice(binding);
         let mut recv = send.clone();
         send.push(dir_send);
@@ -232,10 +261,34 @@ impl RecvState {
     }
 }
 
+impl Drop for RecvState {
+    fn drop(&mut self) {
+        self.rec.fill(0);
+        core::hint::black_box(self.rec.as_mut_slice());
+    }
+}
+
+#[derive(Clone)]
+struct ZeroizingKey([u8; KEY_LEN]);
+
+impl core::ops::Deref for ZeroizingKey {
+    type Target = [u8; KEY_LEN];
+    fn deref(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingKey {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        core::hint::black_box(&mut self.0);
+    }
+}
+
 /// A transparent AEAD wrapper over a byte stream `S`. See the module docs.
 pub struct SealedStream<S> {
     inner: S,
-    key: [u8; KEY_LEN],
+    key: ZeroizingKey,
     session: Session,
     // The per-record AAD counters, SHARED across try_clone so two handles to one
     // socket write a single ordered record sequence and read against a single
@@ -248,7 +301,7 @@ impl<S> SealedStream<S> {
     fn with_session(inner: S, key: [u8; KEY_LEN], session: Session) -> Self {
         SealedStream {
             inner,
-            key,
+            key: ZeroizingKey(key),
             session,
             send: Arc::new(Mutex::new(SendState::new())),
             recv: Arc::new(Mutex::new(RecvState::new())),
@@ -259,6 +312,25 @@ impl<S> SealedStream<S> {
     /// that does not touch the record bytes.
     pub fn get_ref(&self) -> &S {
         &self.inner
+    }
+
+    /// The next record sequence number to be sealed on the send direction.
+    #[must_use]
+    pub fn send_seq(&self) -> u64 {
+        self.send.lock().map_or(0, |tx| tx.seq)
+    }
+
+    /// The next record sequence number expected by the receiver's AAD.
+    #[must_use]
+    pub fn recv_seq(&self) -> u64 {
+        self.recv.lock().map_or(0, |rs| rs.seq)
+    }
+
+    /// Whether the receiver's expected sequence number is strictly below the
+    /// sender's sealed sequence frontier (`aead_can_open_in_order`).
+    #[must_use]
+    pub fn can_open_from_sender(&self, sender_seq: u64) -> bool {
+        aead_can_open_in_order(self.recv_seq(), sender_seq)
     }
 }
 
@@ -316,14 +388,15 @@ impl<S: Read + Write> SealedStream<S> {
         //    first and read second — a hello never fills a socket buffer, so there
         //    is no deadlock.
         let mut mine = [0u8; HELLO_LEN];
-        mine[..HELLO_MAGIC.len()].copy_from_slice(&HELLO_MAGIC);
-        getrandom::getrandom(&mut mine[HELLO_MAGIC.len()..])
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        if let Some((mine_magic, mine_nonce)) = mine.split_at_mut_checked(HELLO_MAGIC.len()) {
+            mine_magic.copy_from_slice(&HELLO_MAGIC);
+            getrandom::getrandom(mine_nonce).map_err(|e| io::Error::other(e.to_string()))?;
+        }
         inner.write_all(&mine)?;
         inner.flush()?;
         let mut theirs = [0u8; HELLO_LEN];
         inner.read_exact(&mut theirs)?;
-        if theirs[..HELLO_MAGIC.len()] != HELLO_MAGIC {
+        if !theirs.starts_with(&HELLO_MAGIC) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "peer is not an astream sealed transport (bad hello)",
@@ -345,7 +418,10 @@ impl<S: Read + Write> SealedStream<S> {
         //    opening the peer's proves the same of the peer. Again send first,
         //    read second.
         {
-            let mut tx = stream.send.lock().unwrap();
+            let mut tx = stream
+                .send
+                .lock()
+                .map_err(|_| io::Error::other("sealed stream: send state mutex poisoned"))?;
             write_record(
                 &mut stream.inner,
                 &stream.key,
@@ -356,7 +432,10 @@ impl<S: Read + Write> SealedStream<S> {
         }
         stream.inner.flush()?;
         {
-            let mut rs = stream.recv.lock().unwrap();
+            let mut rs = stream
+                .recv
+                .lock()
+                .map_err(|_| io::Error::other("sealed stream: receive state mutex poisoned"))?;
             // The confirm is empty, so the one pre-authentication record read is
             // capped at exactly one empty record: an unkeyed peer cannot make us
             // allocate anything larger.
@@ -403,7 +482,7 @@ impl<S: TryCloneable> SealedStream<S> {
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(SealedStream {
             inner: self.inner.try_clone()?,
-            key: self.key,
+            key: self.key.clone(),
             session: self.session.clone(),
             send: Arc::clone(&self.send),
             recv: Arc::clone(&self.recv),
@@ -432,22 +511,30 @@ fn write_record<S: Write>(
             "sealed stream: an earlier record was only partly written",
         ));
     }
-    let sealed_len = NONCE_LEN + plaintext.len() + TAG_LEN;
+    let next_seq = tx
+        .seq
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("sealed stream: record sequence exhausted"))?;
+    let sealed_len = NONCE_LEN
+        .saturating_add(plaintext.len())
+        .saturating_add(TAG_LEN);
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
     tx.rec.clear();
-    tx.rec.reserve(LEN_PREFIX + sealed_len);
     tx.rec.extend_from_slice(&(sealed_len as u32).to_le_bytes());
     tx.rec.extend_from_slice(&nonce);
     tx.rec.extend_from_slice(plaintext);
     record_aad(&mut tx.aad, &session.send, tx.seq);
     seal_in_place(key, &tx.aad, &mut tx.rec, LEN_PREFIX);
     let mut sent = 0;
-    while sent < tx.rec.len() {
-        let err = match inner.write(&tx.rec[sent..]) {
+    while let Some(rem) = tx.rec.get(sent..) {
+        if rem.is_empty() {
+            break;
+        }
+        let err = match inner.write(rem) {
             Ok(0) => io::Error::from(io::ErrorKind::WriteZero),
             Ok(k) => {
-                sent += k;
+                sent = sent.saturating_add(k);
                 continue;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -456,7 +543,7 @@ fn write_record<S: Write>(
         tx.poisoned = sent > 0;
         return Err(err);
     }
-    tx.seq = tx.seq.wrapping_add(1);
+    tx.seq = aead_seq_monotone(tx.seq, next_seq);
     Ok(())
 }
 
@@ -464,15 +551,18 @@ fn write_record<S: Write>(
 /// (a timeout included) leaves `*filled` at the resumable position; an EOF
 /// before the end is truncation (`UnexpectedEof`).
 fn fill<S: Read>(inner: &mut S, buf: &mut [u8], filled: &mut usize) -> io::Result<()> {
-    while *filled < buf.len() {
-        match inner.read(&mut buf[*filled..]) {
+    while let Some(rem) = buf.get_mut(*filled..) {
+        if rem.is_empty() {
+            break;
+        }
+        match inner.read(rem) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "sealed record truncated",
                 ))
             }
-            Ok(k) => *filled += k,
+            Ok(k) => *filled = filled.saturating_add(k),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
@@ -497,6 +587,10 @@ fn read_record<S: Read>(
             "sealed stream failed to authenticate earlier",
         ));
     }
+    let next_seq = rs
+        .seq
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("sealed stream: record sequence exhausted"))?;
     if rs.body_len == 0 {
         if rs.hdr_filled == 0 {
             // At a record boundary a clean EOF is an orderly close.
@@ -514,7 +608,7 @@ fn read_record<S: Read>(
         }
         fill(inner, &mut rs.hdr, &mut rs.hdr_filled)?;
         let n = u32::from_le_bytes(rs.hdr) as usize;
-        if !(OVERHEAD..=limit).contains(&n) {
+        if !(OVERHEAD..=limit).contains(&n) || n > MAX_RECORD {
             rs.poisoned = true;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -523,15 +617,28 @@ fn read_record<S: Read>(
         }
         rs.body_len = n;
         rs.body_filled = 0;
-        if rs.rec.len() < n {
-            rs.rec.resize(n, 0);
+        const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
+        while rs.rec.len() < n {
+            let step = n.saturating_sub(rs.rec.len()).min(ZERO_PAGE.len());
+            if let Some(zeros) = ZERO_PAGE.get(..step) {
+                rs.rec.extend_from_slice(zeros);
+            } else {
+                break;
+            }
         }
     }
     let n = rs.body_len;
-    fill(inner, &mut rs.rec[..n], &mut rs.body_filled)?;
+    let Some(body_buf) = rs.rec.get_mut(..n) else {
+        rs.poisoned = true;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sealed record buffer short",
+        ));
+    };
+    fill(inner, body_buf, &mut rs.body_filled)?;
     record_aad(&mut rs.aad, &session.recv, rs.seq);
-    let end = match open_in_place(key, &rs.aad, &mut rs.rec[..n]) {
-        Ok(plain) => NONCE_LEN + plain.len(),
+    let end = match open_in_place(key, &rs.aad, body_buf) {
+        Ok(plain) => NONCE_LEN.saturating_add(plain.len()),
         Err(_) => {
             rs.poisoned = true;
             return Err(io::Error::new(
@@ -540,7 +647,7 @@ fn read_record<S: Read>(
             ));
         }
     };
-    rs.seq = rs.seq.wrapping_add(1);
+    rs.seq = aead_seq_monotone(rs.seq, next_seq);
     rs.pos = NONCE_LEN;
     rs.end = end;
     rs.hdr_filled = 0;
@@ -558,8 +665,11 @@ impl<S: Write> Write for SealedStream<S> {
         // One write ⇒ one or more records, all under the send lock, so records
         // from two handles never interleave within a write and each record's
         // sequence matches its position on the wire.
-        let mut tx = self.send.lock().unwrap();
-        let mut written = 0;
+        let mut tx = self
+            .send
+            .lock()
+            .map_err(|_| io::Error::other("sealed stream: send state mutex poisoned"))?;
+        let mut written = 0usize;
         for chunk in buf.chunks(MAX_PLAINTEXT) {
             if let Err(e) = write_record(&mut self.inner, &self.key, &self.session, &mut tx, chunk)
             {
@@ -570,7 +680,7 @@ impl<S: Write> Write for SealedStream<S> {
                 // next call (a record cut part-way poisons the send side).
                 return if written == 0 { Err(e) } else { Ok(written) };
             }
-            written += chunk.len();
+            written = written.saturating_add(chunk.len());
         }
         Ok(written)
     }
@@ -585,7 +695,10 @@ impl<S: Read> Read for SealedStream<S> {
         if out.is_empty() {
             return Ok(0);
         }
-        let mut rs = self.recv.lock().unwrap();
+        let mut rs = self
+            .recv
+            .lock()
+            .map_err(|_| io::Error::other("sealed stream: receive state mutex poisoned"))?;
         while rs.pos >= rs.end {
             // Drained (or nothing open yet): read and open the next record. An
             // empty record — the handshake confirm, or a peer's empty write — is
@@ -600,10 +713,14 @@ impl<S: Read> Read for SealedStream<S> {
                 return Ok(0);
             }
         }
-        let k = (rs.end - rs.pos).min(out.len());
-        let pos = rs.pos;
-        out[..k].copy_from_slice(&rs.rec[pos..pos + k]);
-        rs.pos += k;
+        let k = rs.end.saturating_sub(rs.pos).min(out.len());
+        if let (Some(dst), Some(src)) = (
+            out.get_mut(..k),
+            rs.rec.get(rs.pos..).and_then(|s| s.get(..k)),
+        ) {
+            dst.copy_from_slice(src);
+        }
+        rs.pos = rs.pos.saturating_add(k);
         Ok(k)
     }
 }
@@ -1292,5 +1409,351 @@ mod tests {
         assert_eq!(&two, b"yz");
         // Silence the unused-raw-handle lints: the raws just keep the sockets open.
         drop((a.raw_client, a.raw_server));
+    }
+
+    #[test]
+    fn an_exhausted_sender_never_seals_or_changes_the_transport() {
+        let (sc, _) = sessions();
+        let mut ordinary = SealedStream::with_session(Vec::<u8>::new(), KEY, sc.clone());
+        ordinary.write_all(b"ordinary").unwrap();
+        assert_eq!(ordinary.send_seq(), 1);
+        assert_eq!(records(ordinary.get_ref()).len(), 1);
+
+        let mut w = SealedStream::with_session(Vec::<u8>::new(), KEY, sc);
+        w.send.lock().unwrap().seq = u64::MAX - 1;
+        w.write_all(b"last")
+            .expect("the last record with a successor sequence");
+        assert_eq!(w.send_seq(), u64::MAX);
+        assert_eq!(records(w.get_ref()).len(), 1);
+        let state = |w: &SealedStream<Vec<u8>>| {
+            let tx = w.send.lock().unwrap();
+            (tx.seq, tx.poisoned, tx.rec.clone(), tx.aad.clone())
+        };
+        let before = state(&w);
+        let wire = w.get_ref().clone();
+        let mut wrong = Vec::new();
+        for attempt in 0..2 {
+            if let Ok(n) = w.write(b"must not be sealed") {
+                wrong.push(format!("attempt {attempt} accepted {n} bytes"));
+            }
+        }
+        if state(&w) != before {
+            wrong.push("send state changed".to_string());
+        }
+        if w.get_ref() != &wire {
+            wrong.push("transport gained a record".to_string());
+        }
+        assert!(
+            wrong.is_empty(),
+            "sequence exhaustion was not refused: {wrong:?}"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_receiver_never_reads_or_accepts_a_replay() {
+        struct CountReads {
+            inner: Cursor<Vec<u8>>,
+            calls: usize,
+        }
+        impl Read for CountReads {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                self.inner.read(out)
+            }
+        }
+        let (sc, ss) = sessions();
+        let mut ordinary = SealedStream::with_session(Vec::<u8>::new(), KEY, sc.clone());
+        ordinary.write_all(b"ordinary").unwrap();
+        let mut normal =
+            SealedStream::with_session(Cursor::new(ordinary.get_ref().clone()), KEY, ss.clone());
+        assert_eq!(read_all(&mut normal, 32), b"ordinary");
+        assert_eq!(normal.recv_seq(), 1);
+
+        let mut last = SealedStream::with_session(Vec::<u8>::new(), KEY, sc);
+        last.send.lock().unwrap().seq = u64::MAX - 1;
+        last.write_all(b"last").unwrap();
+        let mut aad = Vec::new();
+        record_aad(&mut aad, &ss.recv, u64::MAX);
+        let sealed = crate::seal_with_nonce(&KEY, &[0x55; NONCE_LEN], &aad, b"again");
+        assert_eq!(
+            crate::open(&KEY, &aad, &sealed).unwrap(),
+            b"again",
+            "the replay has a valid tag"
+        );
+        let mut wire = last.get_ref().clone();
+        for _ in 0..2 {
+            wire.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&sealed);
+        }
+        let mut r = SealedStream::with_session(
+            CountReads {
+                inner: Cursor::new(wire),
+                calls: 0,
+            },
+            KEY,
+            ss,
+        );
+        r.recv.lock().unwrap().seq = u64::MAX - 1;
+        let mut positive = [0u8; 4];
+        r.read_exact(&mut positive)
+            .expect("the last ordered record");
+        assert_eq!(&positive, b"last");
+        assert_eq!(r.recv_seq(), u64::MAX);
+        let state = |r: &SealedStream<CountReads>| {
+            let rx = r.recv.lock().unwrap();
+            (
+                rx.seq,
+                rx.pos,
+                rx.end,
+                rx.hdr,
+                rx.hdr_filled,
+                rx.body_len,
+                rx.body_filled,
+                rx.poisoned,
+                rx.rec.clone(),
+                rx.aad.clone(),
+            )
+        };
+        let before = state(&r);
+        let calls = r.get_ref().calls;
+        let pos = r.get_ref().inner.position();
+        let mut wrong = Vec::new();
+        for attempt in 0..2 {
+            if let Ok(n) = r.read(&mut [0u8; 5]) {
+                wrong.push(format!("attempt {attempt} accepted {n} bytes"));
+            }
+        }
+        if state(&r) != before {
+            wrong.push("receive state changed".to_string());
+        }
+        if r.get_ref().calls != calls {
+            wrong.push("transport read was attempted".to_string());
+        }
+        if r.get_ref().inner.position() != pos {
+            wrong.push("transport bytes were consumed".to_string());
+        }
+        assert!(
+            wrong.is_empty(),
+            "sequence exhaustion accepted an authentic replay: {wrong:?}"
+        );
+    }
+
+    /// An owned transport that can consume a prefix and unwind before reporting
+    /// its progress to the record adapter. The unused read direction refuses.
+    struct UnwindingWrite {
+        wire: Vec<u8>,
+        calls: usize,
+        panic_once: bool,
+    }
+
+    impl Write for UnwindingWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.panic_once {
+                self.panic_once = false;
+                self.wire.extend_from_slice(&bytes[..3]);
+                panic!("owned write unwound after three transport bytes");
+            }
+            self.wire.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Read for UnwindingWrite {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
+
+    /// The public adapter is exercised over owned bytes; its ordinary record
+    /// writes still draw their nonce from the OS CSPRNG, as production does.
+    #[test]
+    fn an_unwinding_writer_cannot_resume_a_poisoned_record() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const BINDING: &[u8] = b"owned-poisoned-record-state";
+        let transport = |panic_once| UnwindingWrite {
+            wire: Vec::new(),
+            calls: 0,
+            panic_once,
+        };
+        let mut ordinary = SealedStream::with_transcript(transport(false), KEY, BINDING, true);
+        ordinary.write_all(b"ordinary").expect("an ordinary write");
+        let mut peer = SealedStream::with_transcript(
+            Cursor::new(ordinary.get_ref().wire.clone()),
+            KEY,
+            BINDING,
+            false,
+        );
+        let mut text = [0u8; 8];
+        peer.read_exact(&mut text)
+            .expect("the ordinary record opens");
+        assert_eq!(&text, b"ordinary");
+        assert_eq!((ordinary.send_seq(), peer.recv_seq()), (1, 1));
+        eprintln!("AEAD_POISON_TX_ORDINARY_CONTROLS_REACHED");
+
+        let mut stream = SealedStream::with_transcript(transport(true), KEY, BINDING, true);
+        let unwound = catch_unwind(AssertUnwindSafe(|| stream.write(b"first")));
+        assert!(
+            unwound.is_err(),
+            "the transport unwound inside the real write"
+        );
+        assert_eq!(
+            stream.get_ref().wire.len(),
+            3,
+            "the prefix reached the transport"
+        );
+        assert!(stream.send.is_poisoned(), "the record guard saw the unwind");
+        // Inspect the failed state only; production must never resume through it.
+        let state = |s: &SealedStream<UnwindingWrite>| {
+            let tx = s.send.lock().unwrap_or_else(|p| p.into_inner());
+            (tx.seq, tx.poisoned, tx.rec.clone(), tx.aad.clone())
+        };
+        let before = state(&stream);
+        assert_eq!(
+            (before.0, before.1),
+            (0, false),
+            "no returned-I/O-error latch ran"
+        );
+        let wire = stream.get_ref().wire.clone();
+        let calls = stream.get_ref().calls;
+        let mut wrong = Vec::new();
+        for attempt in 0..2 {
+            match catch_unwind(AssertUnwindSafe(|| stream.write(b"later"))) {
+                Ok(Err(error)) if error.kind() == io::ErrorKind::Other => {}
+                Ok(answer) => wrong.push(format!("retry {attempt}: {answer:?}")),
+                Err(_) => wrong.push(format!("retry {attempt} panicked instead of refusing")),
+            }
+        }
+        if stream.get_ref().wire != wire || stream.get_ref().calls != calls {
+            wrong.push("the transport was used after the unwind".to_string());
+        }
+        if state(&stream) != before {
+            wrong.push("the poisoned record state changed".to_string());
+        }
+        assert!(
+            wrong.is_empty(),
+            "AEAD_POISON_TX_MUST_REFUSE_REUSE: {wrong:?}"
+        );
+    }
+
+    /// An owned cursor whose read consumes bytes and unwinds before returning
+    /// their count. The unused write direction refuses.
+    struct UnwindingRead {
+        wire: Cursor<Vec<u8>>,
+        calls: usize,
+        panic_at: Option<u64>,
+    }
+
+    impl Read for UnwindingRead {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if let Some(at) = self.panic_at {
+                let position = self.wire.position();
+                if at > position && at - position <= out.len() as u64 {
+                    let count = usize::try_from(at - position).expect("a short owned prefix");
+                    self.wire
+                        .read_exact(&mut out[..count])
+                        .expect("the prefix exists");
+                    self.panic_at = None;
+                    panic!("owned read unwound after consuming its prefix");
+                }
+            }
+            self.wire.read(out)
+        }
+    }
+
+    impl Write for UnwindingRead {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        }
+    }
+
+    #[test]
+    fn an_unwinding_reader_cannot_resume_a_poisoned_record() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        const BINDING: &[u8] = b"owned-poisoned-record-state";
+        let session = Session::from_binding(BINDING, false);
+        let mut aad = Vec::new();
+        record_aad(&mut aad, &session.recv, 0);
+        // A private fixed-key/fixed-nonce vector: no transport or entropy source.
+        let sealed = crate::seal_with_nonce(&KEY, &[0x55; NONCE_LEN], &aad, b"ordinary");
+        let mut wire = (sealed.len() as u32).to_le_bytes().to_vec();
+        wire.extend_from_slice(&sealed);
+        let transport = |panic_at| UnwindingRead {
+            wire: Cursor::new(wire.clone()),
+            calls: 0,
+            panic_at,
+        };
+        let mut ordinary = SealedStream::with_transcript(transport(None), KEY, BINDING, false);
+        let mut text = [0u8; 8];
+        ordinary
+            .read_exact(&mut text)
+            .expect("the authentic record opens");
+        assert_eq!(&text, b"ordinary");
+        assert_eq!(ordinary.recv_seq(), 1);
+        eprintln!("AEAD_POISON_RX_ORDINARY_CONTROLS_REACHED");
+
+        let state = |s: &SealedStream<UnwindingRead>| {
+            let rx = s.recv.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                rx.seq,
+                rx.pos,
+                rx.end,
+                rx.hdr,
+                rx.hdr_filled,
+                rx.body_len,
+                rx.body_filled,
+                rx.poisoned,
+                rx.rec.clone(),
+                rx.aad.clone(),
+            )
+        };
+        let mut wrong = Vec::new();
+        // One unwind inside the header and one inside the sealed body.
+        for at in [2, (LEN_PREFIX + 5) as u64] {
+            let mut stream =
+                SealedStream::with_transcript(transport(Some(at)), KEY, BINDING, false);
+            let unwound = catch_unwind(AssertUnwindSafe(|| stream.read(&mut [0u8; 8])));
+            assert!(unwound.is_err(), "the read unwound at offset {at}");
+            assert_eq!(
+                stream.get_ref().wire.position(),
+                at,
+                "the owned prefix was consumed"
+            );
+            assert!(stream.recv.is_poisoned(), "the record guard saw the unwind");
+            let before = state(&stream);
+            let calls = stream.get_ref().calls;
+            for attempt in 0..2 {
+                let mut out = [0xa5u8; 8];
+                match catch_unwind(AssertUnwindSafe(|| stream.read(&mut out))) {
+                    Ok(Err(error)) if error.kind() == io::ErrorKind::Other => {}
+                    Ok(answer) => wrong.push(format!("offset {at}, retry {attempt}: {answer:?}")),
+                    Err(_) => wrong.push(format!("offset {at}, retry {attempt} panicked")),
+                }
+                if out != [0xa5u8; 8] {
+                    wrong.push(format!("offset {at}: caller output changed"));
+                }
+            }
+            if stream.get_ref().calls != calls || stream.get_ref().wire.position() != at {
+                wrong.push(format!("offset {at}: transport used after the unwind"));
+            }
+            if state(&stream) != before {
+                wrong.push(format!("offset {at}: poisoned record state changed"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "AEAD_POISON_RX_MUST_REFUSE_REUSE: {wrong:?}"
+        );
     }
 }

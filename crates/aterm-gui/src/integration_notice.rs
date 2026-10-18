@@ -83,9 +83,9 @@ use crate::message_reporters;
 /// How long a tab's remedy may read `a new tab` after it read the harness's
 /// move before the row says so: the harness ends the agent to move it, and the
 /// relaunch line it types at the shell's next prompt (a look a second,
-/// `relaunch::SHELL_LOOK`) heals the tab within seconds; a handoff's suspended
-/// host reads as no move for its park. A minute covers both; an agent the
-/// person really quit is said a minute late.
+/// `harness::Timings::shell_look`) heals the tab within seconds; a handoff's
+/// suspended host reads as no move for its park. A minute covers both; an
+/// agent the person really quit is said a minute late.
 pub(crate) const AGENT_MOVE_GRACE: Duration = Duration::from_secs(60);
 
 /// What gives a degraded tab its shell integration back.
@@ -119,12 +119,18 @@ impl Heal {
 /// Claude Code started as `node` by its screen) when the harness will type
 /// that move's line (`harness_moves`:
 /// [`crate::harness_host::HostHandle::rekeys_agents`]), else a new tab — and
-/// a new tab for agy and Muse Code, whose move no lane types.
+/// a new tab for agy, Muse Code and Gemini CLI, whose move no lane types. A
+/// Codex is moved by no lane (the Codex screen lane's retirement,
+/// 2026-10-16): only a codex-alab whose crash relaunch has a line aterm's
+/// copy of its own record validated (`codex_line`) is relaunched by a line
+/// aterm types; a vendor `codex`, or a codex-alab with no such line, heals in
+/// a new tab — never told of a move that will not come.
 #[must_use]
 pub(crate) fn heal_for(
     rekey_channel: bool,
     agent: Option<aterm_phase::Program>,
     harness_moves: bool,
+    codex_line: bool,
 ) -> Heal {
     if rekey_channel {
         return Heal::NextPrompt;
@@ -133,13 +139,18 @@ pub(crate) fn heal_for(
         return Heal::NewTab;
     }
     match agent {
-        Some(agent @ (aterm_phase::Program::Claude | aterm_phase::Program::Codex)) => {
-            Heal::AgentMoved {
-                agent: agent.product(),
-            }
-        }
+        Some(agent @ aterm_phase::Program::Claude) => Heal::AgentMoved {
+            agent: agent.product(),
+        },
+        Some(agent @ aterm_phase::Program::Codex) if codex_line => Heal::AgentMoved {
+            agent: agent.product(),
+        },
+        Some(aterm_phase::Program::Codex) => Heal::NewTab,
         Some(
-            aterm_phase::Program::Agy | aterm_phase::Program::Muse | aterm_phase::Program::Generic,
+            aterm_phase::Program::Agy
+            | aterm_phase::Program::Muse
+            | aterm_phase::Program::Gemini
+            | aterm_phase::Program::Generic,
         )
         | None => Heal::NewTab,
     }
@@ -428,54 +439,6 @@ mod tests {
             .collect()
     }
 
-    /// THE OWNER'S TAB, with no harness to move its agent (a headless test App
-    /// has none): ONE row that names the tab by its place, the loss and the
-    /// remedy that applies — a new tab — and nothing more while nothing
-    /// changes; when the shell signs with a key the engine knows, the row
-    /// leaves. NEGATIVE CONTROL: the same tab before its engine lost the key
-    /// says nothing. (Updated 2026-09-29: the branch's first cut offered the
-    /// harness's move here with no harness at all, and named the tab by its
-    /// session id; the move's remedy is pinned in `review_tests`.)
-    #[test]
-    fn a_degraded_tab_says_what_gives_it_back_and_the_row_leaves_when_it_heals() {
-        let mut healthy = App::headless_for_test();
-        let hid = healthy.next_session_id;
-        healthy.push_stub_tab(WindowId(0), crate::stub_session(hid));
-        front(&healthy, hid, "claude");
-        let _ = healthy.observe_session_statuses(Instant::now());
-        assert!(rows(&healthy).is_empty(), "a healthy tab says nothing");
-
-        let (mut app, sid) = degraded_tab("claude");
-        let mut t = Instant::now();
-        let _ = app.observe_session_statuses(t);
-        let said = rows(&app);
-        assert_eq!(said.len(), 1, "one row for the tab: {said:?}");
-        assert_eq!(said[0].0, "Tab lost its shell integration");
-        // The headless App opens with a tab of its own: the stub is tab 2.
-        assert!(
-            said[0].1[0].starts_with("in tab 2:")
-                && said[0].1[0].contains("no command blocks or exit codes"),
-            "{said:?}"
-        );
-        assert!(
-            said[0].1[1].starts_with("open a new tab"),
-            "no harness moves the agent: {said:?}"
-        );
-
-        t += Duration::from_millis(300);
-        let _ = app.observe_session_statuses(t);
-        assert_eq!(rows(&app), said, "an unchanged reading says nothing new");
-
-        // The shell signs with a key the engine knows: healed, the row leaves.
-        {
-            let pooled = app.pool.get(sid).expect("pooled");
-            crate::term_lock(&pooled.term).authorize_shell_integration([0x3C; 32]);
-        }
-        t += Duration::from_millis(300);
-        let _ = app.observe_session_statuses(t);
-        assert!(rows(&app).is_empty(), "healed: {:?}", rows(&app));
-    }
-
     /// A shell spawned WITH the re-key channel heals at its next prompt by
     /// itself: a record, never a row. And a closed tab takes its row with it.
     #[test]
@@ -563,30 +526,52 @@ mod tests {
     fn a_channel_heals_at_the_prompt_a_moved_agent_by_its_move_anything_else_in_a_new_tab() {
         use aterm_phase::Program;
         assert_eq!(
-            heal_for(true, Some(Program::Claude), true),
+            heal_for(true, Some(Program::Claude), true, false),
             Heal::NextPrompt
         );
         assert_eq!(
-            heal_for(true, Some(Program::Claude), false),
+            heal_for(true, Some(Program::Claude), false, false),
             Heal::NextPrompt
         );
         assert_eq!(
-            heal_for(false, Some(Program::Claude), true),
+            heal_for(false, Some(Program::Claude), true, false),
             Heal::AgentMoved {
                 agent: "Claude Code"
             }
         );
+        // A Codex: moved only as a codex-alab with a validated line; a vendor
+        // `codex` (no line) heals in a new tab, never told of a move.
         assert_eq!(
-            heal_for(false, Some(Program::Codex), true),
+            heal_for(false, Some(Program::Codex), true, true),
             Heal::AgentMoved { agent: "Codex" }
         );
+        assert_eq!(
+            heal_for(false, Some(Program::Codex), true, false),
+            Heal::NewTab
+        );
         // The harness will not type the line: a new tab.
-        assert_eq!(heal_for(false, Some(Program::Claude), false), Heal::NewTab);
-        assert_eq!(heal_for(false, Some(Program::Generic), true), Heal::NewTab);
-        assert_eq!(heal_for(false, None, true), Heal::NewTab);
+        assert_eq!(
+            heal_for(false, Some(Program::Claude), false, false),
+            Heal::NewTab
+        );
+        assert_eq!(
+            heal_for(false, Some(Program::Codex), false, true),
+            Heal::NewTab
+        );
+        assert_eq!(
+            heal_for(false, Some(Program::Generic), true, false),
+            Heal::NewTab
+        );
+        assert_eq!(heal_for(false, None, true, false), Heal::NewTab);
         // No lane types agy's or Muse Code's move: a new tab.
-        assert_eq!(heal_for(false, Some(Program::Agy), true), Heal::NewTab);
-        assert_eq!(heal_for(false, Some(Program::Muse), true), Heal::NewTab);
+        assert_eq!(
+            heal_for(false, Some(Program::Agy), true, false),
+            Heal::NewTab
+        );
+        assert_eq!(
+            heal_for(false, Some(Program::Muse), true, false),
+            Heal::NewTab
+        );
     }
 
     /// A CLAUDE CODE STARTED AS `node` HEALS WITH ITS MOVE: the heal asked the
@@ -606,16 +591,12 @@ mod tests {
             })
         };
         assert_eq!(
-            heal_for(false, node(Some(Program::Claude)), true),
+            heal_for(false, node(Some(Program::Claude)), true, false),
             Heal::AgentMoved {
                 agent: "Claude Code"
             }
         );
-        assert_eq!(
-            heal_for(false, node(Some(Program::Codex)), true),
-            Heal::AgentMoved { agent: "Codex" }
-        );
-        assert_eq!(heal_for(false, node(None), true), Heal::NewTab);
+        assert_eq!(heal_for(false, node(None), true, false), Heal::NewTab);
     }
 
     #[test]

@@ -287,7 +287,7 @@ pub(crate) fn parse_stamp(stamp: &str) -> Option<(u64, [u8; 32], u64)> {
 /// Through v0.97.0 the export wrote such a line as it was, and the import
 /// refused the whole sidecar for it: one row of a dozen 8 KiB links cost a tab
 /// its entire carried history (2026-09-28).
-fn strip_over_cap_links(lines: &mut [Line], cols: u16) -> u64 {
+pub(crate) fn strip_over_cap_links(lines: &mut [Line], cols: u16) -> u64 {
     let (_, record_cap) = line_caps(cols);
     let mut stripped = 0;
     for line in lines.iter_mut().filter(|line| line.has_hyperlinks()) {
@@ -314,7 +314,17 @@ struct SidecarLines {
 /// Stream one sidecar: `take` must not exceed what the header names, the
 /// bytes must be exactly `len` long and hash to `sha`, and every frame read
 /// must decode strictly. Returns the width the lines are wrapped at and the
-/// FIRST `take` lines. Frames past `take` are hashed and never decoded.
+/// FIRST `take` lines after `skip`. Frames past them are hashed and never
+/// decoded.
+///
+/// `sha` is `None` for a frame stream with no stamp to hash it against: a
+/// crash restore's history ring ([`CarrySource::Journal`]), whose every chunk
+/// the restore already checked against its own CRC frame, dense step and row
+/// run before it came here. Everything else holds for it as for a sidecar.
+/// So is `skip`, the lines decoded and dropped at the front before the `take`
+/// kept: the ring's first chunk can begin below the first line the join takes
+/// (an update's sidecar begins at it, and passes 0). The bound a sidecar may
+/// hold is on `take`, the lines kept, never on what is skipped.
 ///
 /// ONE LENIENCY (2026-09-28, law L3 of the fixture README: a consumer only
 /// ever becomes more lenient). A line record over the record cap
@@ -330,7 +340,8 @@ struct SidecarLines {
 fn read_sidecar(
     mut reader: impl std::io::Read,
     len: u64,
-    sha: &[u8; 32],
+    sha: Option<&[u8; 32]>,
+    skip: u64,
     take: u64,
 ) -> Result<SidecarLines, &'static str> {
     let mut hasher = aterm_digest::Sha256::new();
@@ -359,6 +370,8 @@ fn read_sidecar(
     let want = usize::try_from(take).map_err(|_| "more lines than this process can hold")?;
     out.try_reserve_exact(want)
         .map_err(|_| "more lines than this process can hold")?;
+    // Lines still to drop before the first one kept.
+    let mut skipping = skip;
     let mut frame = Vec::new();
     while read < len {
         let mut size = [0u8; 4];
@@ -391,11 +404,19 @@ fn read_sidecar(
                     record_cap,
                 )
                 .ok_or("a frame that does not decode")?;
+            let drop = usize::try_from(skipping)
+                .unwrap_or(usize::MAX)
+                .min(decoded.len());
+            skipping -= drop as u64;
             let room = want - out.len();
             // Only the lines kept count: one past `take` is the checkpoint's
-            // to carry, and the screen carry says its own.
-            links_dropped += stripped.iter().filter(|&&at| at < room).count() as u64;
-            out.extend(decoded.into_iter().take(room));
+            // to carry, and the screen carry says its own; one skipped is not
+            // carried at all.
+            links_dropped += stripped
+                .iter()
+                .filter(|&&at| at >= drop && at - drop < room)
+                .count() as u64;
+            out.extend(decoded.into_iter().skip(drop).take(room));
         }
     }
     // Nothing may follow the stamped length.
@@ -403,7 +424,7 @@ fn read_sidecar(
     if read != len || reader.read(&mut tail).map_err(|_| "unreadable")? != 0 {
         return Err("a length other than its stamp");
     }
-    if hasher.finalize() != *sha {
+    if sha.is_some_and(|sha| hasher.finalize() != *sha) {
         return Err("a sha other than its stamp");
     }
     if out.len() != want {
@@ -765,8 +786,8 @@ impl HistoryExporter {
     /// which exports under the park), it stops after the first pass. The
     /// sidecars together stay within [`MAX_AGGREGATE_BYTES`].
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "NativeUpdateHistoryCarry",
             action = "Export",
             project = "aterm_gui::handoff_history::conformance::project"
@@ -809,12 +830,12 @@ impl HistoryExporter {
             aterm_uds::rand::hex_token::<16>().unwrap_or_else(|_| "0".repeat(32)),
             ATTEMPTS.fetch_add(1, Ordering::Relaxed)
         );
-        let worker = std::thread::Builder::new()
-            .name("aterm-history-export".to_string())
-            .spawn(move || {
+        let worker = crate::qos::spawn_lane_thread(
+            "aterm-history-export".to_string(),
+            crate::qos::Role::Responsive,
+            move || {
                 // It takes each session's terminal lock, which the UI thread
                 // contends: Responsive is the floor for such a holder (`qos`).
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 let stop = Stop {
                     cancel: &worker_cancel,
                     pause: &worker_pause,
@@ -822,9 +843,10 @@ impl HistoryExporter {
                 run_export(&dir, &tag, &sessions, follow, cap, stop, &tx);
                 #[cfg(test)]
                 worker_exited.store(true, Ordering::Release);
-            })?
-            .thread()
-            .clone();
+            },
+        )?
+        .thread()
+        .clone();
         Ok(Self {
             events,
             cancel,
@@ -984,6 +1006,7 @@ impl HistoryExporter {
     /// does by itself: it is stopped here), then stop it — allowing it
     /// [`HALT_WAIT`] to hand over what it finished — and hand that over. A
     /// session it had not finished is not in the result.
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn finish(self, wait: Duration) -> ExportResults {
         self.finish_by(std::time::Instant::now() + wait)
     }
@@ -1934,8 +1957,8 @@ pub(crate) struct Joined {
 /// and every other line the park saw is dropped.
 #[must_use]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateHistoryCarry",
         action = "Park",
         project = "aterm_gui::handoff_history::conformance::project"
@@ -2290,40 +2313,147 @@ pub(crate) fn log_verdicts(verdicts: &[(u64, Joined)]) {
 // The incoming side: take before the proof, import after Commit
 // ---------------------------------------------------------------------------
 
-/// One session's history sidecar, opened (and unlinked) before the proof and
-/// read only after Commit.
+/// One session's carried history, read only after Commit (an update) or after the
+/// recovery's restore drain (a crash restore): where its lines come from, and how many.
 pub(crate) struct HistoryCarry {
-    file: std::fs::File,
-    len: u64,
-    sha: [u8; 32],
+    source: CarrySource,
     take: u64,
+}
+
+/// Where a [`HistoryCarry`]'s lines come from. Both are read by [`read_sidecar`], so a
+/// crash restore's history is decoded, link leniency and all, exactly as an update's.
+enum CarrySource {
+    /// An update's sidecar, opened (and unlinked) before the proof: its stamped length
+    /// and digest.
+    Sidecar {
+        file: std::fs::File,
+        len: u64,
+        sha: [u8; 32],
+    },
+    /// A crash restore's history ring (`crash_restore`, the plan's increment 5): the
+    /// chunks the restore copied out of the dead window's region, oldest first, each one
+    /// sidecar frame compressed, and the width they are wrapped at. Read as a sidecar's
+    /// header and then each frame decompressed in turn ([`JournalFrames`]), with no
+    /// digest: every chunk passed its CRC frame, its dense step and its row run in the
+    /// restore. The first `skip` lines are the first chunk's below the join's first row
+    /// (fewer than one chunk holds: `aterm_restore::Restored::ring_chunks_for` leaves out
+    /// every chunk wholly below it), decoded and dropped. Unix only, as the crash restore
+    /// and its crate are.
+    #[cfg(unix)]
+    Journal {
+        chunks: Vec<aterm_restore::HistoryChunk>,
+        cols: u16,
+        skip: u64,
+    },
 }
 
 impl std::fmt::Debug for HistoryCarry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("HistoryCarry")
-            .field("len", &self.len)
-            .field("take", &self.take)
-            .finish_non_exhaustive()
+        let mut f = formatter.debug_struct("HistoryCarry");
+        match &self.source {
+            CarrySource::Sidecar { len, .. } => f.field("len", len),
+            #[cfg(unix)]
+            CarrySource::Journal { chunks, skip, .. } => {
+                f.field("chunks", &chunks.len()).field("skip", skip)
+            }
+        };
+        f.field("take", &self.take).finish_non_exhaustive()
     }
 }
 
 impl HistoryCarry {
+    /// A crash restore's carry: `take` lines of the history ring's `chunks` (wrapped at
+    /// `cols`) after the first `skip` ([`CarrySource::Journal`]).
+    #[cfg(unix)]
+    pub(crate) fn journal(
+        chunks: Vec<aterm_restore::HistoryChunk>,
+        cols: u16,
+        skip: u64,
+        take: u64,
+    ) -> Self {
+        Self {
+            source: CarrySource::Journal { chunks, cols, skip },
+            take,
+        }
+    }
+
     /// How many lines the carry names — what is lost if it fails.
     #[must_use]
     pub(crate) fn take(&self) -> u64 {
         self.take
     }
 
-    /// Read, check and decode the sidecar — see [`read_sidecar`].
+    /// Read, check and decode the carry — see [`read_sidecar`].
     fn read_verified(self) -> Result<SidecarLines, &'static str> {
-        read_sidecar(
-            std::io::BufReader::new(self.file),
-            self.len,
-            &self.sha,
-            self.take,
-        )
+        match self.source {
+            CarrySource::Sidecar { file, len, sha } => {
+                read_sidecar(std::io::BufReader::new(file), len, Some(&sha), 0, self.take)
+            }
+            #[cfg(unix)]
+            CarrySource::Journal { chunks, cols, skip } => {
+                let frames = JournalFrames::new(chunks, cols)?;
+                let len = frames.len;
+                read_sidecar(frames, len, None, skip, self.take)
+            }
+        }
+    }
+}
+
+/// A crash restore's history ring chunks as one sidecar's bytes, for [`read_sidecar`]:
+/// the sidecar header at the ring's width, then each chunk's frame decompressed in turn,
+/// one at a time (only the frame being read is held decompressed). The length is known
+/// before anything is decompressed: the header's, plus what each chunk's LZ4 prefix says
+/// within the bound its line count and width allow
+/// (`aterm_restore::HistoryChunk::frame_size`). A frame that does not decompress to
+/// exactly that is a read error, which the decoder reports as a truncated frame.
+#[cfg(unix)]
+struct JournalFrames {
+    chunks: std::collections::VecDeque<aterm_restore::HistoryChunk>,
+    /// What is being read: the header, then the current frame.
+    current: Vec<u8>,
+    at: usize,
+    len: u64,
+}
+
+#[cfg(unix)]
+impl JournalFrames {
+    fn new(chunks: Vec<aterm_restore::HistoryChunk>, cols: u16) -> Result<Self, &'static str> {
+        let mut len = HEADER_LEN as u64;
+        for chunk in &chunks {
+            if chunk.identity.cols != cols {
+                return Err("a frame wrapped at another width");
+            }
+            let size = chunk
+                .frame_size()
+                .map_err(|_| "a frame that does not decode")?;
+            len = len.saturating_add(size as u64);
+        }
+        Ok(Self {
+            chunks: chunks.into(),
+            current: header(cols).to_vec(),
+            at: 0,
+            len,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl std::io::Read for JournalFrames {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.at == self.current.len() {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            let frame = chunk
+                .frame()
+                .map_err(|_| std::io::Error::other("a history chunk that does not decompress"))?;
+            self.current = frame;
+            self.at = 0;
+        }
+        let n = out.len().min(self.current.len() - self.at);
+        out[..n].copy_from_slice(&self.current[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
     }
 }
 
@@ -2363,9 +2493,7 @@ pub(crate) fn take_sidecar(
         }
         *remaining -= len;
         Ok(HistoryCarry {
-            file,
-            len,
-            sha,
+            source: CarrySource::Sidecar { file, len, sha },
             take,
         })
     })();
@@ -2890,8 +3018,8 @@ pub(crate) struct ImportJob {
 
 /// Run every job, in order, and report each.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "NativeUpdateHistoryCarry",
         action = "Settle",
         project = "aterm_gui::handoff_history::conformance::project"

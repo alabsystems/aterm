@@ -8,12 +8,14 @@
 // `HaloMode::Over` (light-theme veil; CPU `over_rgb` == GPU `fs_rain_glow_over`) over dark and
 // white frames and on the cached path.
 //
-// No GPU or no font: no-op. Byte-exact additive checks also skip on downlevel (sRGB-offscreen)
-// adapters (`additive_is_byte_exact`).
+// No GPU or no font: COULD NOT RUN. On a downlevel (sRGB-offscreen) adapter
+// (`additive_is_byte_exact`) a test runs its other checks, then ends COULD NOT
+// RUN naming the byte-exact comparisons it could not make (`common::ByteExact`).
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{HaloMode, RainHalo, Theme, WindowCpu};
 
+use crate::common::ByteExact;
 use crate::common::{assert_byte_exact, backends, bb, block_text_term, gg, max_channel_delta, rr};
 
 /// Emit one halo as per-row-band quads: the rect `centre ± (rx, ry)` clamped
@@ -64,6 +66,7 @@ fn emit_halo(
 /// over text must be byte-identical on both backends.
 #[test]
 fn glow_halo_synthetic_field_is_byte_exact_over_text() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win = aterm_gpu::WindowGpu::new();
@@ -172,13 +175,11 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
     );
     // Byte-exact additive holds only on native (plain-Unorm offscreen); a downlevel sRGB
     // offscreen does the add in linear.
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "byte-exact glow_halo gate") {
         assert_eq!(
             delta, 0,
             "glow_halo radial additive must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP byte-exact glow_halo gate: downlevel sRGB offscreen (linear add)");
     }
 }
 
@@ -188,6 +189,7 @@ fn glow_halo_synthetic_field_is_byte_exact_over_text() {
 /// byte-exact.
 #[test]
 fn damaged_path_glow_halo_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     let theme = Theme::default();
     let (mut cpu, mut gpu) = backends(18.0, theme);
     let mut win_cpu = WindowCpu::new();
@@ -245,13 +247,11 @@ fn damaged_path_glow_halo_parity_cpu_matches_gpu() {
     // ... and byte-exact across backends over the glyph-free background.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path glow_halo CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "damaged-path byte-exact glow_halo gate") {
         assert_eq!(
             delta, 0,
             "glow_halo over bg via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
         );
-    } else {
-        eprintln!("SKIP damaged-path byte-exact glow_halo gate: downlevel sRGB offscreen");
     }
 }
 
@@ -271,6 +271,7 @@ fn light_theme() -> Theme {
 /// veil must visibly darken the frame, so the check is non-vacuous.
 #[test]
 fn over_veils_byte_exact_over_dark_and_light_frames() {
+    let exact = ByteExact::default();
     for (label, theme) in [("dark", Theme::default()), ("light", light_theme())] {
         let (mut cpu, mut gpu) = backends(18.0, theme);
         let mut win = aterm_gpu::WindowGpu::new();
@@ -368,7 +369,7 @@ fn over_veils_byte_exact_over_dark_and_light_frames() {
             "glow_halo Over ({label}) GPU vs CPU max per-channel delta = {delta} ({} quads)",
             input.glow_halo.len()
         );
-        if gpu.additive_is_byte_exact() {
+        if exact.holds(&gpu, "byte-exact Over gate ({label})") {
             assert_byte_exact(
                 "over_veils_byte_exact_over_dark_and_light_frames",
                 &format!("glow_halo Over ({label})"),
@@ -376,8 +377,6 @@ fn over_veils_byte_exact_over_dark_and_light_frames() {
                 delta,
                 format_args!("({label}) Over veils must be BYTE-EXACT CPU==GPU (got {delta})"),
             );
-        } else {
-            eprintln!("SKIP byte-exact Over gate ({label}): downlevel sRGB offscreen");
         }
     }
 }
@@ -392,6 +391,7 @@ fn luma(p: u32) -> i32 {
 /// byte-exact (the Over pipeline inside the scissored repaint).
 #[test]
 fn damaged_path_over_veil_parity_cpu_matches_gpu() {
+    let exact = ByteExact::default();
     let (mut cpu, mut gpu) = backends(18.0, light_theme());
     let mut win_cpu = WindowCpu::new();
     let mut win_gpu = aterm_gpu::WindowGpu::new();
@@ -453,7 +453,7 @@ fn damaged_path_over_veil_parity_cpu_matches_gpu() {
     // ... and byte-exact across backends over the glyph-free background.
     let delta = max_channel_delta(&cpu_b, &gpu_b);
     eprintln!("damaged-path Over veil CPU vs GPU max per-channel delta = {delta}");
-    if gpu.additive_is_byte_exact() {
+    if exact.holds(&gpu, "damaged-path byte-exact Over gate") {
         assert_byte_exact(
             "damaged_path_over_veil_parity_cpu_matches_gpu",
             "damaged-path Over veil",
@@ -461,7 +461,5 @@ fn damaged_path_over_veil_parity_cpu_matches_gpu() {
             delta,
             format_args!("Over veil via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"),
         );
-    } else {
-        eprintln!("SKIP damaged-path byte-exact Over gate: downlevel sRGB offscreen");
     }
 }

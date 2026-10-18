@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# aterm-restore's lint config: the workspace clippy.toml's rows (clippy reads only the
+# nearest file, so they are repeated here word for word; the root file says why
+# each exists) and THE INJECTED CLOCK.
+#
+# THE INJECTED CLOCK. The crash-restore journal never samples a clock: the keyframe
+# policy is a pure state machine that the parse thread hands the time
+# (`KeyframePolicy::after_slice(now_ms, ..)`), so a test drives every rule (the 200 ms
+# quiescence, the 1 s period, the 100 ms pressure gap) without sleeping, and the
+# recovery is a function of the region's bytes alone. `aterm_time::Instant::now` is
+# `std::time::Instant::now` on every native target, so the std row names it too;
+# `elapsed` reads the clock as well.
+disallowed-methods = [
+  { path = "std::fs::File::lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::try_lock_shared", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "std::fs::File::sync_all", reason = "finish the write with aterm_durable::durable or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "std::fs::File::sync_data", reason = "finish the write with aterm_durable::durable_data or aterm_durable::ordered: name what a power loss may leave (clippy.toml: a chosen flush)" },
+  { path = "libc::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "rustix::fs::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "nix::fcntl::flock", reason = "take it through a guard whose Drop releases by LOCK_UN (clippy.toml: the flock release rule)" },
+  { path = "libc::forkpty", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "libc::execvp", reason = "the shell runs through aterm-pty's confined spawn (clippy.toml: the confined shell)" },
+  { path = "std::process::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::abort", reason = "die by SIGKILL: aterm_uds::process::kill_self_now() (clippy.toml: no core-dump death)" },
+  { path = "libc::raise", reason = "a raised core signal writes a crash report: die by SIGKILL (clippy.toml: no core-dump death)" },
+  { path = "std::os::windows::process::CommandExt::creation_flags", reason = "set a child's console with aterm_uds::spawn (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::System::Threading::CreateProcessA", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows_sys::Win32::UI::Shell::ShellExecuteExW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows::Win32::System::Threading::CreateProcessW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "windows::Win32::UI::Shell::ShellExecuteW", reason = "start children with aterm_uds::spawnfd::command (clippy.toml: one Windows console decision)", allow-invalid = true },
+  { path = "winit::event_loop::EventLoop::new", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "winit::event_loop::EventLoop::builder", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "winit::event_loop::EventLoop::with_user_event", reason = "build the loop with aterm_gui's driver_event_loop_builder (clippy.toml: a quiet event loop)" },
+  { path = "std::time::Instant::now", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+  { path = "std::time::SystemTime::now", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+  { path = "std::time::Instant::elapsed", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+  { path = "std::time::SystemTime::elapsed", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+  { path = "aterm_time::since_epoch", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+  { path = "aterm_time::unix_secs", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+  { path = "aterm_time::unix_millis", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+  { path = "aterm_types::shell_types::current_time_ms", reason = "the crash-restore journal reads no clock: the parse thread hands the policy the time (clippy.toml: the injected clock)" },
+]
+disallowed-types = [
+  { path = "std::process::Command", reason = "build children with aterm_uds::spawnfd::command, which hands them stdio and nothing else (clippy.toml: one child constructor)" },
+]

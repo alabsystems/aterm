@@ -14,7 +14,8 @@ use aterm_gpu::video_tap::{
     ordered_capture_store_push, presented_frame_transition, video_present_decision,
     video_slot_transition,
 };
-use aterm_spec::derive::{Model, presented_frame_tap_model, video_tap_slot_model};
+use aterm_models_misc::{presented_frame_tap_model, video_tap_slot_model};
+use aterm_spec::derive::Model;
 
 type State = BTreeMap<&'static str, i64>;
 

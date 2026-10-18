@@ -6,32 +6,53 @@
 //!
 //! - [`Fold::apply`] reads no clock and is idempotent by seq: a record whose
 //!   seq was already applied changes nothing. A `gap why=handoff epoch=<e>`
-//!   of an epoch newer than the fold's starts that epoch, whose seqs
-//!   restart; the same gap seen again is a seq already applied.
+//!   of an epoch newer than the fold's starts that epoch over; the same gap
+//!   seen again is a seq already applied. A carried update's `mark - handoff
+//!   epoch=<e>` only raises the epoch: what was open stays open.
+//! - [`Fold::snapshot`] and [`Fold::from_snapshot`] carry the fold across a
+//!   seamless update as it stands (`fold_snap.rs`).
 //! - Time enters only when the state is read: [`Fold::clause`] and
 //!   [`Fold::hints`] take `now_wall`.
 //! - **Needs** open when their step opens (`approval`, `question`, `wall`,
 //!   `stall` as `unresponsive`), when a run fails (`failure`), when the
 //!   session closes (`exited`), and on a `need` mark (`escalated`, `review`,
 //!   `decision`, `help`). They close when the step closes, on `seen` (a
-//!   failure), or on a `clear` from whoever raised them or from the owner;
+//!   failure), or on a `clear` from whoever raised them or from the owner
+//!   (a claim's `clear`, src=mark, lifts only needs a claim raised:
+//!   [`clear_lifts`]);
 //!   a run's failure also closes when a later run of its kind ends `ok` or
 //!   `fail`, the newest command's outcome being the one that counts
 //!   ([`lifts_failure`]).
 //!   A `need` mark raises only `review`, `decision` or `help` (`escalated`
 //!   only from `src=meta`, the owner's attention flag): a claim never
-//!   raises an observed need's word.
+//!   raises an observed need's word. A need is its raiser's: one raised
+//!   again by ANOTHER author is that author's own need beside it, never a
+//!   takeover of the first (whose raiser alone, or an author that
+//!   [`Actor::overrides`] it, may lift it).
 //!   Precedence: approval > question > wall > unresponsive > failure >
-//!   escalated > exited > raised by a mark ([`need_precedence`]).
+//!   escalated > exited > raised by a mark, a proven author's before an
+//!   Owner client's before any other's ([`need_precedence`]).
 //! - **Silence never raises a need**: [`Hints::quiet_for_ms`] is a hint.
 //! - **The confidence law** (§3.7): for each (node, key) the value of the
 //!   highest confidence wins, ties to the later seq; a claim never overrides
 //!   an observation.
+//! - **Claims** (`verdict`, `label`) are kept as made, the newest of any
+//!   author; beside it the newest of a trusted author (the harness or the
+//!   owner class, [`Actor::is_trusted`]), which no other author displaces;
+//!   and beside that the newest of a PROVEN author (the harness or the
+//!   person, [`Actor::is_proven`]), which no `ctl` claim displaces — `ctl`
+//!   is every in-session client, the supervised agent included. The clause
+//!   and `brief` show a label only from the proven slot, else the trusted
+//!   one.
 
 use crate::field::{Key, Val};
 use crate::rec::Rec;
+
+#[path = "fold_snap.rs"]
+mod snap;
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, Src};
 use crate::words::{BoxWord, WallKind, need_rank};
+pub use snap::SnapError;
 
 /// The most needs the state holds; a less urgent one gives way.
 pub const MAX_NEEDS: usize = 8;
@@ -247,6 +268,43 @@ pub struct Claim {
     pub until: Option<u64>,
     /// The seq that set it.
     pub seq: u64,
+    /// The name its author declared for itself (`as=`): a claim about a
+    /// claim, printed as `as=`, never as `by=`.
+    pub as_name: Option<String>,
+    /// The record or mail it is about (`re=<seq|@off>`).
+    pub re: Option<crate::vocab::ShortId>,
+}
+
+impl Claim {
+    /// The claim a `verdict` or `label` mark makes: its word or text and
+    /// `ttl=`, `as=` and `re=` (`None` for a mark that carries neither a word
+    /// nor a text).
+    fn of(r: &Rec, label: bool) -> Option<Claim> {
+        let (word, text, until) = if label {
+            let text = r.f.get_str(Key::Text)?.to_string();
+            let ttl =
+                r.f.get_u(Key::Ttl)
+                    .map_or(LABEL_TTL_MS, |s| s.saturating_mul(1000))
+                    .min(LABEL_TTL_MAX_MS);
+            (None, Some(text), Some(r.t.saturating_add(ttl)))
+        } else {
+            (Some(r.f.get_word(Key::Word)?), None, None)
+        };
+        let re = match r.f.get(Key::Re) {
+            Some(Val::Id(id)) => Some(*id),
+            _ => None,
+        };
+        Some(Claim {
+            word,
+            text,
+            by: r.by,
+            t: r.t,
+            until,
+            seq: r.seq,
+            as_name: r.f.get_str(Key::As).map(str::to_string),
+            re,
+        })
+    }
 }
 
 /// What the session is doing, by its newest verdict: the agent word, else
@@ -335,10 +393,25 @@ pub struct SessionState {
     pub totals: Totals,
     /// Mail delivered and not yet marked seen.
     pub mail_open: u16,
-    /// The newest verdict claim.
+    /// The newest verdict claim, of any author.
     pub verdict: Option<Claim>,
-    /// The newest label claim.
+    /// The newest label claim, of any author.
     pub label: Option<Claim>,
+    /// The newest verdict claim of a trusted author ([`Actor::is_trusted`]:
+    /// the harness or the owner), kept beside [`Self::verdict`] so no other
+    /// author's newer verdict displaces it (phase 3A ruling R13).
+    pub verdict_trusted: Option<Claim>,
+    /// The newest label claim of a trusted author: the label `brief` and
+    /// the clause show when no proven author's stands (§7.3, D6).
+    pub label_trusted: Option<Claim>,
+    /// The newest verdict claim of a PROVEN author ([`Actor::is_proven`]:
+    /// the harness or the person), kept beside the trusted one so no `ctl`
+    /// claim — which any process in a session can make, the agent the
+    /// harness judges among them — displaces the harness's verdict.
+    pub verdict_proven: Option<Claim>,
+    /// The newest label claim of a proven author: the label `brief` and the
+    /// clause show first.
+    pub label_proven: Option<Claim>,
     /// The session's own close, once it closed.
     pub closed: Option<ClosedNode>,
     /// The newest record's time (wall ms).
@@ -503,6 +576,51 @@ pub fn age_short(ms: u64) -> String {
     }
 }
 
+/// [`Fold::bus_facts`]: what a bus fold seeded from a snapshot holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusFacts {
+    /// The epoch.
+    pub ep: u32,
+    /// The bus class's open path: run, turn, need-bearing step.
+    pub open: [Option<(Node, Kind)>; 3],
+    /// The open needs, most urgent first: word, node, raiser, source.
+    pub needs: Vec<(&'static str, Node, Actor, Src)>,
+}
+
+/// [`Fold::bus_totals`]: the counters a bus fold holding a session from its
+/// first record agrees on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BusTotals {
+    /// Turns opened.
+    pub turns: u32,
+    /// Turns closed `done`.
+    pub done: u32,
+    /// Turns closed `asked`.
+    pub asked: u32,
+    /// Turns closed on a wall.
+    pub walled: u32,
+    /// Turns closed `interrupted`.
+    pub interrupted: u32,
+    /// Turns closed `error`.
+    pub errors: u32,
+    /// Turns closed otherwise.
+    pub other: u32,
+    /// Approval steps.
+    pub appr: u32,
+    /// Approvals closed by human, harness, ctl, other.
+    pub appr_by: [u32; 4],
+    /// Question steps.
+    pub qs: u32,
+    /// Input stalls.
+    pub stalls: u32,
+    /// The session's close, once it closed.
+    pub closed: Option<&'static str>,
+    /// The newest closed run and its outcome.
+    pub last_run: Option<(Node, &'static str)>,
+    /// The newest closed turn and its outcome.
+    pub last_turn: Option<(Node, &'static str)>,
+}
+
 /// The fold.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fold {
@@ -525,6 +643,61 @@ impl Fold {
     #[must_use]
     pub const fn state(&self) -> &SessionState {
         &self.st
+    }
+
+    /// The fold's estimated heap: its state, tracked nodes, field slots and
+    /// owned content in fields, needs and claims. Spare capacity and
+    /// allocator overhead are not counted.
+    #[must_use]
+    pub fn footprint(&self) -> usize {
+        let fields = |f: &NodeFields| {
+            f.0.iter()
+                .map(|h| std::mem::size_of::<Held>() + h.val.heap_len())
+                .sum::<usize>()
+        };
+        std::mem::size_of::<Fold>()
+            + self
+                .tracked
+                .iter()
+                .map(|o| std::mem::size_of::<OpenNode>() + fields(&o.f))
+                .sum::<usize>()
+            + self
+                .st
+                .open
+                .iter()
+                .flatten()
+                .map(|o| fields(&o.f))
+                .sum::<usize>()
+            + self
+                .st
+                .last
+                .iter()
+                .flatten()
+                .chain(self.st.closed.iter())
+                .map(|c| fields(&c.f))
+                .sum::<usize>()
+            + self
+                .st
+                .needs
+                .iter()
+                .flatten()
+                .filter_map(|n| n.detail.as_ref())
+                .map(String::len)
+                .sum::<usize>()
+            + self
+                .st
+                .verdict
+                .iter()
+                .chain(self.st.label.iter())
+                .chain(self.st.verdict_trusted.iter())
+                .chain(self.st.label_trusted.iter())
+                .chain(self.st.verdict_proven.iter())
+                .chain(self.st.label_proven.iter())
+                .map(|c| {
+                    c.text.as_ref().map_or(0, String::len)
+                        + c.as_name.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
     }
 
     /// Apply one record. Pure and idempotent by seq: a record at or below
@@ -559,6 +732,174 @@ impl Fold {
     pub fn hints(&self, now_wall: u64) -> Hints {
         Hints {
             quiet_for_ms: now_wall.saturating_sub(self.st.last_t),
+        }
+    }
+
+    /// THE BUS'S OPEN PATH (phase 4, ruling S17): the deepest open run, the
+    /// open turn and the deepest open step of the bus class (a step a need
+    /// is raised from) — never a tool, subagent or compact step, which stays
+    /// local, even when one is open beneath it.
+    #[must_use]
+    pub fn bus_open_path(&self) -> [Option<(Node, Kind)>; 3] {
+        let deepest = |want: &dyn Fn(&OpenNode) -> bool| {
+            self.tracked
+                .iter()
+                .rev()
+                .find(|o| want(o))
+                .map(|o| (o.node, o.kind))
+        };
+        [
+            deepest(&|o| o.node.lvl == Lvl::Run),
+            deepest(&|o| o.node.lvl == Lvl::Turn),
+            deepest(&|o| o.node.lvl == Lvl::Step && crate::log::is_bus_step(o.kind)),
+        ]
+    }
+
+    /// SEED A LATE READER FROM A BUS SNAPSHOT (phase 4, §5.5): this fold
+    /// becomes the state `snap` (an `op=snap` body's record) names — its open
+    /// path, its open needs, its mail counts and epoch — as of the snap's
+    /// seq, so the records after it apply as they would have. What a snap
+    /// does not say (the totals, the closed nodes, the claims) starts empty:
+    /// a reader that holds the space's records from its first folds those
+    /// instead and never seeds. `false` (nothing changes) for a record that
+    /// is no snap.
+    pub fn seed_snap(&mut self, snap: &Rec) -> bool {
+        if snap.op != Op::Snap {
+            return false;
+        }
+        let ep = snap
+            .f
+            .get_u(Key::Epoch)
+            .and_then(|e| u32::try_from(e).ok())
+            .unwrap_or(self.st.ep);
+        let mut seeded = Fold::new(ep);
+        let mut par = Node::SESSION;
+        for item in snap.f.get_str(Key::Open).unwrap_or("").split(',') {
+            let Some((node, kind)) = item.split_once(':') else {
+                continue;
+            };
+            let (Some(node), kind) = (Node::parse(node), Kind::from_word(kind)) else {
+                continue;
+            };
+            if kind.node_level() != Some(node.lvl) || seeded.tracked.len() >= MAX_TRACKED {
+                continue;
+            }
+            seeded.tracked.push(OpenNode {
+                node,
+                kind,
+                par: Some(par),
+                t: snap.t,
+                by: Actor::Nobody,
+                src: Src::Unknown,
+                conf: Conf::Unknown,
+                f: NodeFields::default(),
+            });
+            par = node;
+        }
+        for item in snap.f.get_str(Key::Needs).unwrap_or("").split(',') {
+            let mut it = item.split('.');
+            let (Some(word), Some(node), Some(kind), Some(by), Some(src)) =
+                (it.next(), it.next(), it.next(), it.next(), it.next())
+            else {
+                continue;
+            };
+            let (Some(word), Some(node)) = (
+                crate::vocab::lookup(crate::vocab::NEED_WORDS, word),
+                Node::parse(node),
+            ) else {
+                continue;
+            };
+            seeded.raise(Need {
+                word,
+                node,
+                kind: Kind::from_word(kind),
+                since_seq: snap.seq,
+                t: snap.t,
+                src: Src::from_word(src),
+                conf: Conf::Unknown,
+                by: Actor::from_word(by),
+                detail: None,
+            });
+        }
+        let count = |k: Key| {
+            snap.f
+                .get_u(k)
+                .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+        };
+        seeded.st.totals.mail_in = count(Key::MailIn);
+        seeded.st.totals.mail_out = count(Key::MailOut);
+        seeded.st.as_of = snap.seq;
+        seeded.st.last_t = snap.t;
+        seeded.st.rev = 1;
+        seeded.reproject();
+        *self = seeded;
+        true
+    }
+
+    /// A VIEW THAT LOST RECORDS (phase 4, `crate::bus`), folded from its
+    /// start up to `snap` — a snapshot past every record it lost: the open
+    /// needs as of the snapshot are the snapshot's (a claim or a failed run's
+    /// close the view never held raised one; a clear it never held lifted
+    /// one), and the rest of this fold (its totals, its close, its open
+    /// nodes) is what the held records made of it. `false` for a body that
+    /// is no snapshot; nothing changed.
+    pub fn reseed_needs(&mut self, snap: &Rec) -> bool {
+        let mut seeded = Fold::new(self.st.ep);
+        if !seeded.seed_snap(snap) {
+            return false;
+        }
+        self.st.needs = seeded.st.needs;
+        self.reproject();
+        true
+    }
+
+    /// WHAT A BUS FOLD AND THIS ONE MUST AGREE ON (phase 4, design §5.5's
+    /// projection): the epoch, the open path and the open needs of the bus
+    /// class, an edge's actor as `alias` names it on the bus. A fold seeded
+    /// from a snapshot holds exactly these.
+    #[must_use]
+    pub fn bus_facts(
+        &self,
+        alias: &dyn Fn(&crate::vocab::ShortId) -> Option<crate::vocab::ShortId>,
+    ) -> BusFacts {
+        let bus_by = |by: Actor| match by {
+            Actor::Sid(sid) => alias(&sid).map_or(Actor::Nobody, Actor::sid),
+            other => other,
+        };
+        BusFacts {
+            ep: self.st.ep,
+            open: self.bus_open_path(),
+            needs: self
+                .st
+                .needs
+                .iter()
+                .flatten()
+                .map(|n| (n.word, n.node, bus_by(n.by), n.src))
+                .collect(),
+        }
+    }
+
+    /// The counters a bus fold that holds a session's records from its first
+    /// agrees on with the local one: turns by outcome, the need-bearing
+    /// steps, who closed the approvals, and the session's close.
+    #[must_use]
+    pub fn bus_totals(&self) -> BusTotals {
+        let t = &self.st.totals;
+        BusTotals {
+            turns: t.turns,
+            done: t.done,
+            asked: t.asked,
+            walled: t.walled,
+            interrupted: t.interrupted,
+            errors: t.errors,
+            other: t.other,
+            appr: t.appr,
+            appr_by: t.appr_by,
+            qs: t.qs,
+            stalls: t.stalls,
+            closed: self.st.closed.as_ref().map(|c| c.out),
+            last_run: self.st.last[0].as_ref().map(|c| (c.node, c.out)),
+            last_turn: self.st.last[1].as_ref().map(|c| (c.node, c.out)),
         }
     }
 
@@ -612,7 +953,7 @@ impl Fold {
             }
             _ => {}
         }
-        if let Some(word) = step_need(r) {
+        if let Some(word) = need_raised(r) {
             let detail = r.f.get_str(Key::Detail).map(str::to_string);
             let since_t = continued
                 .and_then(|c| {
@@ -702,13 +1043,13 @@ impl Fold {
             Lvl::Run => {
                 let kind = r.k;
                 self.drop_needs(|n| lifts_failure(kind, out, node, n));
-                if out == "fail" {
+                if let Some(word) = need_raised(r) {
                     let detail = r.f.get(Key::Code).and_then(|v| match v {
                         Val::I(c) => Some(c.to_string()),
                         _ => None,
                     });
                     self.raise(Need {
-                        word: "failure",
+                        word,
                         node,
                         kind,
                         since_seq: r.seq,
@@ -749,17 +1090,19 @@ impl Fold {
             Lvl::Session => {
                 self.tracked.clear();
                 self.drop_needs(|n| n.word != "exited");
-                self.raise(Need {
-                    word: "exited",
-                    node,
-                    kind: r.k,
-                    since_seq: r.seq,
-                    t: r.t,
-                    src: r.src,
-                    conf: r.conf,
-                    by: r.by,
-                    detail: None,
-                });
+                if let Some(word) = need_raised(r) {
+                    self.raise(Need {
+                        word,
+                        node,
+                        kind: r.k,
+                        since_seq: r.seq,
+                        t: r.t,
+                        src: r.src,
+                        conf: r.conf,
+                        by: r.by,
+                        detail: None,
+                    });
+                }
                 self.st.closed = Some(closed);
             }
             Lvl::Instance => {}
@@ -773,7 +1116,7 @@ impl Fold {
             Kind::Need => {
                 // A mark's need is the session's: it outlives the node the
                 // mark attached to, and only a `clear` lifts it.
-                if let Some(w) = word.filter(|w| mark_may_raise(r.src, w)) {
+                if let Some(w) = need_raised(r) {
                     self.raise(Need {
                         word: w,
                         node: Node::SESSION,
@@ -788,42 +1131,43 @@ impl Fold {
                 }
             }
             Kind::Clear => {
-                let by = r.by;
+                let (by, src) = (r.by, r.src);
                 // A step's need lives as long as its step; a clear lifts the
-                // others, from whoever raised them or from the owner.
-                self.drop_needs(|n| {
-                    word.is_none_or(|w| n.word == w)
-                        && n.node.lvl != Lvl::Step
-                        && (n.by == by || by.is_owner())
-                });
+                // others, from whoever raised them or from the owner. A
+                // CLAIM's clear (`mark … clear`, src=mark) lifts only claims
+                // (§3.7: a claim never overrides an observation): an
+                // observed need closes by observation alone.
+                self.drop_needs(|n| clear_lifts(src, by, word, n));
             }
             Kind::Seen => self.drop_needs(|n| n.word == "failure"),
-            Kind::Verdict => {
-                if word.is_some() {
-                    self.st.verdict = Some(Claim {
-                        word,
-                        text: None,
-                        by: r.by,
-                        t: r.t,
-                        until: None,
-                        seq: r.seq,
-                    });
-                }
-            }
-            Kind::Label => {
-                if let Some(text) = r.f.get_str(Key::Text) {
-                    let ttl =
-                        r.f.get_u(Key::Ttl)
-                            .map_or(LABEL_TTL_MS, |s| s.saturating_mul(1000))
-                            .min(LABEL_TTL_MAX_MS);
-                    self.st.label = Some(Claim {
-                        word: None,
-                        text: Some(text.to_string()),
-                        by: r.by,
-                        t: r.t,
-                        until: Some(r.t.saturating_add(ttl)),
-                        seq: r.seq,
-                    });
+            // Claims are stored as made, whoever made them (every one stays
+            // in the ring and in `log`); a trusted author's newest is kept
+            // beside the newest of any, so no other author displaces it, and
+            // a proven author's newest beside that, so no `ctl` claim does.
+            Kind::Verdict | Kind::Label => {
+                let label = r.k == Kind::Label;
+                if let Some(claim) = Claim::of(r, label) {
+                    let (trusted, proven) = (claim.by.is_trusted(), claim.by.is_proven());
+                    let (any, kept, held) = if label {
+                        (
+                            &mut self.st.label,
+                            &mut self.st.label_trusted,
+                            &mut self.st.label_proven,
+                        )
+                    } else {
+                        (
+                            &mut self.st.verdict,
+                            &mut self.st.verdict_trusted,
+                            &mut self.st.verdict_proven,
+                        )
+                    };
+                    if proven {
+                        *held = Some(claim.clone());
+                    }
+                    if trusted {
+                        *kept = Some(claim.clone());
+                    }
+                    *any = Some(claim);
                 }
             }
             Kind::Mail => match r.f.get_word(Key::Dir) {
@@ -837,6 +1181,18 @@ impl Fold {
                 _ => {}
             },
             Kind::MailSeen => self.st.mail_open = self.st.mail_open.saturating_sub(1),
+            // A carried update (`mark - handoff carried= shed= epoch=`): the
+            // successor's epoch, and nothing else changes. Its open runs,
+            // turns and steps stay open in every fold, a remote one too (the
+            // mark is turn class), where an uncarried update's `gap
+            // why=handoff` starts over ([`starts_epoch`]).
+            Kind::Handoff => {
+                if let Some(e) = r.f.get_u(Key::Epoch)
+                    && e > u64::from(self.st.ep)
+                {
+                    self.st.ep = u32::try_from(e).unwrap_or(u32::MAX);
+                }
+            }
             Kind::Human => self.st.totals.human = self.st.totals.human.saturating_add(1),
             Kind::Agent => {
                 if let Some(w) = word {
@@ -908,10 +1264,14 @@ impl Fold {
     }
 
     /// Add a need in precedence order; when full, the least urgent (newest
-    /// among equals) gives way to a more urgent one.
+    /// among equals) gives way to a more urgent one. The same need raised
+    /// again BY ITS RAISER replaces it; raised by another author it is that
+    /// author's own need beside it: a raise never rewrites who raised a need
+    /// (which would let any author take another's escalation over, then
+    /// lift it with its own `clear`).
     fn raise(&mut self, need: Need) {
         let mut all: Vec<Need> = self.st.needs.iter_mut().filter_map(Option::take).collect();
-        all.retain(|n| !(n.node == need.node && n.word == need.word));
+        all.retain(|n| !(n.node == need.node && n.word == need.word && n.by == need.by));
         all.push(need);
         all.sort_by_key(|n| (need_precedence(n), n.since_seq));
         all.truncate(MAX_NEEDS);
@@ -969,13 +1329,57 @@ pub fn mark_may_raise(src: Src, word: &str) -> bool {
     matches!(word, "review" | "decision" | "help") || (word == "escalated" && src == Src::Meta)
 }
 
+/// THE NEED A RECORD RAISES (§7.1), or `None`: a step's open
+/// ([`step_need`]), a run's close `out=fail` (`failure`), the session's close
+/// (`exited`), or a `need` mark [`mark_may_raise`] admits. The fold raises a
+/// need exactly when this says one (its `on_open`, `on_close` and `on_mark`
+/// ask it), and `await log need` waits for exactly these records, so the two
+/// can never disagree.
+#[must_use]
+pub fn need_raised(r: &Rec) -> Option<&'static str> {
+    match (r.op, r.node.lvl) {
+        (Op::Open, Lvl::Step) => step_need(r),
+        (Op::Close, Lvl::Run) => (r.out() == Some("fail")).then_some("failure"),
+        (Op::Close, Lvl::Session) => Some("exited"),
+        (Op::Mark, _) if r.k == Kind::Need => {
+            r.f.get_word(Key::Word).filter(|w| mark_may_raise(r.src, w))
+        }
+        _ => None,
+    }
+}
+
+/// THE CLEAR RULE (§7.1, §3.7): whether a `clear` from `by` at `src`
+/// (naming need `word`, or every need) lifts `need`. Never a step's need
+/// (it lives as long as its step); otherwise a need its raiser clears, or an
+/// author that overrides the raiser ([`Actor::overrides`]: the person any;
+/// `ctl` any but a proven author's, so the agent a harness supervises — a
+/// `ctl` client too — never lifts the harness's need). A CLAIM's clear
+/// (`src=mark`) lifts only needs a claim raised: an observed need
+/// (`failure`, `escalated`, `exited`, …) closes by observation alone.
+#[must_use]
+pub fn clear_lifts(src: Src, by: Actor, word: Option<&str>, need: &Need) -> bool {
+    word.is_none_or(|w| need.word == w)
+        && need.node.lvl != Lvl::Step
+        && (need.by == by || by.overrides(&need.by))
+        && (src != Src::Mark || need.src == Src::Mark)
+}
+
 /// THE NEED PRECEDENCE (§7.1), lower first: a need raised by a mark ranks
-/// last whatever its word, so a claim never outranks an observation; every
+/// last whatever its word, so a claim never outranks an observation — a
+/// proven author's ([`Actor::is_proven`]) first among claims, an Owner
+/// client's next, any other author's last, so a flood of other authors'
+/// needs gives way before the harness's when the needs are full; every
 /// other need ranks by its word ([`need_rank`]).
 #[must_use]
 pub fn need_precedence(n: &Need) -> u8 {
     if n.src == Src::Mark || (n.conf == Conf::Claim && n.src != Src::Meta) {
-        7
+        if n.by.is_proven() {
+            7
+        } else if n.by == Actor::Ctl {
+            8
+        } else {
+            9
+        }
     } else {
         need_rank(n.word)
     }
@@ -1017,6 +1421,48 @@ fn tool_words(cls: Option<&str>) -> &'static str {
         Some("mcp") => "using a tool",
         _ => "working",
     }
+}
+
+/// THE LABEL A READER IS SHOWN (§7.3, D6; phase 3A rulings R13 and the
+/// fixer's): a proven author's live label ([`Actor::is_proven`]: the
+/// harness's), else a trusted author's (the owner class, `ctl` among it), at
+/// `now_wall`; never another author's. The clause and `brief` both read it,
+/// so the two can never show different labels.
+#[must_use]
+pub fn shown_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
+    let live = |c: &&Claim| c.text.is_some() && c.until.is_some_and(|u| u > now_wall);
+    st.label_proven
+        .as_ref()
+        .filter(|c| c.by.is_proven())
+        .filter(live)
+        .or_else(|| {
+            st.label_trusted
+                .as_ref()
+                .filter(|c| c.by.is_trusted())
+                .filter(live)
+        })
+}
+
+/// The verdict claims a reader is shown, in order: a proven author's newest
+/// (the harness's), the newest trusted one when it is another claim, then
+/// the newest of any author when that is yet another. No `ctl` verdict
+/// hides the harness's, and no other author's hides either.
+#[must_use]
+pub fn shown_verdicts(st: &SessionState) -> Vec<&Claim> {
+    let mut out: Vec<&Claim> = Vec::with_capacity(3);
+    for c in [
+        st.verdict_proven.as_ref().filter(|c| c.by.is_proven()),
+        st.verdict_trusted.as_ref().filter(|c| c.by.is_trusted()),
+        st.verdict.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if out.iter().all(|o| o.seq != c.seq) {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// THE clause policy (§7.3), a pure function of the state and `now_wall`.
@@ -1065,9 +1511,7 @@ pub fn clause_of(st: &SessionState, now_wall: u64) -> Option<Clause> {
             return Some(mk(words, age(n.t), tone, n.by));
         }
     }
-    if let Some(label) = &st.label
-        && matches!(label.by, Actor::Harness | Actor::Human | Actor::Ctl)
-        && label.until.is_some_and(|u| u > now_wall)
+    if let Some(label) = shown_label(st, now_wall)
         && let Some(text) = &label.text
     {
         let tone = if st.turn().is_some() {

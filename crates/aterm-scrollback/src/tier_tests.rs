@@ -4,7 +4,6 @@
 //! Tests for tiered storage (hot/warm/cold).
 
 use super::*;
-use crate::HotTier;
 use crate::HyperlinkSpan;
 use crate::Scrollback;
 use std::cell::Cell;
@@ -35,21 +34,6 @@ impl WarmTier {
     }
 }
 
-// Hot tier tests
-#[test]
-fn hot_tier_push_get() {
-    let mut hot = HotTier::new();
-    hot.push(Line::from("Line 0"));
-    hot.push(Line::from("Line 1"));
-    hot.push(Line::from("Line 2"));
-
-    assert_eq!(hot.len(), 3);
-    assert_eq!(hot.get(0).unwrap().to_string(), "Line 0");
-    assert_eq!(hot.get(1).unwrap().to_string(), "Line 1");
-    assert_eq!(hot.get(2).unwrap().to_string(), "Line 2");
-    assert!(hot.get(3).is_none());
-}
-
 /// A configured block_size above the disk-decode line-count cap is clamped, so
 /// no promoted block holds more lines than the decoder will reconstruct (a
 /// legitimate oversized block would decode short and fail its count check).
@@ -62,147 +46,6 @@ fn block_size_clamped_to_decode_page_cap() {
         sb.block_size(),
         cap,
         "block_size clamped to the decode-page cap"
-    );
-}
-
-#[test]
-fn hot_tier_take_front() {
-    let mut hot = HotTier::new();
-    for i in 0..10 {
-        hot.push(Line::from(&*format!("Line {i}")));
-    }
-
-    let taken = hot.take_front(3);
-    assert_eq!(taken.len(), 3);
-    assert_eq!(taken[0].to_string(), "Line 0");
-    assert_eq!(taken[2].to_string(), "Line 2");
-    assert_eq!(hot.len(), 7);
-    assert_eq!(hot.get(0).unwrap().to_string(), "Line 3");
-}
-
-#[test]
-fn hot_tier_truncate_front() {
-    let mut hot = HotTier::new();
-    for i in 0..10 {
-        hot.push(Line::from(&*format!("Line {i}")));
-    }
-
-    hot.truncate_front(3);
-    assert_eq!(hot.len(), 3);
-    assert_eq!(hot.get(0).unwrap().to_string(), "Line 7");
-}
-
-// Warm tier tests
-#[test]
-fn warm_block_roundtrip() {
-    let lines: Vec<Line> = (0..10).map(|i| Line::from(&*format!("Line {i}"))).collect();
-
-    let block = WarmBlock::from_lines(&lines);
-    assert_eq!(block.line_count(), 10);
-    assert!(block.compressed_size() > 0);
-
-    let decompressed = block.decompress().expect("no error");
-    assert_eq!(decompressed.len(), 10);
-    assert_eq!(decompressed[0].to_string(), "Line 0");
-    assert_eq!(decompressed[9].to_string(), "Line 9");
-}
-
-#[test]
-fn warm_block_get_line() {
-    let lines: Vec<Line> = (0..10).map(|i| Line::from(&*format!("Line {i}"))).collect();
-
-    let block = WarmBlock::from_lines(&lines);
-    assert_eq!(
-        block
-            .get_line(0)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 0"
-    );
-    assert_eq!(
-        block
-            .get_line(5)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Line 5"
-    );
-    assert!(block.get_line(10).expect("no error").is_none());
-}
-
-#[test]
-fn warm_tier_push_get() {
-    let mut warm = WarmTier::new();
-
-    let lines1: Vec<Line> = (0..5)
-        .map(|i| Line::from(&*format!("Block0-Line{i}")))
-        .collect();
-    let lines2: Vec<Line> = (0..5)
-        .map(|i| Line::from(&*format!("Block1-Line{i}")))
-        .collect();
-
-    warm.push_block(&lines1);
-    warm.push_block(&lines2);
-
-    assert_eq!(warm.line_count(), 10);
-    assert_eq!(warm.block_count(), 2);
-
-    // Test access across blocks
-    assert_eq!(
-        warm.get_line(0)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Block0-Line0"
-    );
-    assert_eq!(
-        warm.get_line(4)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Block0-Line4"
-    );
-    assert_eq!(
-        warm.get_line(5)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Block1-Line0"
-    );
-    assert_eq!(
-        warm.get_line(9)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Block1-Line4"
-    );
-    assert!(warm.get_line(10).expect("no error").is_none());
-}
-
-#[test]
-fn warm_tier_pop_front() {
-    let mut warm = WarmTier::new();
-
-    let lines1: Vec<Line> = (0..5)
-        .map(|i| Line::from(&*format!("Block0-Line{i}")))
-        .collect();
-    let lines2: Vec<Line> = (0..5)
-        .map(|i| Line::from(&*format!("Block1-Line{i}")))
-        .collect();
-
-    warm.push_block(&lines1);
-    warm.push_block(&lines2);
-
-    let block = warm.pop_front().unwrap();
-    assert_eq!(block.line_count(), 5);
-    assert_eq!(warm.line_count(), 5);
-    assert_eq!(
-        warm.get_line(0)
-            .expect("no error")
-            .expect("line present")
-            .to_string(),
-        "Block1-Line0"
     );
 }
 

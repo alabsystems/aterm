@@ -17,7 +17,7 @@
 //!    outranks them removed; every declared bin must have built;
 //! 4. the arch gate over every binary ([`super::arch`]);
 //! 5. stage `bin/` (stripped);
-//! 6. the payload lineage scan (`atpkg::lineage::scan_tree`), whose record is the row's
+//! 6. the payload lineage scan ([`super::lineage::scan_tree`]), whose record is the row's
 //!    `[artifact.provenance]`;
 //! 7. tar in-process, zstd by the CLI, read back through the client decoder
 //!    ([`super::tarwrite`]), `disk_installed`;
@@ -557,7 +557,7 @@ pub fn scan(
     stage_root: &Path,
     compiler: &atpkg::lineage::Compiler,
 ) -> Result<atpkg::manifest::Provenance> {
-    let report = atpkg::lineage::scan_tree(stage_root, &compiler.content.version.commit)
+    let report = super::lineage::scan_tree(stage_root, &compiler.content.version.commit)
         .map_err(|e| Error::cannot_run(format!("the payload scan: {e}")))?;
     if !report.findings.is_empty() {
         return Err(Error::refused(format!(
@@ -576,11 +576,11 @@ pub fn scan(
 }
 
 /// What the signing half of a pack holds from its start: the key and the roster generation
-/// every signature is verified under ([`sign::authority`]). Loaded before anything is
-/// built, so a pack that cannot sign stops in seconds.
+/// every signature is verified under ([`sign::elected`], once per run). Loaded before
+/// anything is built, so a pack that cannot sign stops in seconds.
 pub struct Signer {
     key: MachineKey,
-    authority: sign::Authority,
+    authority: std::sync::Arc<sign::Authority>,
 }
 
 impl Signer {
@@ -592,8 +592,14 @@ impl Signer {
     pub fn load(ctx: &Ctx) -> Result<Self> {
         Ok(Self {
             key: MachineKey::load(ctx, &ctx.identity.key)?,
-            authority: sign::authority(ctx)?,
+            authority: sign::elected(ctx)?,
         })
+    }
+
+    /// The roster generation its signatures are verified under.
+    #[must_use]
+    pub fn authority(&self) -> &sign::Authority {
+        &self.authority
     }
 }
 
@@ -754,7 +760,7 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
         Some(bytes) => pkgdoc::merge(bytes, &header, &row)?,
         None => pkgdoc::fresh(&header, &row)?,
     };
-    let pkg = stage_dir.join(pkgdoc::file_name(program, build_number));
+    let pkg = stage_dir.join(pkgdoc::manifest_name(program, build_number));
     let signature = write_manifest(ctx, &doc, &header, &row, &pkg, signer.as_ref())?;
 
     let mut uploaded = false;

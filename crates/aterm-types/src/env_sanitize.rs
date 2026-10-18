@@ -7,12 +7,18 @@
 //! variables. Public callers reach it through `aterm_types::domain`.
 
 /// Prefixes of environment variables every PTY spawn path filters before exec.
+///
+/// No `MUSE_` prefix: Muse Code 1.4.10 gives its tools' shells `MUSE_SESSION_ID`,
+/// `MUSE_THREAD_ID` and `MUSE_TOOL_USE_ID` (ids, no secret) beside
+/// `CLAUDE_CODE_TOOL_USE_ID`, which `CLAUDE` strips (measured in `aterm-lab`), and the
+/// word is generic.
 pub const ENV_DENY_PREFIXES: &[&str] = &[
     "CLAUDE",       // CLAUDECODE, CLAUDE_CODE_*, CLAUDE_*
     "ANTHROPIC_",   // ANTHROPIC_MODEL, ANTHROPIC_API_KEY, etc.
     "COPILOT_",     // GitHub Copilot
     "CODEX_",       // OpenAI Codex
     "ANTIGRAVITY_", // Google's Antigravity CLI (agy): its tools' ANTIGRAVITY_CSRF_TOKEN and kin
+    "GEMINI_",      // Google's Gemini CLI: its tools' GEMINI_CLI, GEMINI_API_KEY and kin
     "CURSOR_",      // Cursor editor
     "AI_",          // AI development tool infrastructure vars
     "_DEVTOOL_",    // Internal development tool runtime vars
@@ -66,15 +72,30 @@ pub const ENV_OBSERVE_SESSION_ID: &str = "ATERM_OBSERVE_SESSION_ID";
 /// tab it was handed to.
 pub const ENV_TAB_SHELL: &str = "ATERM_TAB_SHELL";
 
-/// Exact env vars that should not leak into child shells: by exact name, because other
-/// `ATERM_*` variables are needed for shell integration in the child.
+/// THE FAST-TIMERS DEVELOPMENT SEAM (`dev_seam!`, so a debug build reads it and a
+/// shipped one never does; `aterm_agent::harness::timings::FAST_SEAM` reads it by
+/// this name): set, a live instance runs its harness's and its hosts' waits at the
+/// test values (`aterm_agent::harness::Timings::FAST`) instead of the production
+/// ones. The live headless suites boot their instances under it
+/// (`crates/aterm/tests/support/headless_boot.rs`), except the tests whose property
+/// is a production clock. Denied for inheritance ([`ENV_DENY_VARS`]): a nested aterm
+/// runs its own clock.
+pub const ENV_DEV_FAST_TIMERS: &str = "ATERM_DEV_FAST_TIMERS";
+
+/// Exact env vars that should not leak into child shells.
+///
+/// These are denied by exact name because other `ATERM_*` variables are
+/// required for shell integration inside the child shell. The
+/// recursion-provisioning identity/edge vars are denied so they are never
+/// INHERITED across a hop (each direct child is re-injected a fresh set; see the
+/// consts above and `build_child_env`), and the retired edge-secret names so a
+/// value an older aterm injected stops at the hop.
 pub const ENV_DENY_VARS: &[&str] = &[
     // Development seams (`dev_seam!`, read only by a dev build): an aterm launched from an
     // aterm shell never runs under a seam its parent's environment carried.
     "ATERM_DEBUG_SEAMLESS_REEXEC",
     "ATERM_DEBUG_RELAUNCH_NUDGE",
     "ATERM_DEBUG_STATUS_BARS",
-    "ATERM_DEBUG_STRAIN",
     "ATERM_DEBUG_PASTE_FILE",
     "ATERM_DEBUG_CLIPBOARD_FILE",
     "ATERM_DEBUG_LOST_SHELL_NONCE",
@@ -83,12 +104,19 @@ pub const ENV_DENY_VARS: &[&str] = &[
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
     "ATERM_NUDGE_CLASS",
     "ATERM_RESIZE_RUN_GAP_MS",
+    // The session log's ring bounds (phase 4's world tests).
+    "ATERM_SLOG_RING",
     // The successor an update launches still receives this one: LaunchServices merges the
     // launching process's environment, with no child shell in between.
     "ATERM_DEBUG_DIE_BEFORE_DIAL",
     "ATERM_DEBUG_HEADLESS_RESTORE",
-    // Retired credentials stay denied: nothing reads them, but a secret an old install.sh
-    // told people to export (`launchctl setenv`) outlives the knob and would reach every tab.
+    // The test values of every harness and host wait: a nested aterm runs its
+    // own clock, never the one its parent's test suite asked for.
+    ENV_DEV_FAST_TIMERS,
+    // RETIRED CREDENTIALS STAY DENIED. Nothing reads these, but the value is a SECRET
+    // that an old install.sh told people to export (`launchctl setenv`); that export
+    // outlives the knob, and without this entry would reach every program in every
+    // tab. A token a shell should carry belongs in that shell's own rc.
     "ATERM_UPDATE_TOKEN",
     "ATPKG_TOKEN",
     // Recursion provisioning (re-injected fresh per direct child via env_add).
@@ -185,51 +213,29 @@ mod tests {
         assert!(!key(b"ATERM_SESSION_ID\xff"));
     }
 
+    /// What a child must never inherit: agent identities and keys by prefix,
+    /// the recursion-provisioning identity/edge vars and the retired
+    /// edge-secret names (an inherited copy never leaks past one hop), the
+    /// development seams (a nested aterm never runs under its parent's QA
+    /// seam), and the retired credentials, all by exact name.
     #[test]
-    fn test_is_ai_env_var_matches_deny_prefixes() {
-        assert!(is_ai_env_var("CLAUDECODE"));
-        assert!(is_ai_env_var("CLAUDE_CODE_ENTRYPOINT"));
-        assert!(is_ai_env_var("CLAUDE_API_KEY"));
-        assert!(is_ai_env_var("ANTHROPIC_MODEL"));
-        assert!(is_ai_env_var("COPILOT_TOKEN"));
-        assert!(is_ai_env_var("CODEX_SESSION"));
-        assert!(is_ai_env_var("ANTIGRAVITY_CSRF_TOKEN"));
-        assert!(is_ai_env_var("CURSOR_SETTINGS"));
+    fn agent_identity_seams_and_credentials_are_denied() {
         let ai_role = ["AI", "ROLE"].join("_");
         let ai_worker_id = ["AI", "WORKER", "ID"].join("_");
-        assert!(is_ai_env_var(&ai_role));
-        assert!(is_ai_env_var(&ai_worker_id));
-        assert!(is_ai_env_var("_DEVTOOL_CARGO_LOCK"));
-    }
-
-    #[test]
-    fn test_is_ai_env_var_preserves_shell_integration_vars() {
-        assert!(!is_ai_env_var("ATERM_SHELL_INTEGRATION_DIR"));
-        assert!(!is_ai_env_var("ATERM_ORIGINAL_ZDOTDIR"));
-        assert!(!is_ai_env_var("ATERM_UNSET_ZDOTDIR"));
-    }
-
-    /// The OSC 133/633 capability nonce survives, so the shell-integration preamble can emit
-    /// `id=<hex>`.
-    #[test]
-    fn test_aterm_shell_nonce_survives_sanitization() {
-        assert!(!is_ai_env_var("ATERM_SHELL_NONCE"));
-    }
-
-    /// The reroute seam's variables (`atpkg::reroute`) reach every child: `ATERM_REROUTE_DIR`
-    /// is re-asserted on PATH after the rc files, and `__ATERM_REROUTE_PASSTHROUGH` is
-    /// `--no-reroute`'s marker an upstream `cargo` hands its own spawns. Pins that `ATERM_*`
-    /// is not denied by prefix.
-    #[test]
-    fn test_reroute_seam_vars_survive_sanitization() {
-        assert!(!is_ai_env_var("__ATERM_REROUTE_PASSTHROUGH"));
-        assert!(!is_ai_env_var("ATERM_REROUTE_DIR"));
-    }
-
-    /// The recursion-provisioning vars and retired edge-secret names are denied by exact name.
-    #[test]
-    fn test_recursion_provisioning_vars_are_denied_by_name() {
         for v in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_API_KEY",
+            "ANTHROPIC_MODEL",
+            "COPILOT_TOKEN",
+            "CODEX_SESSION",
+            "ANTIGRAVITY_CSRF_TOKEN",
+            "GEMINI_CLI",
+            "GEMINI_API_KEY",
+            "CURSOR_SETTINGS",
+            &ai_role,
+            &ai_worker_id,
+            "_DEVTOOL_CARGO_LOCK",
             ENV_SESSION_ID,
             ENV_LAUNCH_NONCE,
             ENV_PARENT_SESSION_ID,
@@ -239,52 +245,55 @@ mod tests {
             ENV_EDGE_WRITE,
             ENV_EDGE_SIGNAL,
             ENV_OBSERVE_SESSION_ID,
-        ] {
-            assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
-        }
-        // Not over-broad: shell-integration ATERM_* vars are kept.
-        assert!(!is_ai_env_var("ATERM_SHELL_INTEGRATION_DIR"));
-    }
-
-    /// The development seams and the retired credentials are denied by exact name.
-    #[test]
-    fn test_update_contract_vars_are_denied_by_name() {
-        for v in [
             "ATERM_DEBUG_SEAMLESS_REEXEC",
             "ATERM_DEBUG_RELAUNCH_NUDGE",
             "ATERM_DEBUG_STATUS_BARS",
-            "ATERM_DEBUG_STRAIN",
             "ATERM_DEBUG_CLIPBOARD_FILE",
             "ATERM_DEBUG_LOST_SHELL_NONCE",
+            "ATERM_DEBUG_DIE_BEFORE_DIAL",
+            "ATERM_DEBUG_HEADLESS_RESTORE",
             "ATERM_UPDATE_ROOT",
             "ATERM_HANDOFF_READY_TIMEOUT_MS",
             "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
-            "ATERM_DEBUG_DIE_BEFORE_DIAL",
-            "ATERM_DEBUG_HEADLESS_RESTORE",
-            "ATERM_NUDGE_CLASS",
             "ATERM_RESIZE_RUN_GAP_MS",
+            "ATERM_SLOG_RING",
+            "ATERM_NUDGE_CLASS",
+            "ATERM_UPDATE_TOKEN",
+            "ATPKG_TOKEN",
+            ENV_DEV_FAST_TIMERS,
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
         }
-        for credential in ["ATERM_UPDATE_TOKEN", "ATPKG_TOKEN"] {
-            assert!(
-                is_ai_env_var(credential),
-                "{credential} is a retired CREDENTIAL and must stay deny-listed"
-            );
-        }
     }
 
+    /// What every child must keep: the ordinary environment; the shell
+    /// integration vars and the OSC 133/633 capability nonce; and the reroute
+    /// seam (`ATERM_REROUTE_DIR`, and `__ATERM_REROUTE_PASSTHROUGH`, the
+    /// `--no-reroute` marker an upstream `cargo` hands its own spawns) — so the
+    /// `ATERM_*` family is never deny-listed by prefix.
     #[test]
-    fn test_is_ai_env_var_preserves_standard_vars() {
-        assert!(!is_ai_env_var("PATH"));
-        assert!(!is_ai_env_var("HOME"));
-        assert!(!is_ai_env_var("USER"));
-        assert!(!is_ai_env_var("SHELL"));
-        assert!(!is_ai_env_var("TERM"));
-        assert!(!is_ai_env_var("LANG"));
-        assert!(!is_ai_env_var("EDITOR"));
-        assert!(!is_ai_env_var("SSH_AUTH_SOCK"));
-        assert!(!is_ai_env_var("HOMEBREW_PREFIX"));
-        assert!(!is_ai_env_var("XDG_CONFIG_HOME"));
+    fn the_ordinary_environment_and_aterm_integration_vars_survive() {
+        for v in [
+            "PATH",
+            "HOME",
+            "USER",
+            "SHELL",
+            "TERM",
+            "LANG",
+            "EDITOR",
+            "SSH_AUTH_SOCK",
+            "HOMEBREW_PREFIX",
+            "XDG_CONFIG_HOME",
+            "ATERM_SHELL_INTEGRATION_DIR",
+            "ATERM_ORIGINAL_ZDOTDIR",
+            "ATERM_UNSET_ZDOTDIR",
+            "ATERM_SHELL_NONCE",
+            "__ATERM_REROUTE_PASSTHROUGH",
+            "ATERM_REROUTE_DIR",
+            // The Gemini CLI drift canary's own variable is aterm's, not the CLI's.
+            "ATERM_GEMINI_BIN",
+        ] {
+            assert!(!is_ai_env_var(v), "{v} must reach the child");
+        }
     }
 }

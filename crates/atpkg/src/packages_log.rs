@@ -71,7 +71,7 @@ pub const ROTATE_AT_BYTES: u64 = 1024 * 1024;
 /// Rotated files kept: `packages.log.1` (newest) … `packages.log.5` (oldest).
 pub const KEEP_ROTATED: u32 = 5;
 
-/// How many events Settings ▸ Packages' Activity shows.
+/// How many events Settings ▸ Packages' Activity reads, of the kinds it shows.
 pub const ACTIVITY_EVENTS: usize = 50;
 
 /// The longest value a line carries, in characters; the rest is `…`.
@@ -973,6 +973,14 @@ pub fn parse_record(line: &str) -> Option<Entry> {
 /// [`TAIL_READ_BYTES`] before its end; a line cut by that window, or torn, is skipped.
 #[must_use]
 pub fn read_tail(dir: &Path, max: usize) -> Vec<Entry> {
+    read_tail_of(dir, max, |_| true)
+}
+
+/// [`read_tail`] of the events `keep` admits: `max` of those, read past every other kind — so
+/// a reader that shows some kinds is not short of them where another kind is frequent (each
+/// discovery's `index-resolved` line beside every pass's two).
+#[must_use]
+pub fn read_tail_of(dir: &Path, max: usize, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
     let path = dir.join(LOG_NAME);
     let mut out = Vec::new();
     for file in [path.clone(), rotated_path(&path, 1)] {
@@ -985,6 +993,7 @@ pub fn read_tail(dir: &Path, max: usize) -> Vec<Entry> {
             lines
                 .iter()
                 .filter_map(|l| parse_line(l))
+                .filter(|entry| keep(entry))
                 .take(max - out.len()),
         );
     }
@@ -994,7 +1003,14 @@ pub fn read_tail(dir: &Path, max: usize) -> Vec<Entry> {
 /// The package log's newest `max` events ([`read_tail`] of [`log_path`]'s directory).
 #[must_use]
 pub fn tail(max: usize) -> Vec<Entry> {
-    log_dir().map_or_else(Vec::new, |dir| read_tail(&dir, max))
+    tail_of(max, |_| true)
+}
+
+/// The package log's newest `max` events that `keep` admits ([`read_tail_of`] of
+/// [`log_path`]'s directory).
+#[must_use]
+pub fn tail_of(max: usize, keep: impl Fn(&Entry) -> bool) -> Vec<Entry> {
+    log_dir().map_or_else(Vec::new, |dir| read_tail_of(&dir, max, keep))
 }
 
 /// Every record ([`parse_record`]) in the last `read_bytes` of `path`, OLDEST FIRST — a

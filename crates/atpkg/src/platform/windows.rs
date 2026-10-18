@@ -88,27 +88,6 @@ pub fn dir_meta_is_private(_meta: &Metadata) -> bool {
 /// no-op that exists to keep `store::ensure_dir` one shape across platforms.
 pub fn exclude_from_backup(_dir: &Path) {}
 
-/// `None`: there is no Spotlight index to ask. Windows Search exposes no per-directory
-/// opt-out for [`crate::noindex`] to honour or to MEASURE, so both Spotlight primitives
-/// are the not-applicable sentinel here — they exist so `noindex` is one shape across
-/// platforms and no call site needs a `cfg` (in practice
-/// [`crate::noindex::verify`] answers `Verdict::NotApplicable` before it reaches this).
-///
-/// `None` is "the question could not be asked", NEVER "not indexed" — see
-/// `crate::noindex::decide`, which turns every unanswerable question into `Unknown`
-/// rather than into a claim that a directory is excluded.
-#[must_use]
-pub fn spotlight_query(_scope: &Path, _filename: &str) -> Option<bool> {
-    None
-}
-
-/// `None`: there is no per-volume indexing switch this layer can read (`mdutil` has no
-/// Windows analogue). Refines a message only; no verdict depends on it.
-#[must_use]
-pub fn spotlight_index_state(_path: &Path) -> Option<super::IndexState> {
-    None
-}
-
 /// Universal Control is a macOS feature; there is nothing to read here.
 #[must_use]
 pub fn universal_control_state() -> [crate::machine::KeyRead; 2] {
@@ -200,7 +179,7 @@ pub fn open_for_sync(path: &Path) -> io::Result<File> {
 /// publish it, and by the readiness marker's write. The handle must carry write access
 /// ([`open_for_sync`]); a read-only one answers `Access is denied`.
 pub fn sync_file_contents(f: &File) -> io::Result<()> {
-    f.sync_data()
+    aterm_durable::durable_data(f)
 }
 
 /// No permission bits on Windows — reports `0` (callers mask/treat it as not-applicable).
@@ -269,6 +248,29 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
         )
     };
     if rc == 0 { None } else { Some(free_to_caller) }
+}
+
+/// The free and total bytes of the volume holding `dir`; Windows reports no inode count.
+#[must_use]
+pub fn volume_stats(dir: &Path) -> Option<crate::freespace::VolumeStats> {
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut free_to_caller: u64 = 0;
+    let mut total: u64 = 0;
+    // SAFETY: as `volume_free_bytes`, with the total-size out-param a valid writable `u64`.
+    let rc = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    (rc != 0).then_some(crate::freespace::VolumeStats {
+        free: free_to_caller,
+        total,
+        files_free: None,
+    })
 }
 
 /// `BY_HANDLE_FILE_INFORMATION`. Only the volume serial and the two file-index halves

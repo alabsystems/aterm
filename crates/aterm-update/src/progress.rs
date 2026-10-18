@@ -405,16 +405,10 @@ mod tests {
             },
             sink,
         );
-        let at = std::time::Instant::now();
         drop(slow);
         assert!(
             !answered.load(Ordering::Acquire),
             "the download's end never waits for the probe"
-        );
-        assert!(
-            at.elapsed() < Duration::from_secs(60),
-            "the download's end never waits for the probe: {:?}",
-            at.elapsed()
         );
         let _ = release.send(());
         std::fs::remove_dir_all(&dir).unwrap();

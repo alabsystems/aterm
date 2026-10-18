@@ -11,7 +11,6 @@
 #[cfg(unix)]
 pub mod measure;
 
-use aterm_core::grid::cell_flags::CellFlags;
 use aterm_core::terminal::Terminal;
 
 /// A terminal under test you feed bytes into and read the screen out of.
@@ -65,30 +64,15 @@ impl Screen {
     }
 
     /// Resolved attribute flags of the visible cell at `(r, c)` (0-based), as
-    /// raw [`CellFlags`] bits; `0` out of range.
+    /// raw [`CellFlags`](aterm_core::grid::CellFlags) bits; `0` out of range.
     ///
-    /// Resolves as `cell_attrs` in aterm-gui/src/control_query.rs does: inline
-    /// flags directly, a `USES_STYLE_ID` cell from the grid's `StyleTable`.
+    /// Resolves as `cell_attrs` in aterm-gui/src/control_query.rs does: the
+    /// cell's inline flags.
     pub fn cell_flags_bits(&self, r: u16, c: u16) -> u16 {
-        let grid = self.term.grid();
-        let Some(cell) = grid.cell(r, c) else {
-            return 0;
-        };
-        // Nothing in production sets `USES_STYLE_ID` and the SGR path interns
-        // no `StyleId`, so the rehydration below is unreachable; the assert
-        // makes the suite prove it.
-        debug_assert!(
-            !cell.uses_style_id(),
-            "cell_flags_bits: a live cell carries USES_STYLE_ID, but nothing interns styles"
-        );
-        if cell.uses_style_id() {
-            let extra = cell.flags().difference(CellFlags::USES_STYLE_ID);
-            grid.resolve_style_to_colors(cell.style_id(), extra)
-                .2
-                .bits()
-        } else {
-            cell.flags().bits()
-        }
+        self.term
+            .grid()
+            .cell(r, c)
+            .map_or(0, |cell| cell.flags().bits())
     }
 
     /// Hyperlink URL attached to the visible cell at `(r, c)` (0-based), if any.

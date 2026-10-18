@@ -5,8 +5,6 @@
 //!
 //! Pages are compressed with the cold codec: the warm tier's size-prepended
 //! LZ4 (`encode_cold_block`), the same in every build.
-//!
-//! For disk-backed cold storage, see `DiskColdTier` (the `disk-tier` feature).
 
 use super::line::{Line, deserialize_page_lines};
 use super::tier::WarmBlock;
@@ -52,7 +50,7 @@ fn take_cold_find_page_steps() -> usize {
 
 /// A cold page (compressed with the LZ4 cold codec).
 ///
-/// Stored in memory. For disk-backed storage, see `DiskColdTier`.
+/// Stored in memory.
 #[derive(Debug, Clone)]
 struct ColdPage {
     /// Cold-codec compressed data (re-compressed from the LZ4 warm block).
@@ -81,7 +79,6 @@ impl ColdPage {
 
 /// Cold tier: LZ4 compressed pages (in-memory).
 ///
-/// For disk-backed cold storage, use [`DiskColdTier`](super::DiskColdTier).
 /// Uses cumulative line counts for O(log P) page lookup and caches the
 /// last decompressed page to avoid redundant decompression.
 ///
@@ -450,7 +447,7 @@ impl ColdTier {
     /// Find the page containing the given line index via binary search.
     fn find_page(&self, line_idx: usize) -> Option<usize> {
         // Plain `&mut usize` step counter (was a `fn()`/closure callback): the
-        // strict Trust gate treats an opaque callback as an absent callee that
+        // Trust lane (`ship trust run`) treats an opaque callback as an absent callee that
         // may panic. The counter is diagnostic-only; tests fold it into the
         // same thread-local the old per-step callback incremented, so the
         // observable count is unchanged.
@@ -481,32 +478,6 @@ impl ColdTier {
                 }
             }
         }
-    }
-
-    /// Remove the oldest page (FIFO eviction).
-    ///
-    /// Returns the number of *logical* lines evicted (excluding already-consumed
-    /// lines from front_offset), or 0 if empty.
-    /// Production code uses `pop_front_batch`/`evict_bytes` for O(P) bulk eviction.
-    #[cfg(test)]
-    pub(crate) fn pop_front(&mut self) -> usize {
-        let Some(page) = self.pages.pop_front() else {
-            return 0;
-        };
-        let physical_lines = page.line_count;
-        let logical_lines = physical_lines.saturating_sub(self.front_offset);
-        self.bytes_used = self.bytes_used.saturating_sub(page.compressed.len());
-        self.line_count = self.line_count.saturating_sub(logical_lines);
-        self.front_offset = 0; // New front page starts fresh.
-
-        // O(1) amortized index maintenance: cursor + base advance; surviving
-        // entries stay absolute and untouched (see drop_front_index_entries).
-        self.drop_front_index_entries(1);
-
-        // Invalidate cache — page indices shifted.
-        self.clear_cache();
-
-        logical_lines
     }
 
     /// Remove the oldest `k` pages in a single batch.

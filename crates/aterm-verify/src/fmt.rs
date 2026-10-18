@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify fmt [--fix]`: every `.rs` file git tracks, outside `vendor/`,
-//! through the pinned `trustfmt` at the edition its crate declares,
-//! in one parallel pass; and every `rustfmt.toml` edition against its manifest.
+//! `verify fmt [--fix]`: every `.rs` file git tracks, outside `vendor/`, and
+//! every untracked one cargo builds (a new source not yet staged), through
+//! the pinned `trustfmt` at the edition its crate declares, in one parallel
+//! pass; and every `rustfmt.toml` edition against its manifest.
 //!
 //! Per file, not `targo-fmt --all`: the files cargo's target discovery never
 //! reaches (an `include!`d source, a crate outside `members`) are held too,
@@ -25,13 +26,12 @@ pub const TRUSTFMT: &str = "trustfmt";
 /// Tracked sources whose layout is their content, never handed to the
 /// formatter: generated tables whose generator owns their shape, and a proof
 /// island in a notation only a newer seal's formatter parses.
-pub const EXCLUDED: [&str; 7] = [
+pub const EXCLUDED: [&str; 6] = [
     "crates/aterm-core/tests/support/replay_corpus_data.rs",
     "crates/aterm-effects/src/animal_glyphs_gen.rs",
     "crates/aterm-effects/src/cat_glyphs_gen.rs",
     "crates/aterm-effects/src/dog_glyphs_gen.rs",
     "crates/aterm-effects/src/pet_glyphs_gen.rs",
-    "crates/aterm-effects/src/robi_glyphs_gen.rs",
     "crates/aterm-gui/src/config_watcher_protocol_island.rs",
 ];
 
@@ -199,30 +199,123 @@ fn record_editions(r: &mut Report, gaps: &[EditionGap]) {
 }
 
 /// Every `*.rs` path git tracks outside `vendor/` (third-party source
-/// mirrored, not authored), present on disk, repo-relative and sorted, bar
-/// [`EXCLUDED`]. Tracked only: `--fix` never rewrites an untracked scratch
-/// file, and a new source is held once it is added.
+/// mirrored, not authored), and every UNTRACKED one cargo builds
+/// ([`built_by_cargo`]) that git does not ignore, present on disk,
+/// repo-relative and sorted, bar [`EXCLUDED`]. A new source is held before it
+/// is staged: tracked only, `crates/aterm-lab/src/gemini_proof.rs` passed
+/// this check unformatted until it was added (2026-10-16). An untracked file
+/// cargo does not build (a scratch file, notes) is never handed to the
+/// formatter, so `--fix` never rewrites one.
 fn rs_files(ctx: &Ctx) -> Result<Vec<String>, String> {
-    let out = crate::changed::git(&ctx.root, &ctx.path_env)
-        .args(["ls-files", "-z", "--cached", "--", "*.rs"])
+    rs_files_in(&ctx.root, &ctx.path_env)
+}
+
+/// [`rs_files`] of the checkout at `root`, git run on `path_env`.
+fn rs_files_in(root: &Path, path_env: &std::ffi::OsStr) -> Result<Vec<String>, String> {
+    let tracked = ls_files(root, path_env, &["--cached"])?;
+    let untracked = ls_files(root, path_env, &["--others", "--exclude-standard"])?;
+    let mut files: Vec<String> = tracked
+        .into_iter()
+        .chain(untracked.into_iter().filter(|p| built_by_cargo(root, p)))
+        .filter(|p| !p.starts_with("vendor/") && !EXCLUDED.contains(&p.as_str()))
+        .filter(|p| root.join(p).is_file())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    Ok(files)
+}
+
+/// The `*.rs` paths `git ls-files <which>` names in `root`, repo-relative.
+fn ls_files(
+    root: &Path,
+    path_env: &std::ffi::OsStr,
+    which: &[&str],
+) -> Result<Vec<String>, String> {
+    let out = crate::changed::git(root, path_env)
+        .args(["ls-files", "-z"])
+        .args(which)
+        .args(["--", "*.rs"])
         .output()
         .map_err(|e| format!("could not run `git ls-files`: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "`git ls-files` failed in {}: {}",
-            ctx.root.display(),
+            root.display(),
             String::from_utf8_lossy(&out.stderr).trim_end()
         ));
     }
-    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&out.stdout)
         .split('\0')
-        .filter(|p| !p.is_empty() && !p.starts_with("vendor/") && !EXCLUDED.contains(p))
-        .filter(|p| ctx.root.join(p).is_file())
+        .filter(|p| !p.is_empty())
         .map(str::to_owned)
-        .collect();
-    files.sort_unstable();
-    files.dedup();
-    Ok(files)
+        .collect())
+}
+
+/// The directories under a package whose `.rs` files cargo builds: its
+/// library and binaries (and every module they declare), and the targets it
+/// discovers by itself.
+const TARGET_DIRS: [&str; 4] = ["src", "tests", "benches", "examples"];
+
+/// Whether cargo builds `rel` (repo-relative): it sits under a
+/// [`TARGET_DIRS`] directory of the package whose `Cargo.toml` is the
+/// nearest above it, or is that package's `build.rs`, or sits where that
+/// manifest declares a target by path ([`declared_dirs`]: a fuzz crate's
+/// `fuzz_targets/`). A file under a manifest that declares no `[package]` (a
+/// workspace root), or elsewhere in a package (its notes, a fixture tree), is
+/// not.
+fn built_by_cargo(root: &Path, rel: &str) -> bool {
+    let path = Path::new(rel);
+    let Some(dir) = path
+        .parent()
+        .unwrap_or(Path::new(""))
+        .ancestors()
+        .find(|d| root.join(d).join("Cargo.toml").is_file())
+    else {
+        return false;
+    };
+    let Ok(manifest) = std::fs::read_to_string(root.join(dir).join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(inside) = path.strip_prefix(dir) else {
+        return false;
+    };
+    manifest.lines().any(|l| l.trim() == "[package]")
+        && (inside == Path::new("build.rs")
+            || inside
+                .components()
+                .next()
+                .is_some_and(|c| TARGET_DIRS.iter().any(|t| c.as_os_str() == *t))
+            || declared_dirs(&manifest).iter().any(|d| {
+                let parent = inside.parent().unwrap_or(Path::new(""));
+                parent == d || (!d.as_os_str().is_empty() && parent.starts_with(d))
+            }))
+}
+
+/// The directories, under its package, of the `.rs` targets a manifest
+/// declares by path (`path = "fuzz_targets/decode.rs"` under a `[[bin]]`,
+/// `build = "…"`): cargo builds what sits there, and the modules beside and
+/// under it, though it is no [`TARGET_DIRS`] directory. A path that leaves
+/// the package (`path = "../../src/lib.rs"`, an oracle's crate under test)
+/// names none; nor does a dependency's (`path = "../x"`, no `.rs`). The
+/// package's own directory, where a target sits at its top, counts for the
+/// files beside it alone ([`built_by_cargo`]).
+fn declared_dirs(manifest: &str) -> Vec<PathBuf> {
+    manifest
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            if !["path", "build"].contains(&key.trim()) {
+                return None;
+            }
+            let target = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+            let dir = Path::new(target)
+                .parent()
+                .filter(|_| target.ends_with(".rs"))?;
+            dir.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+                .then(|| dir.to_path_buf())
+        })
+        .collect()
 }
 
 /// `files` grouped by the edition each is formatted at.
@@ -518,6 +611,111 @@ mod tests {
         dir
     }
 
+    /// `git` in the scratch checkout `root`, each call asserted.
+    fn git_in(root: &Path, calls: &[&[&str]]) {
+        let env = crate::EnvSnapshot::capture();
+        for args in calls {
+            let ok = crate::changed::git(root, &env.path)
+                .args(*args)
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?} in the scratch checkout");
+        }
+    }
+
+    /// THE CHECK HOLDS A NEW SOURCE BEFORE IT IS STAGED: an untracked `.rs`
+    /// under a package's `src/`, `tests/`, `benches/` or `examples/`, its
+    /// `build.rs`, or where its manifest declares a target by path (a fuzz
+    /// crate's `fuzz_targets/` and below; a `[lib]` at the package's top and
+    /// the files beside it) is listed beside every tracked one (tracked only,
+    /// `gemini_proof.rs` passed unformatted until it was added). NEGATIVE
+    /// CONTROLS: an untracked file cargo builds nothing from — notes in a
+    /// package, a fuzz crate's corpus and its other directories, a file under
+    /// a manifest with no `[package]`, outside any manifest, a directory under
+    /// a top-level `[lib]`'s, the directory a target path that leaves the
+    /// package names, a dependency's path — one git ignores, and one under
+    /// `vendor/` are not; and git's tracked listing alone, which the check
+    /// read before, names none of the new sources.
+    #[test]
+    fn an_untracked_source_cargo_builds_is_listed_and_nothing_else_untracked() {
+        let t = tree(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/a\"]\n"),
+            (
+                "crates/a/Cargo.toml",
+                "[package]\nname = \"a\"\nedition = \"2024\"\n",
+            ),
+            ("crates/a/src/lib.rs", "pub fn tracked() {}\n"),
+            (".gitignore", "crates/a/src/ignored.rs\n"),
+            (
+                "crates/a/fuzz/Cargo.toml",
+                "[package]\nname = \"a-fuzz\"\n\n[dependencies.x]\npath = \"x\"\n\n\
+                 [[bin]]\nname = \"decode\"\npath = \"fuzz_targets/decode.rs\"\n\n\
+                 [[bin]]\nname = \"up\"\npath = \"../notes/up.rs\"\n",
+            ),
+            ("crates/a/fuzz/fuzz_targets/decode.rs", "fn main() {}\n"),
+            (
+                "crates/flat/Cargo.toml",
+                "[package]\nname = \"flat\"\n\n[lib]\npath = \"lib.rs\"\n",
+            ),
+        ]);
+        let root = t.path();
+        git_in(root, &[&["init", "-q"], &["add", "."]]);
+        for (rel, text) in [
+            ("crates/a/src/new.rs", "pub fn new() {}\n"),
+            ("crates/a/src/deep/mod.rs", "pub fn deep() {}\n"),
+            ("crates/a/tests/t.rs", "#[test]\nfn t() {}\n"),
+            ("crates/a/benches/b.rs", "fn main() {}\n"),
+            ("crates/a/examples/e.rs", "fn main() {}\n"),
+            ("crates/a/build.rs", "fn main() {}\n"),
+            ("crates/a/notes/scratch.rs", "fn scratch( ){}\n"),
+            ("crates/a/src/ignored.rs", "fn ignored( ){}\n"),
+            ("scratch.rs", "fn scratch( ){}\n"),
+            ("vendor/v/Cargo.toml", "[package]\nname = \"v\"\n"),
+            ("vendor/v/src/lib.rs", "fn v( ){}\n"),
+            ("crates/a/fuzz/fuzz_targets/new.rs", "fn main() {}\n"),
+            ("crates/a/fuzz/fuzz_targets/util/mod.rs", "pub fn u() {}\n"),
+            ("crates/a/fuzz/corpus/seed.rs", "fn seed( ){}\n"),
+            ("crates/a/fuzz/scratch.rs", "fn scratch( ){}\n"),
+            ("crates/a/fuzz/x/lib.rs", "fn x( ){}\n"),
+            ("crates/flat/lib.rs", "pub fn flat() {}\n"),
+            ("crates/flat/beside.rs", "pub fn beside() {}\n"),
+            ("crates/flat/notes/n.rs", "fn n( ){}\n"),
+            ("crates/a/notes/up.rs", "fn up( ){}\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, text).expect("write");
+        }
+        let env = crate::EnvSnapshot::capture();
+        let files = rs_files_in(root, &env.path).expect("listed");
+        assert_eq!(
+            files,
+            [
+                "crates/a/benches/b.rs",
+                "crates/a/build.rs",
+                "crates/a/examples/e.rs",
+                "crates/a/fuzz/fuzz_targets/decode.rs",
+                "crates/a/fuzz/fuzz_targets/new.rs",
+                "crates/a/fuzz/fuzz_targets/util/mod.rs",
+                "crates/a/src/deep/mod.rs",
+                "crates/a/src/lib.rs",
+                "crates/a/src/new.rs",
+                "crates/a/tests/t.rs",
+                "crates/flat/beside.rs",
+                "crates/flat/lib.rs",
+            ]
+        );
+        let tracked = ls_files(root, &env.path, &["--cached"]).expect("listed");
+        assert_eq!(
+            tracked,
+            [
+                "crates/a/fuzz/fuzz_targets/decode.rs",
+                "crates/a/src/lib.rs"
+            ],
+            "the control"
+        );
+    }
+
     #[test]
     fn a_diff_path_keeps_a_colon_inside_the_checkout_path() {
         let out = "Diff in /a:b/crates/x/src/lib.rs:12:\n stuff\nDiff in /a:b/y.rs:3:\n\
@@ -671,9 +869,10 @@ mod tests {
     }
 
     /// The real formatter over a scratch checkout: a file whose diff carries
-    /// a context line reading `error: …` is one drift and nothing unread;
-    /// `--fix` rewrites it; the next check passes. Skips, saying so, on a
-    /// machine with no trustfmt.
+    /// a context line reading `error: …` is one drift and nothing unread, and
+    /// so is a new source not yet staged; `--fix` rewrites both, and leaves an
+    /// untracked scratch file cargo builds nothing from as it was; the next
+    /// check passes. Skips, saying so, on a machine with no trustfmt.
     #[test]
     fn the_real_formatter_reds_on_drift_and_the_fix_greens_it() {
         use crate::ladder::{Outcome, Severity};
@@ -701,17 +900,17 @@ mod tests {
         let root = t.path().to_path_buf();
         let scratch = t.path().join(".scratch");
         std::fs::create_dir_all(&scratch).expect("scratch");
-        let env = crate::EnvSnapshot::capture();
-        for args in [
-            &["init", "-q"][..],
-            &["add", "Cargo.toml", "rustfmt.toml", "src"],
-        ] {
-            let ok = crate::changed::git(&root, &env.path)
-                .args(args)
-                .status()
-                .is_ok_and(|s| s.success());
-            assert!(ok, "git {args:?} in the scratch checkout");
-        }
+        git_in(
+            &root,
+            &[
+                &["init", "-q"],
+                &["add", "Cargo.toml", "rustfmt.toml", "src"],
+            ],
+        );
+        let untidy = "pub fn new(  ) ->usize{2}\n";
+        std::fs::write(root.join("src/new.rs"), untidy).expect("write");
+        std::fs::create_dir_all(root.join("notes")).expect("mkdir");
+        std::fs::write(root.join("notes/scratch.rs"), untidy).expect("write");
         let check = |fix: bool| {
             let ctx = Ctx::new_with_tools(
                 root.clone(),
@@ -734,7 +933,7 @@ mod tests {
             "{rows:?}"
         );
         let ids: Vec<String> = red.findings().into_iter().map(|f| f.id).collect();
-        assert_eq!(ids, ["src/lib.rs"], "{rows:?}");
+        assert_eq!(ids, ["src/lib.rs", "src/new.rs"], "{rows:?}");
         let fixed = check(true);
         assert!(
             fixed.outcomes().all(|(o, _)| o == Outcome::Ok),
@@ -745,6 +944,16 @@ mod tests {
             std::fs::read_to_string(root.join("src/lib.rs"))
                 .expect("read")
                 .contains("pub fn wrong() -> usize {")
+        );
+        assert!(
+            std::fs::read_to_string(root.join("src/new.rs"))
+                .expect("read")
+                .contains("pub fn new() -> usize {")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/scratch.rs")).expect("read"),
+            untidy,
+            "the scratch file is never rewritten"
         );
         let green = check(false);
         assert!(

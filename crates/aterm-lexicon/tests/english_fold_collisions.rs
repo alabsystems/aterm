@@ -8,7 +8,7 @@
 //! word: Turkish `piç` folds to `pic`, the prefix of `pick`; Latvian `sūds`
 //! folds to `suds`.
 //!
-//! This walks the system English dictionary and fails if ANY ordinary English
+//! This walks Webster's Second (`crate::web2_words`) and fails if ANY ordinary English
 //! word classifies as a sparkle class without being opted into. The allowlist
 //! below is the set of English words that are SUPPOSED to sparkle.
 
@@ -26,10 +26,7 @@ const INTENTIONAL: &[&str] = &[
 
 #[test]
 fn no_unambiguous_surface_is_an_ordinary_english_word() {
-    let Ok(raw) = std::fs::read_to_string("/usr/share/dict/words") else {
-        eprintln!("no system word list; fold-collision gate skipped");
-        return;
-    };
+    let raw = crate::web2_words();
     let allow: HashSet<&str> = INTENTIONAL.iter().copied().collect();
     let lex = aterm_lexicon::Lexicon::builtin();
     let opts = aterm_lexicon::ScanOptions::default();
@@ -83,10 +80,7 @@ const INTENTIONAL_PREFIXES: &[&str] = &[
 
 #[test]
 fn no_english_word_transits_an_unambiguous_profanity_prefix() {
-    let Ok(raw) = std::fs::read_to_string("/usr/share/dict/words") else {
-        eprintln!("no system word list; prefix-transit gate skipped");
-        return;
-    };
+    let raw = crate::web2_words();
     let lex = aterm_lexicon::Lexicon::builtin();
     let opts = aterm_lexicon::ScanOptions::default();
     // The live-bonk surface set: every folded spaced surface that, scanned as

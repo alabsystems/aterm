@@ -10,29 +10,8 @@
 
 use aterm_core::terminal::Terminal;
 
-/// Byte-stream RIS must not clear the host shell-integration nonce requirement.
-#[test]
-fn byte_stream_ris_preserves_shell_integration_nonce_requirement() {
-    let mut t = Terminal::new(24, 80);
-    t.set_require_shell_integration_nonce(true);
-    assert!(
-        t.is_require_shell_integration_nonce(),
-        "precondition: host armed the nonce requirement"
-    );
-
-    // RIS from the untrusted byte stream.
-    t.process(b"\x1bc");
-
-    assert!(
-        t.is_require_shell_integration_nonce(),
-        "byte-stream RIS (ESC c) must NOT clear the host shell-integration \
-         nonce requirement — otherwise a rogue program forges OSC 133/633 \
-         marks without a nonce (#7937 F01-2 / #7960)"
-    );
-}
-
 /// Programmatic `reset()` and byte-stream RIS both preserve the nonce
-/// requirement.
+/// requirement; RIS from the byte stream clearing it was #7937 F01-2 / #7960.
 #[test]
 fn reset_paths_agree_on_nonce_preservation() {
     let mut via_api = Terminal::new(24, 80);

@@ -13,10 +13,7 @@ use super::*;
 /// snap.
 #[test]
 fn render_snapshot_carries_the_banked_residual() {
-    let Some(mut t) = terminal_with_history() else {
-        eprintln!("no system font; skipping snapshot smoke");
-        return;
-    };
+    let mut t = terminal_with_history();
     t.scroll_px(t.cell_height() as f64 / 2.0);
     let rows = t.rows;
     t.build_frame();

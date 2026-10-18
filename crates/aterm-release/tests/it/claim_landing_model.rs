@@ -3,7 +3,7 @@
 
 //! Tier-1 conformance for `ReleaseClaimLanding`, the release claim's writer/reader contract.
 //!
-//! The model (`aterm_spec::derive::release_claim_landing_model`) states the laws: the release
+//! The model (`aterm_models_release::release_claim_landing_model`) states the laws: the release
 //! commit carries only the published commit's code, main keeps every peer commit and ledger
 //! line, build numbers strictly increase, and a claimed-unpublished version reads as a recut,
 //! never fresh, never "cut elsewhere", never claimed again once published. This drives the real
@@ -26,7 +26,8 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aterm_spec::derive::{Model, release_claim_landing_model};
+use aterm_models_release::release_claim_landing_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use ledger::testing::Git;
 use ledger::{ClaimPlan, GitRunner, RunOut};

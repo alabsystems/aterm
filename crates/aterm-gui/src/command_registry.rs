@@ -235,6 +235,10 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // The manual reset of the focused view's terminal to its host defaults: runtime engine
         // state only (`LocalUi`, the class of the font zoom), and it needs a terminal leaf.
         M::ResetTerminal => spec("terminal.reset", S::View, A::LocalUi, C::Terminal),
+        // A tab's own theme: runtime state of the focused view's session, the
+        // `theme session` verbs' class; it needs a terminal leaf.
+        M::ChooseTabTheme => spec("palette.choose_tab_theme", S::View, A::LocalUi, C::Terminal),
+        M::ClearTabTheme => spec("terminal.theme.clear", S::View, A::LocalUi, C::Terminal),
     }
 }
 

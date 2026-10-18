@@ -15,16 +15,17 @@
 //!
 //! `crates/aterm-arrayvec` is a shim whose `[package] name` is `arrayvec`; it
 //! re-exports [`ArrayVec`] and nothing else of substance, so that
-//! `[patch.crates-io]` can point `naga` / `wgpu` / `wgpu-core` / `wgpu-hal` /
-//! `tiny-skia` at this implementation. Anything you change in
+//! `[patch.crates-io]` can point `naga` / `wgpu` / `wgpu-core` / `wgpu-hal`
+//! (and, until LW.5, `tiny-skia`) at this implementation. Anything you change in
 //! `array_vec.rs` is therefore load-bearing for third-party GPU code as well as
 //! for aterm's parser — read `crates/aterm-arrayvec/src/lib.rs` first.
 //!
 //! ## `SmallVec` is also the storage of the `smallvec` package
 //!
 //! `crates/aterm-smallvec` (package `smallvec`) wraps [`SmallVec<T, N>`] as
-//! upstream's `SmallVec<[T; N]>` for parking_lot_core, the wgpu crates and
-//! wayland-backend. It adds no unsafe code: every `MaybeUninit`
+//! upstream's `SmallVec<[T; N]>` for parking_lot_core and the wgpu crates
+//! (wayland-backend too, until linux-windowing LW.7). It adds no unsafe code:
+//! every `MaybeUninit`
 //! those consumers reach is in `small_vec.rs`, so a change there is checked by
 //! that crate's tests too (`targo --unverified test -p smallvec`).
 

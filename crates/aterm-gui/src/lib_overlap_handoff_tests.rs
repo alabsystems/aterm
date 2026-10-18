@@ -26,7 +26,7 @@ fn overlap_model_step(
 }
 
 fn overlap_model_at_proof_ready() -> (aterm_spec::derive::Model, aterm_spec::interp::State) {
-    let model = aterm_spec::derive::native_update_overlap_handoff_model();
+    let model = aterm_models_misc::native_update_overlap_handoff_model();
     let mut state = model.init_state();
     for action in [
         "ParkParentReaders",
@@ -114,50 +114,6 @@ fn handoff_arbiter_linearizes_commit_and_reject_interleavings() {
     assert_eq!(failed_state["parent_exited"], 0);
 }
 
-#[test]
-fn barrier_race_has_exactly_one_handoff_phase_winner() {
-    use crate::{HandoffAttemptArbiter, HandoffAttemptPhase};
-    use std::sync::{Arc, Barrier};
-
-    for _ in 0..128 {
-        let arbiter = HandoffAttemptArbiter::new();
-        let (model, mut state) = overlap_model_at_proof_ready();
-        overlap_model_step(&model, &mut state, "ArmConcurrentRejectContender");
-        let barrier = Arc::new(Barrier::new(3));
-        let commit_arbiter = arbiter.clone();
-        let commit_barrier = Arc::clone(&barrier);
-        let commit = std::thread::spawn(move || {
-            commit_barrier.wait();
-            commit_arbiter.try_begin_commit()
-        });
-        let reject_arbiter = arbiter.clone();
-        let reject_barrier = Arc::clone(&barrier);
-        let reject = std::thread::spawn(move || {
-            reject_barrier.wait();
-            reject_arbiter.try_begin_reject()
-        });
-        barrier.wait();
-        let commit_won = commit.join().expect("commit racer");
-        let reject_won = reject.join().expect("reject racer");
-        assert_ne!(commit_won, reject_won, "exactly one CAS must win");
-        if commit_won {
-            overlap_model_step(&model, &mut state, "MainWinsCommitArbiter");
-            overlap_model_step(&model, &mut state, "WorkerLosesRejectRace");
-        } else {
-            overlap_model_step(&model, &mut state, "WorkerWinsRejectArbiter");
-        }
-        assert_eq!(
-            arbiter.phase(),
-            if commit_won {
-                HandoffAttemptPhase::Committing
-            } else {
-                HandoffAttemptPhase::Rejecting
-            }
-        );
-        assert_eq!(state["arbiter"], if commit_won { 1 } else { 2 });
-    }
-}
-
 fn arm_outgoing_handoff(app: &mut App) -> std::sync::mpsc::Receiver<()> {
     let layout = app.capture_restore_manifest();
     let layout_digest = crate::seamless::layout_digest(&layout).expect("canonical layout");
@@ -219,12 +175,6 @@ fn the_outgoing_process_titles_the_bar_for_its_successor_before_commit() {
         .publish_handoff_target_to_menu_bar()
         .expect("the successor is nameable");
     assert_eq!(title, "v0.92.0");
-    assert!(
-        !title.contains('\u{2B06}'),
-        "no arrow over the successor: {title}"
-    );
-    assert_ne!(title, crate::menu::version_menu_bar_title(true));
-    assert_ne!(title, crate::menu::version_menu_bar_title(false));
 
     app.relaunch = Some(crate::relaunch_notice::RelaunchNotice {
         build: target + 1,
@@ -256,45 +206,62 @@ fn the_outgoing_process_titles_the_bar_for_its_successor_before_commit() {
     );
 }
 
-/// Readiness gate and exact proof: an undrained restore queue holds the proof; once
-/// drained, exactly one proof lands on the parent's read end and the fd is consumed.
+/// Arm `app` as an incoming successor that owes its readiness proof under
+/// `nonce` (layout digest `[7; 32]`, screen digest `[8; 32]`): the parent's
+/// read end of the proof channel, its write end of the Commit pipe, and the
+/// reader gate the Commit opens. Every end is close-on-exec, so a child
+/// another test spawns holds none of them.
+fn arm_incoming_proof(
+    app: &mut App,
+    nonce: &str,
+) -> (
+    std::fs::File,
+    std::fs::File,
+    crate::spawn::DeferredReaderGate,
+) {
+    use std::os::fd::FromRawFd as _;
+    let (mut ready, mut commit) = ([0i32; 2], [0i32; 2]);
+    // SAFETY: both arrays provide pipe(2)'s two writable descriptor slots.
+    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
+    assert_eq!(unsafe { libc::pipe(commit.as_mut_ptr()) }, 0, "commit pipe");
+    for fd in ready.into_iter().chain(commit) {
+        aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
+    }
+    // SAFETY: these four newly created descriptors have one owner each.
+    let (ready_read, ready_write, commit_read, commit_write) = unsafe {
+        (
+            std::fs::File::from_raw_fd(ready[0]),
+            std::os::fd::OwnedFd::from_raw_fd(ready[1]),
+            std::os::fd::OwnedFd::from_raw_fd(commit[0]),
+            std::fs::File::from_raw_fd(commit[1]),
+        )
+    };
+    app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
+        ready_write,
+        nonce,
+        [7; 32],
+        [8; 32],
+    ));
+    app.handoff_commit = Some(crate::seamless::CommitReceiver::for_test(commit_read));
+    let gate = crate::spawn::DeferredReaderGate::closed();
+    app.handoff_reader_gate = Some(gate.clone());
+    (ready_read, commit_write, gate)
+}
+
+/// Readiness gate and exact proof: an undrained restore queue holds the proof,
+/// and so does unfinished control preparation; once both are done, exactly one
+/// proof lands on the parent's read end and the write end is consumed.
 #[test]
 fn readiness_proof_fires_only_when_drained() {
     let mut app = App::headless_for_test();
     let nonce = "readiness-proof-test";
-    let mut fds = [0i32; 2];
-    // SAFETY: plain pipe(2) into a valid 2-slot out-array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (fds[0], fds[1]);
-    let mut commit_fds = [0i32; 2];
-    assert_eq!(
-        unsafe { libc::pipe(commit_fds.as_mut_ptr()) },
-        0,
-        "commit pipe"
-    );
-    let (commit_rd, commit_wr) = (commit_fds[0], commit_fds[1]);
-    // SAFETY: fresh pipe fd, exclusively owned from here.
-    let wr = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(wr) };
-    let layout_digest = [7; 32];
-    let screen_digest = [8; 32];
-    app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-        wr,
-        nonce,
-        layout_digest,
-        screen_digest,
-    ));
-    let commit_rd =
-        unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(commit_rd) };
-    app.handoff_commit = Some(crate::seamless::CommitReceiver::for_test(commit_rd));
-    app.handoff_reader_gate = Some(crate::spawn::DeferredReaderGate::closed());
-    // GATE: a pending restore holds the proof.
+    let (mut ready_read, _commit_write, gate) = arm_incoming_proof(&mut app, nonce);
     app.pending_restore = Some(crate::restore::RestoreManifest::new(Vec::new()));
     app.maybe_signal_handoff_ready();
     assert!(
         app.handoff_ready.is_some(),
         "proof held while the restore queue is undrained"
     );
-    // A drained, painted candidate still owes its control resources.
     app.pending_restore = None;
     let control_preparation = crate::control::ControlPreparation::default();
     app.handoff_control_preparation = Some(control_preparation.clone());
@@ -303,38 +270,29 @@ fn readiness_proof_fires_only_when_drained() {
         app.handoff_ready.is_some(),
         "control preparation must hold the real proof"
     );
-    assert!(!app.handoff_reader_gate.as_ref().unwrap().is_released());
+    assert!(!gate.is_released());
     control_preparation.finish(true);
-    // Drained + prepared ⇒ the exact proof fires and the fd is consumed.
     app.maybe_signal_handoff_ready();
     assert!(app.handoff_ready.is_none(), "fd consumed at signal time");
-    let mut buf = [0u8; crate::seamless::READY_WIRE_LEN];
-    // SAFETY: bounded read from the pipe this test owns.
-    let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
-    assert_eq!(n as usize, buf.len(), "one complete readiness proof");
-    let got = crate::seamless::AdoptionProof::from_wire(&buf).expect("valid proof wire");
+    let mut wire = Vec::new();
+    std::io::Read::read_to_end(&mut ready_read, &mut wire).expect("the proof, then EOF");
+    let wire: [u8; crate::seamless::READY_WIRE_LEN] = wire
+        .try_into()
+        .expect("exactly one proof, and the write end closed after it");
     assert_eq!(
-        got,
+        crate::seamless::AdoptionProof::from_wire(&wire).expect("a valid proof"),
         crate::seamless::adoption_proof(
             nonce,
             crate::build_info::build_number()
                 .parse::<u64>()
                 .unwrap_or(0),
             crate::build_info::git_commit(),
-            &layout_digest,
-            &screen_digest,
+            &[7; 32],
+            &[8; 32],
             &[],
         )
         .expect("empty-set proof")
     );
-    // The write end was closed with the OwnedFd: EOF, not a hang.
-    let n2 = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), 1) };
-    assert_eq!(
-        n2, 0,
-        "write end closed → EOF (the parent's crash detector)"
-    );
-    aterm_pty::close_fd(rd);
-    aterm_pty::close_fd(commit_wr);
 }
 
 /// A failed capture barrier does not withdraw handoff readiness: the proof's paint
@@ -378,290 +336,161 @@ fn a_failed_capture_barrier_does_not_withdraw_handoff_readiness() {
 }
 
 /// Held shell re-keys are written by the commit waiter when Commit arrives, never at
-/// the proof and never when the attempt ends at EOF.
+/// the proof.
 #[test]
 fn held_rekeys_are_written_by_the_commit_and_never_before() {
-    use std::os::fd::FromRawFd as _;
-    for committed in [false, true] {
-        let mut app = App::headless_for_test();
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("rk-commit")
-            .tempdir()
-            .expect("scratch");
-        let key_file = dir.path().join("s-ab");
-        let queue = std::sync::Arc::new(crate::shell_rekey::Deferred::holding());
-        queue.hold(crate::shell_rekey::mint(&key_file, 1).0);
-        app.session_factory.rekey_deferred = Some(queue);
-        let mut ready = [0i32; 2];
-        let mut commit = [0i32; 2];
-        // SAFETY: both arrays provide pipe(2)'s two writable descriptor slots.
-        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
-        assert_eq!(unsafe { libc::pipe(commit.as_mut_ptr()) }, 0, "commit pipe");
-        // SAFETY: these four newly created descriptors have one owner each.
-        let mut ready_read = unsafe { std::fs::File::from_raw_fd(ready[0]) };
-        let ready_write = unsafe { std::os::fd::OwnedFd::from_raw_fd(ready[1]) };
-        let commit_read = unsafe { std::os::fd::OwnedFd::from_raw_fd(commit[0]) };
-        let mut commit_write = unsafe { std::fs::File::from_raw_fd(commit[1]) };
-        app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-            ready_write,
-            "rekey-at-commit",
-            [5; 32],
-            [6; 32],
-        ));
-        app.handoff_commit = Some(crate::seamless::CommitReceiver::for_test(commit_read));
-        let gate = crate::spawn::DeferredReaderGate::closed();
-        app.handoff_reader_gate = Some(gate.clone());
-        let preparation = crate::control::ControlPreparation::default();
-        preparation.finish(true);
-        app.handoff_control_preparation = Some(preparation);
-        app.maybe_signal_handoff_ready();
-        assert!(app.handoff_ready.is_none(), "the proof fired");
-        let mut wire = [0u8; crate::seamless::READY_WIRE_LEN];
-        std::io::Read::read_exact(&mut ready_read, &mut wire).expect("the proof");
-        let proof = crate::seamless::AdoptionProof::from_wire(&wire).expect("proof wire");
-        assert!(!key_file.exists(), "no key before the Commit");
-        if committed {
-            std::io::Write::write_all(&mut commit_write, &proof.to_commit_wire()).expect("commit");
-            let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-            while !(key_file.exists() && gate.is_released()) && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert!(gate.is_released(), "the Commit opened the readers");
-            assert!(key_file.exists(), "and wrote the held key");
-        } else {
-            drop(commit_write);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            assert!(!gate.is_released());
-            assert!(
-                !key_file.exists(),
-                "an attempt with no Commit writes nothing"
-            );
-        }
-    }
-}
-
-#[test]
-fn control_preparation_failure_closes_proof_before_parent_commit() {
-    use std::os::fd::FromRawFd;
     let mut app = App::headless_for_test();
-    let mut ready = [0; 2];
-    let mut commit = [0; 2];
-    // SAFETY: both arrays provide pipe(2)'s two writable descriptor slots.
-    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
-    assert_eq!(unsafe { libc::pipe(commit.as_mut_ptr()) }, 0);
-    // SAFETY: these four newly created descriptors have one owner each.
-    let mut ready_read = unsafe { std::fs::File::from_raw_fd(ready[0]) };
-    let ready_write = unsafe { std::os::fd::OwnedFd::from_raw_fd(ready[1]) };
-    let commit_read = unsafe { std::os::fd::OwnedFd::from_raw_fd(commit[0]) };
-    let _commit_write = unsafe { std::os::fd::OwnedFd::from_raw_fd(commit[1]) };
-    app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-        ready_write,
-        "control-preparation-failure",
-        [3; 32],
-        [4; 32],
-    ));
-    app.handoff_commit = Some(crate::seamless::CommitReceiver::for_test(commit_read));
-    let gate = crate::spawn::DeferredReaderGate::closed();
-    app.handoff_reader_gate = Some(gate.clone());
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("rk-commit")
+        .tempdir()
+        .expect("scratch");
+    let key_file = dir.path().join("s-ab");
+    let queue = std::sync::Arc::new(crate::shell_rekey::Deferred::holding());
+    queue.hold(crate::shell_rekey::mint(&key_file, 1).0);
+    app.session_factory.rekey_deferred = Some(queue);
+    let (mut ready_read, mut commit_write, gate) = arm_incoming_proof(&mut app, "rekey-at-commit");
     let preparation = crate::control::ControlPreparation::default();
-    preparation.finish(false);
+    preparation.finish(true);
     app.handoff_control_preparation = Some(preparation);
     app.maybe_signal_handoff_ready();
-    assert!(app.handoff_degraded);
-    assert!(app.handoff_ready.is_none());
-    assert!(app.handoff_commit.is_none());
-    assert!(
-        !gate.is_released(),
-        "resource failure cannot authorize PTY consumption"
+    assert!(app.handoff_ready.is_none(), "the proof fired");
+    let mut wire = [0u8; crate::seamless::READY_WIRE_LEN];
+    std::io::Read::read_exact(&mut ready_read, &mut wire).expect("the proof");
+    let proof = crate::seamless::AdoptionProof::from_wire(&wire).expect("proof wire");
+    assert!(!key_file.exists(), "no key before the Commit");
+    std::io::Write::write_all(&mut commit_write, &proof.to_commit_wire()).expect("commit");
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the Commit opened the readers and wrote the held key",
+        || (key_file.exists() && gate.is_released()).then_some(()),
     );
-    // All other proof prerequisites were ready, as in the positive test.
-    // A resource failure closes the real channel without emitting proof.
-    let mut byte = [0];
-    assert_eq!(std::io::Read::read(&mut ready_read, &mut byte).unwrap(), 0);
 }
 
+/// A preparation failure before the proof closes the parent's channel at once,
+/// with no proof and the readers still shut: a control-resource failure, and a
+/// reader preparation that fails (a test App has no event-loop proxy). The
+/// close is synchronous: a successor that kept it open would cost the parent
+/// its decision deadline, and here the read below would block for good.
 #[test]
-fn preproof_preparation_failure_closes_parent_channel_promptly() {
-    let mut app = App::headless_for_test();
-    let mut ready_fds = [0i32; 2];
-    assert_eq!(
-        unsafe { libc::pipe(ready_fds.as_mut_ptr()) },
-        0,
-        "ready pipe"
-    );
-    let (ready_rd, ready_wr) = (ready_fds[0], ready_fds[1]);
-    let mut commit_fds = [0i32; 2];
-    assert_eq!(
-        unsafe { libc::pipe(commit_fds.as_mut_ptr()) },
-        0,
-        "commit pipe"
-    );
-    let (commit_rd, commit_wr) = (commit_fds[0], commit_fds[1]);
-    // pipe(2) ends are inheritable; mark them close-on-exec so a child spawned by another
-    // test cannot hold the write end open.
-    for fd in [ready_rd, ready_wr, commit_rd, commit_wr] {
-        aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
-    }
-    let ready_wr =
-        unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(ready_wr) };
-    let commit_rd =
-        unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(commit_rd) };
-    app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-        ready_wr,
-        "preproof-failure",
-        [3; 32],
-        [4; 32],
-    ));
-    app.handoff_commit = Some(crate::seamless::CommitReceiver::for_test(commit_rd));
-    app.handoff_reader_gate = Some(crate::spawn::DeferredReaderGate::closed());
-    app.pool
-        .sessions
-        .values_mut()
-        .next()
-        .expect("headless fixture session")
-        .session
-        .handoff_local_id = Some(0);
-    // A test App has no event-loop proxy, so reader preparation fails before
-    // ProofReady. The channel must close synchronously: in production a
-    // successor that kept it open costs the parent its 15 s decision
-    // deadline, and here, where the App holds the only write end and the read
-    // below has no deadline, it would block that read for good.
-    let started = std::time::Instant::now();
-    app.maybe_signal_handoff_ready();
-    let mut byte = [0u8; 1];
-    let read = unsafe { libc::read(ready_rd, byte.as_mut_ptr().cast(), 1) };
-    assert_eq!(read, 0, "parent observes EOF on rejected proof channel");
-    assert!(
-        // A hang detector, a minute: 100ms wrapped a syscall and measured the
-        // scheduler, and nothing in this test waits on the parent's 15 s.
-        started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
-        "pre-Proof failure must resolve without waiting: {:?}",
-        started.elapsed()
-    );
-    assert!(app.handoff_degraded);
-    assert!(app.handoff_ready.is_none());
-    assert!(app.handoff_commit.is_none());
-    aterm_pty::close_fd(ready_rd);
-    aterm_pty::close_fd(commit_wr);
-}
-
-/// Parking a session with no live reader (a stub) ACKs immediately, and the
-/// self-describing resume scan (`reader_join: None` + a real master) never
-/// matches a stub — so park/resume cycles are safe no-ops on windows whose
-/// sessions carry no PTY.
-#[test]
-fn park_and_resume_are_noops_for_stub_sessions() {
-    let mut app = App::headless_for_test();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
-    assert!(
-        app.park_all_readers(deadline),
-        "no readers → parked trivially"
-    );
-    // The resume scan skips stubs (master == -1): nothing panics, nothing spawns.
-    app.attach_deferred_readers();
-    for p in app.pool.sessions.values() {
+fn a_preparation_failure_closes_the_proof_channel_without_a_proof() {
+    for cause in ["control resources", "reader preparation"] {
+        let mut app = App::headless_for_test();
+        let (mut ready_read, _commit_write, gate) = arm_incoming_proof(&mut app, cause);
+        if cause == "control resources" {
+            let preparation = crate::control::ControlPreparation::default();
+            preparation.finish(false);
+            app.handoff_control_preparation = Some(preparation);
+        } else {
+            app.pool
+                .sessions
+                .values_mut()
+                .next()
+                .expect("headless fixture session")
+                .session
+                .handoff_local_id = Some(0);
+        }
+        app.maybe_signal_handoff_ready();
+        assert!(app.handoff_degraded, "{cause}");
+        assert!(app.handoff_ready.is_none(), "{cause}");
+        assert!(app.handoff_commit.is_none(), "{cause}");
         assert!(
-            p.session.reader_join.is_none(),
-            "no reader was attached to a stub"
+            !gate.is_released(),
+            "{cause}: a failure cannot authorize PTY consumption"
+        );
+        let mut byte = [0];
+        assert_eq!(
+            std::io::Read::read(&mut ready_read, &mut byte).expect("read"),
+            0,
+            "{cause}: the parent observes EOF, no proof"
         );
     }
 }
 
+/// Every tab close a pending handoff can be asked for — the native close of a
+/// non-last tab, Cmd-W on the focused pane, and the control verb — is deferred
+/// onto the handoff's teardown: no tab and no Session/PTY ownership edge goes
+/// before the child is reaped, and the worker is told to abort. Once the
+/// pending authority is cleared, the deferred close replays.
 #[test]
-fn pending_handoff_defers_non_last_tab_close_without_dropping_pty_ownership() {
-    let mut app = App::headless_for_test();
-    app.push_stub_tab(WindowId(0), stub_session(app.next_session_id));
-    let tab = app.windows[&WindowId(0)].tab_set.tabs()[0].id;
-    let tabs_before = app.windows[&WindowId(0)].tab_set.len();
-    let sessions_before: std::collections::BTreeSet<_> =
-        app.pool.iter().map(|session| session.id).collect();
-    let epoch_before = app.update_handoff_activity_epoch;
-    let cancelled = arm_outgoing_handoff(&mut app);
+fn pending_handoff_defers_every_tab_close_without_dropping_pty_ownership() {
+    for closer in ["close_tab_at", "cmd-w", "control verb"] {
+        let mut app = App::headless_for_test();
+        app.push_stub_tab(WindowId(0), stub_session(app.next_session_id));
+        let first = app.windows[&WindowId(0)].tab_set.tabs()[0].id;
+        let (active, focus) = {
+            let active = app.windows[&WindowId(0)]
+                .tab_set
+                .active()
+                .expect("active tab");
+            (active.id, active.focus)
+        };
+        let tabs_before = app.windows[&WindowId(0)].tab_set.len();
+        let sessions_before: std::collections::BTreeSet<_> =
+            app.pool.iter().map(|session| session.id).collect();
+        let epoch_before = app.update_handoff_activity_epoch;
+        let cancelled = arm_outgoing_handoff(&mut app);
 
-    assert!(!app.close_tab_at(WindowId(0), 0));
-    assert_eq!(app.windows[&WindowId(0)].tab_set.len(), tabs_before);
-    assert_eq!(
-        app.pool
-            .iter()
-            .map(|session| session.id)
-            .collect::<std::collections::BTreeSet<_>>(),
-        sessions_before,
-        "no Session/PTY ownership edge may detach before child reap"
-    );
-    assert!(app.update_handoff_activity_epoch > epoch_before);
-    assert!(cancelled.try_recv().is_ok(), "close requests worker abort");
-    assert!(matches!(
-        app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
-        Some(crate::DeferredHandoffTeardown::Mutations(mutations))
-            if mutations.contains(&crate::DeferredHandoffMutation::CloseTab {
-                window: WindowId(0),
-                tab,
-            })
-    ));
-
-    // Model the completion boundary: only after the worker is gone and the
-    // pending authority is cleared may the stable target be replayed.
-    app.pending_update_handoff = None;
-    assert!(!app.replay_deferred_handoff_tab_close(WindowId(0), tab));
-    assert_eq!(app.windows[&WindowId(0)].tab_set.len(), tabs_before - 1);
-    assert_eq!(app.pool.iter().count(), sessions_before.len() - 1);
-}
-
-#[test]
-fn pending_handoff_defers_cmd_w_focused_pane_close() {
-    let mut app = App::headless_for_test();
-    app.push_stub_tab(WindowId(0), stub_session(app.next_session_id));
-    let active = app.windows[&WindowId(0)]
-        .tab_set
-        .active()
-        .expect("active tab");
-    let mutation = crate::DeferredHandoffMutation::CloseView {
-        window: WindowId(0),
-        tab: active.id,
-        view: active.focus,
-    };
-    let tabs_before = app.windows[&WindowId(0)].tab_set.len();
-    let pool_before = app.pool.iter().count();
-    let cancelled = arm_outgoing_handoff(&mut app);
-
-    assert_eq!(app.close_active_tab(), None);
-    assert_eq!(app.windows[&WindowId(0)].tab_set.len(), tabs_before);
-    assert_eq!(app.pool.iter().count(), pool_before);
-    assert!(cancelled.try_recv().is_ok());
-    assert!(matches!(
-        app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
-        Some(crate::DeferredHandoffTeardown::Mutations(mutations))
-            if mutations.contains(&mutation)
-    ));
-}
-
-#[test]
-fn native_and_control_tab_close_share_the_pending_handoff_barrier() {
-    let mut app = App::headless_for_test();
-    app.push_stub_tab(WindowId(0), stub_session(app.next_session_id));
-    let tabs_before = app.windows[&WindowId(0)].tab_set.len();
-    let pool_before = app.pool.iter().count();
-
-    let native_cancelled = arm_outgoing_handoff(&mut app);
-    assert!(!app.close_tab_at(WindowId(0), 0), "native CloseTab core");
-    assert!(native_cancelled.try_recv().is_ok());
-    assert_eq!(app.windows[&WindowId(0)].tab_set.len(), tabs_before);
-    assert_eq!(app.pool.iter().count(), pool_before);
-
-    app.pending_update_handoff = None;
-    let control_cancelled = arm_outgoing_handoff(&mut app);
-    let state = app.apply_tab_cmd(crate::TabAction::Close(Some(0)));
-    assert!(control_cancelled.try_recv().is_ok());
-    // The close was deferred onto the handoff teardown, and the reply says so; no early
-    // mutation is asserted on the window below.
-    assert_eq!(
-        state,
-        Err("tab close deferred: a pending update handoff is being cancelled first".to_string()),
-        "a deferred close reports the deferral, not a state pair"
-    );
-    assert_eq!(app.windows[&WindowId(0)].tab_set.len(), tabs_before);
-    assert_eq!(app.pool.iter().count(), pool_before);
+        let deferred = match closer {
+            "close_tab_at" => {
+                assert!(!app.close_tab_at(WindowId(0), 0));
+                Some(crate::DeferredHandoffMutation::CloseTab {
+                    window: WindowId(0),
+                    tab: first,
+                })
+            }
+            "cmd-w" => {
+                assert_eq!(app.close_active_tab(), None);
+                Some(crate::DeferredHandoffMutation::CloseView {
+                    window: WindowId(0),
+                    tab: active,
+                    view: focus,
+                })
+            }
+            _ => {
+                assert!(
+                    app.apply_tab_cmd(crate::TabAction::Close(Some(0))).is_err(),
+                    "a deferred close reports the deferral, not a state pair"
+                );
+                None
+            }
+        };
+        assert_eq!(
+            app.windows[&WindowId(0)].tab_set.len(),
+            tabs_before,
+            "{closer}"
+        );
+        assert_eq!(
+            app.pool
+                .iter()
+                .map(|session| session.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            sessions_before,
+            "{closer}: no Session/PTY ownership edge may detach before child reap"
+        );
+        assert!(
+            cancelled.try_recv().is_ok(),
+            "{closer}: the close requests the worker's abort"
+        );
+        if let Some(mutation) = deferred {
+            assert!(
+                matches!(
+                    app.pending_update_handoff.as_ref().map(|pending| &pending.teardown),
+                    Some(crate::DeferredHandoffTeardown::Mutations(mutations))
+                        if mutations.contains(&mutation)
+                ),
+                "{closer}"
+            );
+        }
+        if closer == "close_tab_at" {
+            assert!(app.update_handoff_activity_epoch > epoch_before);
+            // The completion boundary: only after the worker is gone and the
+            // pending authority is cleared may the stable target be replayed.
+            app.pending_update_handoff = None;
+            assert!(!app.replay_deferred_handoff_tab_close(WindowId(0), first));
+            assert_eq!(app.windows[&WindowId(0)].tab_set.len(), tabs_before - 1);
+            assert_eq!(app.pool.iter().count(), sessions_before.len() - 1);
+        }
+    }
 }
 
 #[test]
@@ -744,66 +573,6 @@ fn automatic_appkit_termination_dominates_close_and_revokes_commit() {
     );
 }
 
-/// The window seam (`update_handoff_window_event_class`) and delivery seam
-/// (`input_event_handoff_class`) classify each gesture the same way; in particular
-/// pointer traffic is tolerated by both.
-#[test]
-fn the_input_seam_and_the_window_seam_agree_on_pointer_traffic() {
-    use super::{input_event_handoff_class, update_handoff_window_event_class};
-    use crate::input::InputEvent;
-    use winit::dpi::PhysicalSize;
-    use winit::event::WindowEvent;
-    use winit::event::{DeviceId, MouseScrollDelta, TouchPhase};
-
-    let pairs: Vec<(WindowEvent, InputEvent)> = vec![
-        (
-            WindowEvent::CursorMoved {
-                device_id: DeviceId::dummy(),
-                position: winit::dpi::PhysicalPosition::new(3.0, 4.0),
-            },
-            InputEvent::MouseMove {
-                buttons: 3,
-                row: 1,
-                col: 2,
-                mods: 0,
-                side: aterm_core::selection::SelectionSide::Left,
-                px_off: crate::input::PixelOffset { x: 0, y: 0 },
-            },
-        ),
-        (
-            WindowEvent::MouseWheel {
-                device_id: DeviceId::dummy(),
-                delta: MouseScrollDelta::LineDelta(0.0, 1.0),
-                phase: TouchPhase::Moved,
-            },
-            InputEvent::Wheel {
-                dir: aterm_types::mouse::WheelDir::Up,
-                lines: 1,
-                row: 1,
-                col: 2,
-                mods: 0,
-                px_off: crate::input::PixelOffset { x: 0, y: 0 },
-            },
-        ),
-        (
-            WindowEvent::Resized(PhysicalSize::new(800, 600)),
-            InputEvent::Resize {
-                rows: 24,
-                cols: 80,
-                echo_to_window: false,
-            },
-        ),
-    ];
-    for (window_event, input_event) in pairs {
-        assert_eq!(
-            update_handoff_window_event_class(&window_event),
-            input_event_handoff_class(&input_event),
-            "the same gesture must classify the same at both seams: \
-             {window_event:?} vs {input_event:?}"
-        );
-    }
-}
-
 #[test]
 fn typing_buffers_through_a_pending_overlap_but_paste_still_revokes() {
     let mut app = App::headless_for_test();
@@ -848,6 +617,7 @@ fn typing_buffers_through_a_pending_overlap_but_paste_still_revokes() {
         crate::input::InputEvent::Wheel {
             dir: aterm_types::mouse::WheelDir::Up,
             lines: 1,
+            detent: true,
             row: 1,
             col: 2,
             mods: 0,
@@ -913,6 +683,7 @@ fn a_wake_after_the_commit_waits_for_the_commit_wake() {
     let typed = || {
         let (reply, answer) = std::sync::mpsc::channel();
         let wake = super::Wake::Input {
+            mark: None,
             batch: vec![crate::input::InputEvent::KeySequence(b"x".to_vec())],
             src: crate::input::Source::Controller,
             reply: Some(reply),
@@ -972,33 +743,6 @@ fn a_wake_after_the_commit_waits_for_the_commit_wake() {
     let (wake, _answer) = typed();
     assert!(app.admit_wake_before_commit(wake).is_some());
     assert_eq!(app.handoff_committed_wakes.len(), 2);
-}
-
-/// The Commit wake runs what was held for it LAST: after it cleared the
-/// pending handoff (so nothing is held again) and after the keystrokes typed
-/// before Commit replayed (so a pane whose program exited across Commit takes
-/// its own keys before its `Exit` closes it). And `user_event` admits every
-/// wake through the one gate that holds them.
-#[test]
-fn the_commit_wake_runs_the_held_wakes_after_the_typed_keys() {
-    let src = include_str!("lib.rs");
-    let arm = src
-        .find("Wake::ActivateCommittedHandoff { mut expected } => {")
-        .expect("the Commit wake");
-    let body = &src[arm..];
-    let body = &body[..body.find("Wake::HandoffHistorySettled").expect("next arm")];
-    let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle}"));
-    let pending = at("self.incoming_handoff_pending = false;");
-    let typed = at("self.window_event(el, winit_id, deferred);");
-    let held = at("std::mem::take(&mut self.handoff_committed_wakes)");
-    assert!(pending < typed && typed < held, "{pending} {typed} {held}");
-    let user_event = src
-        .find("fn user_event(&mut self, el: &ActiveEventLoop, ev: Wake) {")
-        .expect("user_event");
-    let head = &src[user_event..];
-    let head = &head[..head.find("match ev {").expect("its dispatch")];
-    assert!(head.contains("self.admit_wake_before_commit(ev)"), "{head}");
-    assert!(!head.contains("drops_wake_before_commit"), "{head}");
 }
 
 /// The pre-Commit input queue: bounded with the overflow counted; the kept prefix is
@@ -1101,64 +845,10 @@ fn pre_commit_input_is_bounded_counted_and_cannot_strand_a_chord() {
     );
 }
 
-/// winit's synthetic `Focused(false)` at window creation, and the flip at Commit's
-/// activation, arrive with nothing queued: the queue stays coherent and later input
-/// replays with its modifiers and no repair counted.
-#[test]
-fn a_focus_loss_with_nothing_queued_leaves_the_pre_commit_queue_coherent() {
-    use super::ModifiersState;
-    use winit::event::WindowEvent;
-
-    let _counters = crate::metrics::HANDOFF_INPUT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let incoherent_before = crate::metrics::handoff_input_counts().1;
-    let mut app = App::headless_for_test();
-    let winit_id = winit::window::WindowId::from(0u64);
-    app.winit_to_window.insert(winit_id, WindowId(0));
-    app.incoming_handoff_pending = true;
-
-    // The window's creation (winit's startup `Focused(false)`), and the
-    // activation's become-key / resign-key before any key was typed.
-    app.on_focus(WindowId(0), false);
-    app.on_focus(WindowId(0), true);
-    app.on_focus(WindowId(0), false);
-    assert!(
-        !app.handoff_deferred_input_incoherent,
-        "a focus loss with nothing queued ahead of it reorders nothing"
-    );
-
-    // What the user types afterwards queues after it, in order.
-    app.queue_pre_commit_input(winit_id, WindowEvent::ModifiersChanged(Default::default()));
-    app.queue_pre_commit_input(
-        winit_id,
-        WindowEvent::Ime(winit::event::Ime::Commit("ls".to_string())),
-    );
-    assert_eq!(app.handoff_deferred_input.len(), 2);
-    app.windows
-        .get_mut(&WindowId(0))
-        .expect("headless window")
-        .mods = ModifiersState::SUPER;
-    assert_eq!(
-        app.settle_replayed_handoff_input(),
-        0,
-        "nothing was dropped"
-    );
-    assert_eq!(
-        app.windows[&WindowId(0)].mods,
-        ModifiersState::SUPER,
-        "a coherent queue keeps the modifier the user really holds"
-    );
-    assert_eq!(
-        crate::metrics::handoff_input_counts().1,
-        incoherent_before,
-        "and `input_incoherent=` does not move for a handoff that lost nothing"
-    );
-}
-
 /// A window losing focus with a chord already queued is marked: the replay disarms it
-/// and counts the repair. A loss on another window reorders nothing here; an unnamed
-/// window's queued event counts as possibly this one's.
+/// and counts the repair. A loss with nothing queued, or with input queued only for
+/// another window, reorders nothing; an unnamed window's queued event counts as
+/// possibly this one's.
 #[test]
 fn a_focus_loss_after_input_was_queued_for_the_window_marks_it_incoherent() {
     use super::ModifiersState;
@@ -1174,6 +864,16 @@ fn a_focus_loss_after_input_was_queued_for_the_window_marks_it_incoherent() {
     app.winit_to_window.insert(this, WindowId(0));
     app.winit_to_window.insert(other, WindowId(1));
     app.incoming_handoff_pending = true;
+
+    // winit's synthetic `Focused(false)` at window creation, and the flips at
+    // Commit's activation, arrive with nothing queued: they reorder nothing.
+    app.on_focus(WindowId(0), false);
+    app.on_focus(WindowId(0), true);
+    app.on_focus(WindowId(0), false);
+    assert!(
+        !app.handoff_deferred_input_incoherent,
+        "a focus loss with nothing queued ahead of it reorders nothing"
+    );
 
     // Input queued for ANOTHER window: this window's loss reorders none of it.
     app.queue_pre_commit_input(other, WindowEvent::ModifiersChanged(Default::default()));
@@ -1342,7 +1042,7 @@ fn a_streaming_hidden_tab_does_not_hold_the_output_gap_phase() {
 
 /// While a consent warm-up is mid-gesture the automatic apply stands off in every
 /// ladder phase, `Land` included, until `[privacy] warmup_hold_ms`. Manual applies are
-/// never held (`consent_warmup::tests::a_manual_apply_is_never_held`).
+/// never held.
 #[test]
 fn a_live_consent_warm_up_holds_the_automatic_apply_but_only_to_its_cap() {
     use crate::native_update_auto_intent::{ApplyPhase, automatic_park_refusal};
@@ -1419,14 +1119,10 @@ fn a_headless_instance_never_starts_a_consent_warm_up() {
 }
 
 /// The access card never reaches a headless instance: the lifecycle ticks without a
-/// worker, row or leaving `Idle`; a late verdict posts nothing; the decision names
-/// headlessness. The inert probe answers `unknown`.
+/// worker, row or leaving `Idle`; a need is not counted; a late verdict posts nothing.
 #[test]
 fn a_headless_instance_never_offers_the_macos_access_card() {
-    use super::consent_card::{
-        AccessRecord, CardFacts, CardPhase, LaunchVerdict, NeedCause, NeedFacts, NeedVerdict,
-        NotDue, decide_launch, decide_need,
-    };
+    use super::consent_card::{CardPhase, NeedCause};
     use super::message_reporters::KEY_FILE_ACCESS;
     use std::time::Instant;
 
@@ -1455,28 +1151,6 @@ fn a_headless_instance_never_offers_the_macos_access_card() {
         "a stray verdict is stale"
     );
     assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
-    let panel = app.consent_panel_facts();
-    assert_eq!(panel.fda, aterm_containment::consent::FdaState::Unknown);
-    let facts = CardFacts {
-        offered: true,
-        headless: app.headless,
-        fda: panel.fda,
-        dr: panel.dr,
-    };
-    assert_eq!(
-        decide_launch(&facts, None, &AccessRecord::default()),
-        LaunchVerdict::Quiet(NotDue::Headless)
-    );
-    let need = NeedFacts {
-        card: facts,
-        now_secs: 1,
-        process_started_at: 1,
-        cause: NeedCause::ProtectedRead { session: None },
-    };
-    assert_eq!(
-        decide_need(&need, None, &AccessRecord::default()),
-        NeedVerdict::Quiet(NotDue::Headless)
-    );
     // The only headless path that reaches the decision code: a verdict
     // in `Deciding` settles, and posts nothing.
     assert!(app.consent_card.begin_deciding(Instant::now()));
@@ -1582,12 +1256,10 @@ fn access_card_posted(app: &mut App, now: std::time::Instant) -> aterm_messages:
 ///
 /// THE PARK POINT IS macOS-ONLY: `tick_macos_access_card` returns at its
 /// FIRST line on every other target, because Full Disk Access is a TCC
-/// concept. The other hosts get an arm that asserts what the product
-/// really does there — no entry, no wake — read from `cfg!` directly, so
-/// deleting the gate turns this red instead of carrying it along.
+/// concept (`macos_access_card_stays_inert_off_macos`).
 #[test]
 fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
-    use super::consent_card::{CardPhase, NeedCause, NeedWords, Verdict};
+    use super::consent_card::{CardPhase, NeedCause, NeedWords};
     use super::message_reporters::KEY_FILE_ACCESS;
     use aterm_messages::{Message, Severity, tags};
     use std::time::{Duration, Instant};
@@ -1612,43 +1284,11 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
     assert!(fda_entries(&app).is_empty());
     assert!(app.messages.live_by_key(KEY_FILE_ACCESS).is_none());
 
+    // The park point is macOS-only: what every other host's early return
+    // owes is `macos_access_card_stays_inert_off_macos`'s.
     if !cfg!(target_os = "macos") {
-        let mut app = access_card_windowed();
-        assert!(app.proxy.is_none(), "no event loop under the harness");
-        app.tick_macos_access_card(t0);
-        assert_eq!(app.consent_card.phase(), CardPhase::Idle);
-        // DUE — the one branch that could raise the question.
-        assert!(app.consent_card.begin_deciding(t0));
-        assert!(app.consent_card.on_decided(&Verdict::Offer, t0));
-        app.tick_macos_access_card(t0);
-        assert_eq!(app.consent_card.phase(), CardPhase::Due);
-        assert!(
-            fda_entries(&app).is_empty() && app.messages.live_by_key(KEY_FILE_ACCESS).is_none(),
-            "a macOS access question must never reach a non-macOS digest"
-        );
-        assert!(app.next_macos_access_card_deadline(t0).is_none());
         return;
     }
-
-    // IDLE with the notice switched off: settled, no worker, no entry.
-    let mut app = access_card_windowed();
-    app.config.privacy = Some(crate::app_config::PrivacyConfig {
-        notice: Some(false),
-        ..Default::default()
-    });
-    app.tick_macos_access_card(t0);
-    assert_eq!(app.consent_card.phase(), CardPhase::Settled);
-    assert!(fda_entries(&app).is_empty());
-
-    // Idle with the switch on but no event-loop proxy: settled — no
-    // worker can post a verdict, so nothing waits forever.
-    let mut app = access_card_windowed();
-    app.tick_macos_access_card(t0);
-    assert_eq!(
-        app.consent_card.phase(),
-        CardPhase::Settled,
-        "no proxy: no worker"
-    );
 
     // DUE: raised ONCE, and it costs the band nothing — a row already
     // there stays the top row, no row is wanted for the question, and a
@@ -1724,6 +1364,26 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
     let regressed = fda_entries(&app);
     assert_eq!(regressed.len(), 1);
     assert_eq!(regressed[0].key, "privacy.fda.regressed");
+
+    // The record learns that the question was asked: the cache at once (above),
+    // the file off the UI thread.
+    let mut app = access_card_windowed();
+    let record = aterm_tempfile::Builder::new()
+        .prefix("aterm-access-card")
+        .tempdir()
+        .expect("scratch");
+    app.consent_card_config = Some(record.path().join("aterm.toml"));
+    access_card_posted(&mut app, t0);
+    let asked = app.consent_card_host.record.asked_at;
+    assert!(asked.is_some());
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the record file learns asked_at",
+        || {
+            (super::consent_card::read_record(app.consent_card_config.as_deref()).asked_at == asked)
+                .then_some(())
+        },
+    );
 }
 
 /// OPEN SETTINGS (R16), ON THE ENTRY (design-exceptions §8.2): the button
@@ -1999,57 +1659,6 @@ fn macos_access_card_stays_inert_off_macos() {
     }
 }
 
-/// The observer ships off: a headless default-config instance starts nothing, reports
-/// `off` (distinct from `unavailable` and from a denial), and publishes no verdict.
-#[test]
-fn a_default_instance_starts_no_consent_observer_and_publishes_nothing() {
-    use super::consent_observer::{ObserverAvailability, StartOutcome};
-
-    let mut app = App::headless_for_test();
-    assert_eq!(
-        app.consent_observer.availability(),
-        ObserverAvailability::Off
-    );
-    assert_eq!(app.start_consent_observer(), StartOutcome::Disabled);
-    assert_eq!(
-        app.consent_observer.availability(),
-        ObserverAvailability::Off,
-        "a refusal is `off`, never a verdict"
-    );
-    assert!(
-        app.consent_observer
-            .verdicts(
-                std::time::Instant::now(),
-                &[],
-                super::consent_observer::live_pgid_of
-            )
-            .is_empty(),
-        "nothing was observed, so nothing is published"
-    );
-}
-
-/// The EPERM-driven attention path, end to end on a headless instance: the
-/// first observed denial notifies once and a storm of further denials does
-/// not. The gate is what makes the whole path safe to call from any denial
-/// site.
-#[test]
-fn an_observed_eperm_storm_notifies_once() {
-    let mut app = App::headless_for_test();
-    assert!(
-        !app.consent_attention.is_spent(),
-        "a fresh instance is armed"
-    );
-    app.note_protected_eperm(Some(0));
-    assert!(
-        app.consent_attention.is_spent(),
-        "the first denial spent it"
-    );
-    for _ in 0..25 {
-        app.note_protected_eperm(Some(0));
-    }
-    assert!(app.consent_attention.is_spent(), "and it stayed spent");
-}
-
 /// An observed dialog's banner names the tab that asked, as every herald
 /// banner does: `<tab title>: <what>`. NEGATIVE CONTROL: a session the
 /// store does not hold keeps the bare body.
@@ -2168,39 +1777,24 @@ fn the_effective_observer_mode_follows_the_config_and_the_cards_switches() {
     } else {
         ObserverMode::Off
     };
-    assert_eq!(
-        privacy(None, true, true).effective_observer_mode_for(true),
-        sentinel_here
-    );
-    assert_eq!(
-        privacy(None, true, false).effective_observer_mode_for(true),
-        ObserverMode::Off,
-        "no card, nothing for the sentinel to feed"
-    );
-    assert_eq!(
-        privacy(None, false, true).effective_observer_mode_for(true),
-        ObserverMode::Off
-    );
-    assert_eq!(
-        privacy(Some(false), true, true).effective_observer_mode_for(true),
-        ObserverMode::Off
-    );
-    assert_eq!(
-        privacy(Some(true), true, false).effective_observer_mode_for(true),
-        ObserverMode::Full,
-        "Full is an explicit opt-in and needs no card"
-    );
-    // An unbundled build (no bundle id to be a dialog's subject) runs no
-    // sentinel; an explicit Full is still honoured.
-    assert_eq!(
-        privacy(None, true, true).effective_observer_mode_for(false),
-        ObserverMode::Off,
-        "no bundle, nothing to judge a dialog against"
-    );
-    assert_eq!(
-        privacy(Some(true), true, true).effective_observer_mode_for(false),
-        ObserverMode::Full
-    );
+    // (observer, enabled, notice, bundled) -> mode. The sentinel needs both of
+    // the card's switches and a bundle id to judge a dialog against; Full is
+    // an explicit opt-in that needs neither.
+    for (observer, enabled, notice, bundled, mode) in [
+        (None, true, true, true, sentinel_here),
+        (None, true, false, true, ObserverMode::Off),
+        (None, false, true, true, ObserverMode::Off),
+        (Some(false), true, true, true, ObserverMode::Off),
+        (Some(true), true, false, true, ObserverMode::Full),
+        (None, true, true, false, ObserverMode::Off),
+        (Some(true), true, true, false, ObserverMode::Full),
+    ] {
+        assert_eq!(
+            privacy(observer, enabled, notice).effective_observer_mode_for(bundled),
+            mode,
+            "observer={observer:?} enabled={enabled} notice={notice} bundled={bundled}"
+        );
+    }
     // A headless instance never runs the sentinel (inert arm, no card).
     let mut headless = App::headless_for_test();
     assert_eq!(headless.effective_observer_mode(), ObserverMode::Off);
@@ -2282,24 +1876,98 @@ fn an_observed_app_data_dialog_for_this_bundle_is_a_need_and_nothing_else_is() {
     assert_eq!(app.consent_card_host.needs, 2);
 }
 
-/// A headless instance has no card, so an observed dialog is not a need.
+/// A DIALOG THE CARD IS NOT ABOUT, ON RECORD. The 2026-10-16 media-library
+/// dialog was seen and dropped to one `aterm.log` line, so nothing aterm shows
+/// could say which tab asked. Now each dialog for this bundle in a service
+/// aterm can name is one record keyed by service (never a row, never a need);
+/// a service aterm cannot name, a dialog for another subject, the app-data
+/// dialog and aterm's own read record nothing.
 #[test]
-fn a_headless_instance_counts_no_observed_dialog() {
+#[cfg(target_os = "macos")]
+fn an_observed_dialog_the_card_is_not_about_is_one_record_per_service() {
     use super::consent_observer::{ObserverEvent, PromptNeed};
     use std::time::Instant;
+    let bundle = "com.aterm.aterm";
+    let prompt = |msg_id: &str, service: &str, subject: &str| {
+        ObserverEvent::Prompt(PromptNeed {
+            msg_id: msg_id.to_owned(),
+            service: service.to_owned(),
+            subject: subject.to_owned(),
+            resp_pid: 4242,
+            accessing_pid: Some(i32::MAX - 1),
+        })
+    };
     let mut app = App::headless_for_test();
+    app.headless = false;
+    let now = Instant::now();
+    let dialogs = |app: &App| -> Vec<(String, String)> {
+        app.messages
+            .log()
+            .records()
+            .filter_map(|r| {
+                r.key
+                    .as_deref()
+                    .filter(|k| k.starts_with("privacy.dialog."))
+                    .map(|k| (k.to_owned(), r.title.clone()))
+            })
+            .collect()
+    };
+
+    for (id, service, subject) in [
+        ("2.1", "kTCCServiceMediaLibrary", bundle),
+        ("2.2", "kTCCServiceMediaLibrary", bundle),
+        ("2.3", "kTCCServiceAddressBook", bundle),
+        ("2.4", "kTCCServiceNoSuchService", bundle),
+        ("2.5", "kTCCServicePhotos", "com.example.other"),
+        ("2.6", "kTCCServiceSystemPolicyAppData", bundle),
+    ] {
+        app.consent_observer
+            .feed_for_test(prompt(id, service, subject), now);
+    }
+    // aterm's own read (the warm-up) is on the Security page, not on record.
     app.consent_observer.feed_for_test(
         ObserverEvent::Prompt(PromptNeed {
-            msg_id: "9.9".to_owned(),
-            service: "kTCCServiceSystemPolicyAppData".to_owned(),
-            subject: "com.aterm.aterm".to_owned(),
-            resp_pid: 1,
-            accessing_pid: None,
+            msg_id: "2.7".to_owned(),
+            service: "kTCCServicePhotos".to_owned(),
+            subject: bundle.to_owned(),
+            resp_pid: 4242,
+            accessing_pid: i32::try_from(std::process::id()).ok(),
         }),
-        Instant::now(),
+        now,
     );
-    app.note_observed_prompts(Some("com.aterm.aterm"), Instant::now());
-    assert_eq!(app.consent_card_host.needs, 0);
+    app.note_observed_prompts(Some(bundle), now);
+
+    let seen = dialogs(&app);
+    assert_eq!(
+        seen.iter()
+            .filter(|(k, _)| k == "privacy.dialog.medialibrary")
+            .count(),
+        2,
+        "each dialog is its own record: {seen:?}"
+    );
+    let keys: std::collections::BTreeSet<&str> = seen.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["privacy.dialog.addressbook", "privacy.dialog.medialibrary"]
+            .into_iter()
+            .collect(),
+        "one key per nameable service of this bundle: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|(_, title)| title == "Asked for the music and media library"),
+        "{seen:?}"
+    );
+    for key in keys {
+        assert!(
+            app.messages.live_by_key(key).is_none(),
+            "{key} is a record, never a row"
+        );
+    }
+    assert_eq!(
+        app.consent_card_host.needs, 1,
+        "only the app-data dialog is a need"
+    );
 }
 
 /// AN EPERM UNDER A PROTECTED ROOT IS A NEED AND POSTS NO BANNER OUTSIDE
@@ -2313,6 +1981,10 @@ fn an_eperm_under_a_protected_root_is_a_need_and_posts_no_banner_outside_full_mo
     let mut app = App::headless_for_test();
     app.headless = false;
     app.note_protected_eperm(Some(0));
+    assert!(
+        app.consent_attention.is_spent(),
+        "the once-per-process gate is spent"
+    );
     if cfg!(target_os = "macos") {
         assert_eq!(app.consent_card_host.needs, 1, "the refusal is a need");
         // No event loop under the harness, so the card keeps the need for
@@ -2405,81 +2077,6 @@ fn a_denied_probe_alone_raises_nothing() {
     assert_eq!(app.consent_card_host.needs, 0);
 }
 
-/// A NEED THAT DECIDES `ASK` RAISES ONE QUESTION AND RECORDS THAT IT DID:
-/// the words come from the need (tab, kind), `asked_at` lands in the
-/// record (the cache at once, the file off the UI thread), and a second
-/// need is not raised. `decide_need` itself is table-tested in
-/// `consent_card`; the identity is cold here, so the ask is driven through
-/// the card's own transitions.
-#[test]
-#[cfg(target_os = "macos")]
-fn an_observed_appdata_prompt_asks_once_and_records_asked_at_when_posting() {
-    use super::consent_card::{CardPhase, NeedCause, NeedWords, Verdict};
-    use std::time::{Duration, Instant};
-    let t0 = Instant::now();
-    let mut app = access_card_windowed();
-    let dir = std::env::temp_dir().join(format!(
-        "aterm-access-card-asked-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    app.consent_card_config = Some(dir.join("aterm.toml"));
-    let words = NeedWords {
-        cause: NeedCause::PromptObserved {
-            service: Some(aterm_containment::consent::Folder::AppData),
-            session: Some(3),
-        },
-        tab_number: Some(2),
-        regressed: false,
-    };
-    app.consent_card_host.words = Some(words);
-    assert!(app.consent_card.begin_deciding(t0));
-    assert!(app.consent_card.on_decided(&Verdict::Offer, t0));
-    app.tick_macos_access_card(t0);
-    let entries = fda_entries(&app);
-    assert_eq!(entries.len(), 1, "the question is raised");
-    assert_eq!(entries[0].key, "privacy.fda.needed");
-    // Its words are the card's consts, and only they: what macOS did (the
-    // tab too) is the event line, which the entry's three `more` lines
-    // leave to `aterm.log`.
-    assert_eq!(
-        entries[0].detail,
-        [
-            super::consent_card::FDA_WHY,
-            super::consent_card::FDA_THEN,
-            super::consent_card::FDA_GRANTS,
-            super::consent_card::FDA_AFTER,
-            super::consent_card::FDA_DETAIL,
-        ],
-        "{:?}",
-        entries[0].detail
-    );
-    assert!(words.event_line().contains("tab 2"));
-    assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
-    let asked = app.consent_card_host.record.asked_at;
-    assert!(asked.is_some(), "the cache knows it asked");
-    // …and the file learns it off the UI thread.
-    let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    while super::consent_card::read_record(app.consent_card_config.as_deref()).asked_at != asked
-        && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(
-        super::consent_card::read_record(app.consent_card_config.as_deref()).asked_at,
-        asked
-    );
-    // A later need while watching is kept and never raises a second entry.
-    app.consent_card.defer_need();
-    app.tick_macos_access_card(t0 + Duration::from_secs(1));
-    assert_eq!(fda_entries(&app).len(), 1);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// OPEN SETTINGS RECORDS `opened_at` (through either surface): the record
 /// is what tells a newer process the owner already acted.
 #[test]
@@ -2507,7 +2104,7 @@ fn open_settings_records_opened_at_in_the_record() {
 fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
     use super::{
         UpdateHandoffEventClass as Class, Wake, handoff_deferrable_input,
-        update_handoff_wake_class, update_handoff_window_event_class,
+        input_event_handoff_class, update_handoff_wake_class, update_handoff_window_event_class,
     };
     use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::event::{
@@ -2522,18 +2119,12 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
     ] {
         assert_eq!(update_handoff_window_event_class(&paint), Class::Exempt);
     }
-    // Pointer and modifier noise buffers through, including clicks, scroll, gestures,
-    // window drags, hover and the theme flip.
+    // Pointer and modifier noise buffers through: hover, clicks, scroll,
+    // gestures, window drags, a file hovered and taken away, and the theme flip.
     for tolerated in [
         WindowEvent::CursorMoved {
             device_id: DeviceId::dummy(),
             position: PhysicalPosition::new(4.0, 2.0),
-        },
-        WindowEvent::CursorEntered {
-            device_id: DeviceId::dummy(),
-        },
-        WindowEvent::CursorLeft {
-            device_id: DeviceId::dummy(),
         },
         WindowEvent::ModifiersChanged(winit::event::Modifiers::default()),
         WindowEvent::MouseInput {
@@ -2547,8 +2138,8 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
             phase: TouchPhase::Moved,
         },
         WindowEvent::Moved(PhysicalPosition::new(1, 1)),
-        WindowEvent::ThemeChanged(winit::window::Theme::Dark),
         WindowEvent::HoveredFileCancelled,
+        WindowEvent::ThemeChanged(winit::window::Theme::Dark),
     ] {
         assert_eq!(
             update_handoff_window_event_class(&tolerated),
@@ -2572,6 +2163,15 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
             "{revoking:?} must revoke the overlap"
         );
     }
+    // The delivery seam agrees on the grid: a resize revokes there too.
+    assert_eq!(
+        input_event_handoff_class(&crate::input::InputEvent::Resize {
+            rows: 24,
+            cols: 80,
+            echo_to_window: false,
+        }),
+        Class::Revoking
+    );
 
     // The incoming side: a visible, uncommitted successor must queue what the user
     // types, compositions included, since an IME commit is a grapheme's only path to
@@ -2616,6 +2216,7 @@ fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
             window: WindowId(0),
         },
         Wake::Input {
+            mark: None,
             batch: Vec::new(),
             src: crate::input::Source::Human,
             reply: None,

@@ -53,7 +53,8 @@
 //! text, so each is declined `program-row` before the ribbon sees it, its
 //! press forgotten. The run's last glyph comes from the host —
 //! `Terminal::print_anchor_glyph`, handed over with the anchor through
-//! `observe_print_anchor_glyph` as `app_render.rs` does — or, from a host
+//! `aterm_effects::host::motion_print_anchor` and `observe_print_anchor_glyph`
+//! as `app_render.rs` does — or, from a host
 //! that does not hand it over, from the caret row's own probe and its two
 //! flanking rows. A WRAPPED history match puts the status row under the
 //! match's last line, two rows below the caret, where only the host's glyph
@@ -101,12 +102,11 @@
 //! ribbon cells, the glyph under each, and the admission ring.
 //!
 //! PINNED: the owner's whole-read shape (no ink on the match row, nothing under
-//! or right of the `_`, each echo refused `program-row`), the match that hops,
-//! forward or back (no ink on its row, each hop refused `program-row`), the
-//! entry switch shaped like a soft wrap, bash's retreat, the fewest-bytes
-//! minibuffer, the longer search and the forget that keeps its keys from paying
-//! for the move after it, the wrapped match fed as the host feeds it, and
-//! typeahead into the minibuffer; with their controls — plain prompt typing
+//! or right of the `_`), the match that hops, forward or back (no ink on its
+//! row, each hop refused `program-row`), the entry switch shaped like a soft
+//! wrap, bash's retreat, the longer search and the forget that keeps its keys
+//! from paying for the move after it, the wrapped match fed as the host feeds
+//! it, and typeahead into the minibuffer; with their controls — plain prompt typing
 //! lights and retires on schedule, typing after leaving the search lights each
 //! key's own cell, a parked caret's own echo and a wide glyph's (glyph-less, so
 //! unknown) still light, a hidden caret's echo is judged alike on every path,
@@ -115,8 +115,7 @@
 //! zsh, a redisplay past the tty's chunk) can present the match's own glyph at
 //! the caret as a key's echo: that lay is RECALLED once zle prints its status
 //! row and the caret rests behind it — shortened, not refused (RAINBOW-PATH-V3
-//! §8 D-13). The recall's laws pass; the zero-ink laws are kept as ignored
-//! latent rows with their residual.
+//! §8 D-13).
 
 use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
@@ -491,7 +490,6 @@ fn cfg() -> GlowConfig {
         ring: true,
         beam: false,
         head_dx: 0.5,
-        pack: None,
     }
 }
 
@@ -787,11 +785,13 @@ impl Host {
         }
         self.last_cur = cur;
         self.glow.observe_caret_drawn(drawn);
+        // The engines get the anchor through the anchor law, as the shipping
+        // host hands it over; the census above reads the terminal's own.
+        let (law_anchor, law_glyph) = aterm_effects::host::motion_print_anchor(&self.term);
         if self.present.anchor_glyph {
-            self.glow
-                .observe_print_anchor_glyph(anchor, self.term.print_anchor_glyph());
+            self.glow.observe_print_anchor_glyph(law_anchor, law_glyph);
         } else {
-            self.glow.observe_print_anchor(anchor);
+            self.glow.observe_print_anchor(law_anchor);
         }
         self.glow
             .tick(cur, self.now, &self.cfg, self.g, &mut self.out);
@@ -1396,93 +1396,14 @@ fn bash_s_reverse_search_retreat_lays_nothing_under_the_match() {
     }
 }
 
-/// **THE MINIBUFFER'S ECHOES ARE REFUSED, NOT LAID.** The mechanism, on the
-/// owner's take as the app presents it: each of the four keys' status-row
-/// echoes reaches the anchored lane (four verdicts naming the status row) and
-/// every one is the `program-row` refusal — no `licensed` row lays a cell
-/// there, and the failing `d` leaves no `no-credits` landing behind.
-#[test]
-fn the_minibuffer_echoes_are_refused_program_row() {
-    let h = replay(G150, APP);
-    let status = h.match_row() + 1;
-    assert_eq!(h.status_rows, BTreeSet::from([status]));
-    let end = h.search_end_us.expect("Ctrl-G ends the search");
-    let there: Vec<Verdict> = h
-        .ring
-        .iter()
-        .filter(|v| v.target.0 == status && v.us < end)
-        .copied()
-        .collect();
-    assert_eq!(
-        there.len(),
-        4,
-        "one verdict per minibuffer echo:{}",
-        h.report("g150")
-    );
-    assert!(
-        there
-            .iter()
-            .all(|v| v.reason == CursorGlow::DECLINE_PROGRAM_ROW
-                && v.licence == AdmissionRecord::LICENCE_NONE),
-        "every minibuffer echo is refused `program-row`: {there:?}"
-    );
-    assert!(
-        h.status_cells.is_empty(),
-        "nothing laid on the status row: {:?}",
-        h.status_cells
-    );
-}
-
-/// The shape with the fewest bytes: a visible caret parked after a 3-column
-/// prompt; per key the program drops a row, prints `<glyph>_` and climbs back.
-/// Nothing is laid under the fake cursor, glyph from the host or the probes.
-#[test]
-fn a_minibuffer_echo_below_a_stationary_caret_lays_nothing_under_its_fake_cursor() {
-    for anchor_glyph in [true, false] {
-        let mut h = Host::new(
-            24,
-            100,
-            Present {
-                anchor_glyph,
-                ..APP
-            },
-        );
-        h.feed(b"\x1b[5;1Hp% ");
-        let r = h.term.cursor().row;
-        // Ctrl-R: the status row appears, the caret returns.
-        h.hint(&[0x12]);
-        h.feed(b"\r\r\nsearch: _\x1b[K\x1b[A\x1b[6D");
-        for (i, k) in "abc".chars().enumerate() {
-            h.idle_ms(120);
-            h.hint(&[k as u8]);
-            // Down to (r+1, 3), right onto the fake cursor, `k_`, up, back.
-            h.feed(format!("\x1b[1B\x1b[{}C{k}_\x1b[A\x1b[{}D", 5 + i, 7 + i).as_bytes());
-            assert_eq!(
-                (h.term.cursor().row, h.term.cursor().col),
-                (r, 3),
-                "the caret is back after the prompt"
-            );
-        }
-        h.idle_ms(1_200);
-        assert_eq!(h.text(r + 1), "search: abc_");
-        assert_eq!(
-            h.parked_prints.len(),
-            4,
-            "non-vacuity: every echo ended off the caret's row"
-        );
-        assert_eq!(
-            untyped_status_cells(&h),
-            vec![],
-            "anchor glyph {anchor_glyph}:\n{}",
-            h.report("minimal")
-        );
-    }
-}
-
 /// A longer search: Backspace, `ude`, Right to leave, ` x` on the prompt row.
 /// During the search the status row has no band under untyped glyphs and the
-/// prompt row none at all; after it the prompt row carries only the Right
-/// hop's own cells and the keys typed there.
+/// prompt row none at all. The refused presses (`u`, `d`, `e` echoed on the
+/// status row) are forgotten, so nothing typed during the search pays for a
+/// later move: the Right is licensed by its own key and no verdict from the
+/// Ctrl-R on is `licence=inflight`. After the search each of ` x` lights its
+/// own cell, under its glyph, within 100 ms of its key (keyed on glyph and
+/// clock: the Right's hop already laid a cell at the space's column).
 #[test]
 fn a_longer_search_lays_no_band_on_cells_nobody_typed() {
     let h = replay(CONTINUE, APP);
@@ -1494,6 +1415,7 @@ fn a_longer_search_lays_no_band_on_cells_nobody_typed() {
         "status-row cells under untyped glyphs: {wrong:?}\n{}",
         h.report("continue")
     );
+    let from = h.census_from.expect("the take presses Ctrl-R").0;
     let left = h.search_end_us.expect("Right leaves the search");
     let during: Vec<(u16, char)> = h
         .cells
@@ -1515,50 +1437,12 @@ fn a_longer_search_lays_no_band_on_cells_nobody_typed() {
         prompt_text.is_empty(),
         "cells on the prompt's own text: {prompt_text:?}"
     );
-}
 
-/// Typing after the search: after Right, each of ` x` lights its own cell,
-/// under its glyph, born within 100 ms of its key. (Keyed on glyph and clock:
-/// the Right's hop already laid a cell at the space's column.)
-#[test]
-fn typing_on_the_prompt_row_after_leaving_the_search_still_lights_its_cells() {
-    let h = replay(CONTINUE, APP);
-    let r = h.match_row();
-    // Right left the caret one past the match's `c`; ` x` went in there.
-    let (space, x) = (PROMPT_COLS + 1, PROMPT_COLS + 2);
-    assert_eq!(h.glyph(r, space), ' ');
-    assert_eq!(h.glyph(r, x), 'x');
-    let after = h.search_end_us.expect("Right leaves the search");
-    let keys: Vec<(u64, char)> = h.keys.iter().copied().filter(|k| k.0 > after).collect();
-    assert_eq!(
-        keys.iter().map(|k| k.1).collect::<String>(),
-        " x",
-        "the keys typed after the search"
-    );
-    for ((key_us, glyph), col) in keys.into_iter().zip([space, x]) {
-        let first = h.cells.get(&(r, col, glyph)).map(|&(first, _)| first);
-        assert!(
-            first.is_some_and(|first| (key_us..=key_us + 100_000).contains(&first)),
-            "{glyph:?} at ({r},{col}) lit under its own glyph within 100 ms of its key at {key_us} µs: {first:?}\n{}",
-            h.report("continue")
-        );
-    }
-}
-
-/// Refused presses are forgotten: `u`, `d` and `e` echoed on the status row,
-/// so nothing typed during the search pays for a later move. The Right is
-/// licensed by its own key, and no verdict from the Ctrl-R on is
-/// `licence=inflight`.
-#[test]
-fn the_refused_search_keys_pay_for_nothing_after_the_search() {
-    let h = replay(CONTINUE, APP);
-    let r = h.match_row();
-    let from = h.census_from.expect("the take presses Ctrl-R").0;
-    let end = h.search_end_us.expect("Right leaves the search");
+    // The refused presses are forgotten.
     let right = h
         .ring
         .iter()
-        .find(|v| v.us >= end && v.origin == (r, PROMPT_COLS) && v.target == (r, PROMPT_COLS + 1))
+        .find(|v| v.us >= left && v.origin == (r, PROMPT_COLS) && v.target == (r, PROMPT_COLS + 1))
         .copied();
     assert!(
         right.is_some_and(|v| v.licence == AdmissionRecord::LICENCE_KEY),
@@ -1575,6 +1459,26 @@ fn the_refused_search_keys_pay_for_nothing_after_the_search() {
         paid_in_flight.is_empty(),
         "moves paid by presses in flight: {paid_in_flight:?}"
     );
+
+    // Typing after the search: Right left the caret one past the match's `c`;
+    // ` x` went in there.
+    let (space, x) = (PROMPT_COLS + 1, PROMPT_COLS + 2);
+    assert_eq!(h.glyph(r, space), ' ');
+    assert_eq!(h.glyph(r, x), 'x');
+    let keys: Vec<(u64, char)> = h.keys.iter().copied().filter(|k| k.0 > left).collect();
+    assert_eq!(
+        keys.iter().map(|k| k.1).collect::<String>(),
+        " x",
+        "the keys typed after the search"
+    );
+    for ((key_us, glyph), col) in keys.into_iter().zip([space, x]) {
+        let first = h.cells.get(&(r, col, glyph)).map(|&(first, _)| first);
+        assert!(
+            first.is_some_and(|first| (key_us..=key_us + 100_000).contains(&first)),
+            "{glyph:?} at ({r},{col}) lit under its own glyph within 100 ms of its key at {key_us} µs: {first:?}\n{}",
+            h.report("continue")
+        );
+    }
 }
 
 /// The wrapped match: an 85-character entry after the 31-column prompt wraps,
@@ -1828,7 +1732,7 @@ fn a_parked_caret_s_own_echo_lights_after_enter_on_the_caret_s_row() {
 /// Typeahead into the minibuffer: two keys pressed before the first echo is
 /// presented both end on `_`; the first is refused by the glyph gate and the
 /// second finds no credit, so nothing is laid under the fake cursor. The forget
-/// itself is pinned by `the_refused_search_keys_pay_for_nothing_after_the_search`.
+/// itself is pinned by `a_longer_search_lays_no_band_on_cells_nobody_typed`.
 #[test]
 fn typeahead_into_the_minibuffer_lays_nothing() {
     let mut h = Host::new(24, 100, APP);
@@ -1916,16 +1820,6 @@ fn match_row_kept(h: &Host) -> Vec<String> {
     kept
 }
 
-/// Any band ink on the match row, with how long each cell carried it.
-fn match_row_inked(h: &Host) -> Vec<String> {
-    let r = h.match_row();
-    h.lives
-        .iter()
-        .filter(|((row, _), _)| *row == r)
-        .map(|((_, c), l)| format!("({r},{c}) {} ms", (l.last_us - l.first_us) / 1000))
-        .collect()
-}
-
 /// Every owner take with a present after every piece of every read, on the
 /// 120 Hz train and on the host's wake: what `law` finds, per replay.
 fn every_tear(law: fn(&Host) -> Vec<String>) -> String {
@@ -2005,7 +1899,7 @@ fn one_tear(law: fn(&Host) -> Vec<String>) -> (String, usize, usize) {
 /// output chunk (a long wrapped match) or a remote zsh over ssh can arrive
 /// split. RED before the recall (2026-09-30): the lays lived about 2 s on
 /// row R (`c` at (R, 31) from 161 ms to 2,208 ms in the bare take). The
-/// zero-ink law is the latent row [`torn_reads_lay_no_band_on_the_match_row`].
+/// recall shortens the lay, it does not refuse it (RAINBOW-PATH-V3 §8 D-13).
 #[test]
 fn torn_reads_leave_no_band_on_the_match_row() {
     let bad = every_tear(match_row_kept);
@@ -2015,8 +1909,7 @@ fn torn_reads_leave_no_band_on_the_match_row() {
 /// **ONE TORN READ, EVERY BOUNDARY, IS RECALLED.** Whatever the torn frame
 /// laid on the match row is recalled when the caret rests, and nothing on
 /// it outlives the recall. Non-vacuous: the sweep must catch a lay and
-/// recall it. The zero-ink law is the latent row
-/// [`one_torn_read_at_any_boundary_lays_no_band_on_the_match_row`].
+/// recall it.
 #[test]
 fn one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row() {
     let (bad, tried, recalled) = one_tear(match_row_kept);
@@ -2025,36 +1918,6 @@ fn one_torn_read_at_any_boundary_leaves_no_band_on_the_match_row() {
     assert!(
         bad.is_empty(),
         "a single torn read left band on the match row:{bad}"
-    );
-}
-
-/// **LATENT: A TORN REDISPLAY LAYS NO BAND ON THE MATCH ROW AT ALL.** The
-/// law the recall does not meet: it SHORTENS the band a frame caught
-/// mid-redisplay lays, it does not refuse it (RAINBOW-PATH-V3 §8 D-13 — no
-/// lay-time witness tells zle printing the match's glyph at the caret from
-/// the key's echo). Measured 2026-09-30 with the recall: every read torn,
-/// (R, 31) carried ink 731 ms (g150), 469 ms (g60), 310 ms (burst) and
-/// 861 ms (cap120) on the 120 Hz train — the whole search, each key
-/// re-laying it — and one read torn, 62 of 185 tears laid, each cell for
-/// at most 238 ms (before the recall: 1.7-2.0 s).
-#[test]
-#[ignore = "latent: the recall shortens a torn redisplay's band (<= 0.24 s; 0.3-0.9 s while every read tears), it does not refuse it — RAINBOW-PATH-V3 §8 D-13"]
-fn torn_reads_lay_no_band_on_the_match_row() {
-    let bad = every_tear(match_row_inked);
-    assert!(bad.is_empty(), "band on the match row R:{bad}");
-}
-
-/// **LATENT: ONE TORN READ LAYS NO BAND ON THE MATCH ROW AT ALL** — the
-/// single-tear sweep under the zero-ink law
-/// ([`torn_reads_lay_no_band_on_the_match_row`] says why it is latent).
-#[test]
-#[ignore = "latent: the recall shortens a torn redisplay's band (<= 0.24 s; 0.3-0.9 s while every read tears), it does not refuse it — RAINBOW-PATH-V3 §8 D-13"]
-fn one_torn_read_at_any_boundary_lays_no_band_on_the_match_row() {
-    let (bad, tried, _) = one_tear(match_row_inked);
-    assert!(tried > 100, "the sweep tried {tried} tears");
-    assert!(
-        bad.is_empty(),
-        "a single torn read laid band on the match row:{bad}"
     );
 }
 

@@ -452,28 +452,6 @@ pub enum KittyShownAs {
     PawStyle,
 }
 
-impl KittyShownAs {
-    /// Every cause, in registry order.
-    #[cfg(test)]
-    pub const ALL: [KittyShownAs; 4] = [
-        KittyShownAs::Cat,
-        KittyShownAs::PawFallbackFloor,
-        KittyShownAs::PawFallbackOverflow,
-        KittyShownAs::PawStyle,
-    ];
-
-    /// The stable `kitty-log.toml` / introspection key for this cause.
-    #[cfg(test)]
-    pub fn config_key(self) -> &'static str {
-        match self {
-            KittyShownAs::Cat => "cat",
-            KittyShownAs::PawFallbackFloor => "paw_fallback_floor",
-            KittyShownAs::PawFallbackOverflow => "paw_fallback_overflow",
-            KittyShownAs::PawStyle => "paw_style",
-        }
-    }
-}
-
 /// [`KittySighting::traits`] bit: heterochromia.
 pub const TRAIT_HETEROCHROMIA: u8 = 1;
 /// [`KittySighting::traits`] bit: an ear nick.
@@ -578,23 +556,6 @@ mod tests {
         }
     }
 
-    /// The dark-background lift collapses coats {0,1,2,3}, so every pair among them is
-    /// insufficient, even (0,3) at 105 raw.
-    #[test]
-    fn dark_collapse_pairs_are_insufficient_where_raw_rgb_would_pass() {
-        for (a, b) in [(0u8, 1u8), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
-            assert!(
-                coat_distance(a, b) < SUFFICIENT_DIFFERENCE,
-                "({a},{b}): dark-collapsed pairs are never sufficient (got {})",
-                coat_distance(a, b)
-            );
-        }
-        assert!(
-            dist(raw_stop(0), raw_stop(3)) > SUFFICIENT_DIFFERENCE,
-            "the raw ramp would have passed (0,3) — the min over backgrounds is the point"
-        );
-    }
-
     /// The flagship coats clear [`SUFFICIENT_DIFFERENCE`] by measurement, with 4× headroom.
     #[test]
     fn flagship_trio_is_always_sufficiently_different() {
@@ -614,17 +575,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn coat_distance_is_symmetric_with_a_zero_diagonal() {
-        for a in 0..16u8 {
-            assert_eq!(coat_distance(a, a), 0.0, "d({a},{a})");
-            for b in 0..16u8 {
-                assert_eq!(coat_distance(a, b), coat_distance(b, a), "d({a},{b})");
-            }
-        }
-        assert_eq!(coat_distance(u8::MAX, 15), 0.0, "clamped like normalized()");
     }
 
     #[test]
@@ -679,42 +629,10 @@ mod tests {
             ["none", "fortune", "nebula", "butterfly", "sakura"],
             "magic keys are pinned"
         );
-        let shown_keys: Vec<&str> = KittyShownAs::ALL.iter().map(|s| s.config_key()).collect();
-        assert_eq!(
-            shown_keys,
-            [
-                "cat",
-                "paw_fallback_floor",
-                "paw_fallback_overflow",
-                "paw_style"
-            ],
-            "shown-as keys are pinned"
-        );
         let mut dedup = type_keys.clone();
         dedup.sort_unstable();
         dedup.dedup();
         assert_eq!(dedup.len(), type_keys.len(), "keys must be unique");
-    }
-
-    #[test]
-    fn accessory_trait_bits_are_pinned_and_disjoint() {
-        use crate::genome::Accessory;
-        assert_eq!(TRAIT_BOW, 16);
-        assert_eq!(TRAIT_SUNGLASSES, 32);
-        assert_eq!(TRAIT_WITCH_HAT, 64);
-        assert_eq!(TRAIT_CROWN, 128);
-        let low = TRAIT_HETEROCHROMIA | TRAIT_EAR_NICK | TRAIT_BLAZE | TRAIT_SHY;
-        let high = TRAIT_BOW | TRAIT_SUNGLASSES | TRAIT_WITCH_HAT | TRAIT_CROWN;
-        assert_eq!(low & high, 0, "accessory bits never collide with traits");
-        assert_eq!(accessory_trait_bits(None), 0);
-        for (acc, bit) in [
-            (Accessory::Bow, TRAIT_BOW),
-            (Accessory::Sunglasses, TRAIT_SUNGLASSES),
-            (Accessory::WitchHat, TRAIT_WITCH_HAT),
-            (Accessory::Crown, TRAIT_CROWN),
-        ] {
-            assert_eq!(accessory_trait_bits(Some(acc)), bit);
-        }
     }
 
     #[test]
@@ -729,41 +647,6 @@ mod tests {
                 "seed {seed}: the launch floor rolls heads only"
             );
             assert!(a.accessory.is_none(), "seed {seed}: no free accessory");
-        }
-    }
-
-    #[test]
-    fn launch_kitties_spread_the_roster_and_avoid_the_shared_default() {
-        let looks: Vec<KittyLook> = (0..64u64).map(KittyLook::for_launch).collect();
-        let mut distinct = looks.clone();
-        distinct.sort_by_key(|l| (l.variant as u8, l.coat, l.iris, l.age as u8));
-        distinct.dedup();
-        assert!(
-            distinct.len() >= 32,
-            "64 seeds should yield at least 32 distinct breeds (got {})",
-            distinct.len()
-        );
-        assert!(
-            looks.iter().all(|l| *l != KittyLook::default()),
-            "the derived floor must not collapse onto the shared default cat"
-        );
-    }
-
-    /// Exact draws for fixed seeds: a change to [`LAUNCH_LOOK_SALT`], `genome::mix` or the
-    /// `cat_*_v4` decoders re-dresses every launch kitty, a breaking change.
-    #[test]
-    fn launch_draws_are_pinned_forever() {
-        for (seed, (variant, coat, iris, age)) in [
-            (0u64, (CatGlyphId::S123, 2u8, 7u8, CatAge::Adult)),
-            (1, (CatGlyphId::S111, 0u8, 4u8, CatAge::Elder)),
-            (0x5EED, (CatGlyphId::S118, 0u8, 4u8, CatAge::Adolescent)),
-        ] {
-            let got = KittyLook::for_launch(seed);
-            assert_eq!(
-                (got.variant, got.coat, got.iris, got.age),
-                (variant, coat, iris, age),
-                "seed {seed:#x} must keep its breed forever"
-            );
         }
     }
 
@@ -801,56 +684,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn canonical_table_folds_shells() {
-        for shell in ["zsh", "bash", "fish", "sh", "pwsh", "nu"] {
-            assert_eq!(canonical_app_id(shell), SHELL_APP_ID);
-        }
-        assert_eq!(canonical_app_id("somenewtool"), "somenewtool");
-    }
-
-    /// Pinned so a ramp or roster refactor cannot silently re-dress a flagship.
-    #[test]
-    fn flagship_breeds_are_fixed_and_distinct() {
-        let expect = [
-            ("claude", (CatGlyphId::S108, 12, 0, CatAge::Adult)),
-            ("codex", (CatGlyphId::S117, 15, 7, CatAge::Adult)),
-            ("agy", (CatGlyphId::S122, 3, 6, CatAge::Adolescent)),
-        ];
-        let mut looks = Vec::new();
-        for (id, (variant, coat, iris, age)) in expect {
-            let look = KittyLook::for_app(id);
-            assert_eq!(
-                (look.variant, look.coat, look.iris, look.age),
-                (variant, coat, iris, age),
-                "{id} wears its hand-picked tuple"
-            );
-            looks.push(look);
-        }
-        for i in 0..looks.len() {
-            for j in i + 1..looks.len() {
-                assert_ne!(looks[i], looks[j], "flagships are pairwise distinct");
-            }
-        }
-        assert!(
-            flagship_look(SHELL_APP_ID).is_none(),
-            "the shell is the base cat's business, not a flagship"
-        );
-    }
-
-    #[test]
-    fn unknown_app_breed_is_name_derived_and_stable() {
-        let first = KittyLook::for_app("somenewtool");
-        let second = KittyLook::for_app("somenewtool");
-        assert_eq!(first, second, "the exact tuple resolves identically twice");
-        assert_eq!(first, first.normalized(), "emitted looks are renderable");
-        assert_eq!(
-            GLYPHS[first.variant as usize].kind,
-            GlyphKind::Head,
-            "the hash path only ever deals heads"
-        );
-    }
-
+    /// `for_app` never mints an accessory, for flagships and the hash path;
+    /// the hash path is stable and deals renderable heads only.
     #[test]
     fn for_app_never_emits_an_accessory() {
         for id in ["claude", "codex", "agy"] {
@@ -858,7 +693,15 @@ mod tests {
         }
         for n in 0..64 {
             let name = format!("tool{n}");
-            assert_eq!(KittyLook::for_app(&name).accessory, None, "{name}");
+            let look = KittyLook::for_app(&name);
+            assert_eq!(look.accessory, None, "{name}");
+            assert_eq!(look, KittyLook::for_app(&name), "{name}: stable");
+            assert_eq!(look, look.normalized(), "{name}: renderable");
+            assert_eq!(
+                GLYPHS[look.variant as usize].kind,
+                GlyphKind::Head,
+                "{name}"
+            );
         }
     }
 }

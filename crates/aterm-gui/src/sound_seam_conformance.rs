@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance of the derived `TrailSoundSeam` machine
-//! (`aterm_spec::derive::trail_sound_seam_model`) to the shipping code.
+//! (`aterm_models_misc::trail_sound_seam_model`) to the shipping code.
 //!
 //! Every step runs real code:
 //!
@@ -25,9 +25,8 @@
 //! Each observed step is projected onto the model and must be a successor of
 //! the action its host input class names, with every invariant holding. The
 //! run must also visit every reachable model state, so the binding is two-way.
-//! Every style is driven (`Classic` and `Custom` with the default pack
-//! included), on a real grid and on the three degenerate ones (no columns, no
-//! rows, no cell).
+//! Every style is driven (`Classic` included), on a real grid and on the
+//! three degenerate ones (no columns, no rows, no cell).
 //!
 //! Negative controls replay the defects this binding catches: a host fold that
 //! reads `audible` off the folded (dark) intensity, a verb that reads
@@ -45,23 +44,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, TrailParams};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::trail_sound::SoundKind;
-use aterm_spec::derive::{Model, trail_sound_seam_model};
+use aterm_models_misc::trail_sound_seam_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 
 use super::{
     HostSoundTerms, SeamReason, fold_window_audibility, sound_seam, trail_on, verb_seam_inputs,
 };
-use crate::app_config::{
-    CursorGlowInputs, ResolvedTrailStyle, TrailPackCatalog, resolve_cursor_glow,
-    resolve_trail_presentation, resolve_trail_presentation_from_style,
-};
+use crate::app_config::{CursorGlowInputs, resolve_cursor_glow, resolve_trail_presentation};
 use crate::motion::{MotionEffect, MotionMode, MotionPolicy};
 use crate::trail_audio::HostState;
 
 /// Every style, each with the spelling the resolver is handed.
-const STYLES: [GlowStyle; 11] = [
+const STYLES: [GlowStyle; 10] = [
     GlowStyle::Lumen,
     GlowStyle::Phaser,
     GlowStyle::RainbowKitty,
@@ -72,10 +69,9 @@ const STYLES: [GlowStyle; 11] = [
     GlowStyle::Water,
     GlowStyle::Comet,
     GlowStyle::Classic,
-    GlowStyle::Custom,
 ];
 
-/// The config spelling of a style (`Custom` is a `pack:` spelling).
+/// The config spelling of a style.
 fn spelling(style: GlowStyle) -> &'static str {
     match style {
         GlowStyle::Lumen => "lumen",
@@ -88,7 +84,6 @@ fn spelling(style: GlowStyle) -> &'static str {
         GlowStyle::Water => "water",
         GlowStyle::Comet => "comet",
         GlowStyle::Classic => "classic",
-        GlowStyle::Custom => "pack:conformance",
     }
 }
 
@@ -237,19 +232,7 @@ fn geom(grid: Grid) -> Geom {
 /// the master knob and serious mode's `CursorGlow` permission.
 fn resolved(i: HostInputs, style: GlowStyle) -> GlowConfig {
     let raw = spelling(style);
-    let presentation = if style == GlowStyle::Custom {
-        resolve_trail_presentation_from_style(
-            raw,
-            ResolvedTrailStyle {
-                canonical: None,
-                style: Some(GlowStyle::Custom),
-                pack: Some(TrailParams::defaults()),
-                issue: None,
-            },
-        )
-    } else {
-        resolve_trail_presentation(raw, &TrailPackCatalog::default())
-    };
+    let presentation = resolve_trail_presentation(raw);
     assert_eq!(
         presentation.style.style,
         Some(style),

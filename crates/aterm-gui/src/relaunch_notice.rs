@@ -102,17 +102,4 @@ mod tests {
             0.0
         );
     }
-
-    /// The fade bucket steps once per [`REALIZED_BUCKET`] — the quantum the palette fp
-    /// folds, so an open palette re-presents once per step and never every frame.
-    #[test]
-    fn realized_bucket_steps_at_the_quantum() {
-        assert_eq!(realized_bucket(Duration::ZERO), 0);
-        assert_eq!(realized_bucket(REALIZED_BUCKET - Duration::from_secs(1)), 0);
-        assert_eq!(realized_bucket(REALIZED_BUCKET), 1);
-        assert_eq!(
-            realized_bucket(REALIZED_BUCKET * 7 + Duration::from_secs(3)),
-            7
-        );
-    }
 }

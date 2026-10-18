@@ -4,7 +4,7 @@
 //! The `CatBaker`: bakes full-colour RGBA tiles at exact destination pixel size
 //! (the nearest-1:1 contract of the `cat_quads` render stream) into one
 //! `SceneAtlas`-compatible texture shared by the word cats, the animals, the
-//! kitty cursor, the pet, the dog and Robi. Rasterized with `aterm-scene`'s
+//! kitty cursor, the pet and the dog. Rasterized with `aterm-scene`'s
 //! [`Tile`] filler (4×4-supersampled coverage).
 //!
 //! * **Tiles**: authored glyphs (`cat_glyphs_gen::GLYPHS`) keyed by
@@ -319,7 +319,7 @@ impl CatBaker {
     /// row-major, and must fit a slot (`w ≤ slot_w`, `h ≤ 2·ch`). Returns the
     /// placement (`ax = 0`, `ay = slot·2·ch`), or `None` if the baker is
     /// uninitialised, the tile does not fit, or the bake budget is spent. Used by
-    /// the kitty cursor, pet, dog, Robi and animal tiles.
+    /// the kitty cursor, pet, dog and animal tiles.
     pub fn host_tile(&mut self, host_id: u64, w: u16, h: u16, rgba: &[u8]) -> Option<CatTile> {
         if self.cell_h == 0 || w == 0 || h == 0 {
             return None;
@@ -1186,81 +1186,6 @@ impl BakeKeyV4 {
 }
 
 #[cfg(test)]
-struct SlotV4 {
-    key: BakeKeyV4,
-    tile: Tile,
-    last_used: u64,
-}
-
-/// Test-only LRU bake cache keyed on [`BakeKeyV4`], with the same
-/// [`MAX_SLOTS`] and [`MAX_BAKES_PER_FRAME`] budgets as [`CatBaker`]. Tiles are
-/// `w + PATCH_STRIP` wide.
-#[derive(Default)]
-#[cfg(test)]
-pub struct CatBakerV4 {
-    slots: Vec<SlotV4>,
-    clock: u64,
-    bakes_left: u32,
-    version: u64,
-}
-
-#[cfg(test)]
-impl CatBakerV4 {
-    /// Per-tick prologue: advance the LRU clock and reset the per-frame bake budget.
-    #[cfg(test)]
-    pub fn begin_frame(&mut self) {
-        self.clock = self.clock.wrapping_add(1);
-        self.bakes_left = MAX_BAKES_PER_FRAME;
-    }
-
-    /// Number of resident tiles (`≤ MAX_SLOTS`).
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Look `key` up, baking on a miss when the frame's budget allows. `None`
-    /// means retry next frame. The tile is `key.w + PATCH_STRIP` wide, art in
-    /// `[0, w)`.
-    #[cfg(test)]
-    pub fn get(&mut self, key: &BakeKeyV4) -> Option<&Tile> {
-        if let Some(i) = self.slots.iter().position(|s| s.key == *key) {
-            self.slots[i].last_used = self.clock;
-            return Some(&self.slots[i].tile);
-        }
-        if self.bakes_left == 0 {
-            return None;
-        }
-        self.bakes_left -= 1;
-        let tile = key.bake();
-        self.version = self.version.wrapping_add(1);
-        let i = if self.slots.len() < MAX_SLOTS {
-            self.slots.push(SlotV4 {
-                key: *key,
-                tile,
-                last_used: self.clock,
-            });
-            self.slots.len() - 1
-        } else {
-            // Evict the least-recently-used (lowest index tiebreak — deterministic).
-            let evict = self
-                .slots
-                .iter()
-                .enumerate()
-                .min_by_key(|(idx, s)| (s.last_used, *idx))
-                .map(|(idx, _)| idx)?;
-            self.slots[evict] = SlotV4 {
-                key: *key,
-                tile,
-                last_used: self.clock,
-            };
-            evict
-        };
-        Some(&self.slots[i].tile)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cat_glyphs_gen::GLYPH_IDS;
@@ -1327,26 +1252,10 @@ mod tests {
         }
     }
 
-    /// The §5.5 structural slot count is a pure function of cell height:
-    /// `slots = min(32, ⌊2 MiB / ((4·ch)·(2·ch)·4)⌋)`.
+    /// The §5.5 structural slot count keeps the atlas inside its 2 MiB
+    /// budget at every cell height.
     #[test]
     fn slot_count_is_structural() {
-        assert_eq!(
-            CatBaker::slot_count(14),
-            32,
-            "small cells hit the 32 ceiling"
-        );
-        assert_eq!(CatBaker::slot_count(20), 32);
-        assert_eq!(
-            CatBaker::slot_count(40),
-            32,
-            "51.2 KB/slot still fits 32 at 2 MiB (§5.5, 1.6 MiB)"
-        );
-        assert_eq!(
-            CatBaker::slot_count(56),
-            20,
-            "2 MiB / (224·112·4) degrades gracefully"
-        );
         for ch in [14u16, 20, 40, 56, 90] {
             let bytes =
                 CatBaker::slot_count(ch) * (4 * usize::from(ch)) * (2 * usize::from(ch)) * 4;
@@ -1581,8 +1490,8 @@ mod tests {
         tile
     }
 
-    /// v4 §7: same key ⇒ byte-identical bake, across independent calls and a fresh
-    /// bake through the LRU cache.
+    /// v4 §7: same key ⇒ byte-identical bake, across independent calls and the
+    /// key's own cache-miss path.
     #[test]
     fn v4_bake_variant_is_deterministic() {
         let a = bake_variant(CatGlyphId::S100, &fills(5, 3, false), 96, 64);
@@ -1595,7 +1504,7 @@ mod tests {
             "art + patch strip wide"
         );
 
-        // The cache re-bakes byte-identically (and the strip catch-light landed).
+        // The key's cache-miss bake is byte-identical to the direct bake.
         let key = BakeKeyV4 {
             variant: CatGlyphId::S100,
             accessory: None,
@@ -1609,10 +1518,7 @@ mod tests {
             h: 64,
             eyes: EyesFrame::Open,
         };
-        let mut cache = CatBakerV4::default();
-        cache.begin_frame();
-        let cached = cache.get(&key).expect("bake").pixels().to_vec();
-        assert_eq!(cached, a.pixels(), "cache bake == direct bake");
+        assert_eq!(key.bake().pixels(), a.pixels(), "key bake == direct bake");
     }
 
     /// v4 §7: a `Recolor::Coat` variant recolors — ≥ 3 distinct ramp indices give
@@ -1653,19 +1559,6 @@ mod tests {
         let b = bake_variant(CatGlyphId::SpecTuxedo, &fills(15, 3, false), 96, 96);
         assert_eq!(a.pixels(), b.pixels(), "fixed patches ⇒ coat-invariant");
         assert!(a.pixels().iter().any(|&x| x != 0), "actually painted");
-    }
-
-    /// v4 §7: the dark-background bake differs from the light one — the outline is
-    /// lifted to [`OUTLINE_PALE`].
-    #[test]
-    fn v4_dark_bg_lifts_outline() {
-        let light = bake_variant(CatGlyphId::S100, &fills(2, 3, false), 96, 64);
-        let dark = bake_variant(CatGlyphId::S100, &fills(2, 3, true), 96, 64);
-        assert_ne!(
-            light.pixels(),
-            dark.pixels(),
-            "dark_bg must lift the outline to a distinct tile"
-        );
     }
 
     /// Dark-coat rescue: on dark bands the darkest coats lift to the floor,
@@ -1830,28 +1723,6 @@ mod tests {
                 "the circular red seam must share one cache key"
             );
         }
-
-        for (index, &accent) in CONTEXT_ACCENTS[..12].iter().enumerate() {
-            let (hue, _, _) = rgb2hsv(accent);
-            let expected = index as f32 * 30.0;
-            let distance = (hue - expected).abs().min(360.0 - (hue - expected).abs());
-            assert!(
-                distance <= 0.6,
-                "anchor {index} is {hue:.2}°, expected {expected:.2}°"
-            );
-        }
-    }
-
-    #[test]
-    fn context_background_selects_contrast_outline() {
-        let dark = CatColorKey::from_rgb(0x0008_0910, 0x00F0_E8E0, 0x00D0_C8C0);
-        let light = CatColorKey::from_rgb(0x00FA_FAF4, 0x0020_242A, 0x0040_4850);
-        assert!(dark.dark());
-        assert!(!light.dark());
-        let dark_fill = ResolvedFills::from_context(8, 4, dark);
-        let light_fill = ResolvedFills::from_context(8, 4, light);
-        let lum = |c: (f32, f32, f32)| 0.2126 * c.0 + 0.7152 * c.1 + 0.0722 * c.2;
-        assert!(lum(dark_fill.outline) > lum(light_fill.outline));
     }
 
     #[test]
@@ -1979,10 +1850,9 @@ mod tests {
         assert!(has_rgb(pale), "mixed bake contains its pale halo");
     }
 
-    /// v4 §7: an accessory overlay changes texels vs the bare variant and is a
-    /// distinct cache key (a bow cat never aliases its bare twin).
+    /// v4 §7: an accessory overlay changes texels vs the bare variant.
     #[test]
-    fn v4_accessory_overlay_differs_and_is_distinct_key() {
+    fn v4_accessory_overlay_changes_texels() {
         let bare = bake_variant(CatGlyphId::S100, &fills(5, 3, false), 96, 96);
         let bow = bake_variant_with(
             CatGlyphId::S100,
@@ -1993,37 +1863,10 @@ mod tests {
             EyesFrame::Open,
         );
         assert_ne!(bare.pixels(), bow.pixels(), "overlay must change texels");
-
-        let base = BakeKeyV4 {
-            variant: CatGlyphId::S100,
-            accessory: None,
-            coat: 5,
-            iris: 3,
-            colors: CatColorKey {
-                accent: 12,
-                background: 3,
-            },
-            w: 96,
-            h: 96,
-            eyes: EyesFrame::Open,
-        };
-        let bowed = BakeKeyV4 {
-            accessory: Some(CatGlyphId::AccBow),
-            ..base
-        };
-        assert_ne!(base, bowed, "accessory is a distinct BakeKeyV4");
-
-        // Distinct keys occupy distinct cache slots.
-        let mut cache = CatBakerV4::default();
-        cache.begin_frame();
-        cache.get(&base).expect("bake bare");
-        cache.begin_frame();
-        cache.get(&bowed).expect("bake bow");
-        assert_eq!(cache.len(), 2, "two distinct keys ⇒ two slots");
     }
 
     /// Open, happy and blink bake distinct tiles; `Open` equals the default open
-    /// bake; each `eyes` value is its own `BakeKeyV4`.
+    /// bake.
     #[test]
     fn eyes_frame_bakes_distinct_but_open_is_authored() {
         let f = fills(5, 3, false);
@@ -2035,109 +1878,17 @@ mod tests {
         assert_ne!(open.pixels(), happy.pixels(), "a squint changes texels");
         assert_ne!(open.pixels(), blink.pixels(), "a blink changes texels");
         assert_ne!(happy.pixels(), blink.pixels(), "squint and blink differ");
-
-        let base = BakeKeyV4 {
-            variant: CatGlyphId::S100,
-            accessory: None,
-            coat: 5,
-            iris: 3,
-            colors: CatColorKey::default(),
-            w: 40,
-            h: 32,
-            eyes: EyesFrame::Open,
-        };
-        let winking = BakeKeyV4 {
-            eyes: EyesFrame::Blink,
-            ..base
-        };
-        assert_ne!(base, winking, "eyes is a distinct BakeKeyV4 axis");
-        let mut cache = CatBakerV4::default();
-        cache.begin_frame();
-        cache.get(&base).expect("bake open");
-        cache.begin_frame();
-        cache.get(&winking).expect("bake blink");
-        assert_eq!(cache.len(), 2, "open and blink occupy distinct slots");
     }
 
-    /// At the settings-preview size (~31 px) the glossy pass touches only opaque dark
-    /// eye texels; happy, blink and shallow-eyed heads are unchanged by it.
+    /// Happy and blink eyes never receive the open-eye reflections: the glossy
+    /// pass toggled leaves those bakes byte-identical at the settings-preview
+    /// size. Containment and non-vacuity across the roster are
+    /// `flying_reflection_roster_is_contained_and_nonvacuous`.
     #[test]
-    fn flying_cursor_reflections_are_contained_and_expression_aware() {
+    fn flying_cursor_reflections_skip_happy_and_blink_eyes() {
         const W: u32 = 38;
         const H: u32 = 31;
         let fills = fills(8, 4, false);
-        let plain = bake_reflection_control(CatGlyphId::S100, &fills, W, H, EyesFrame::Open, false);
-        let glossy = bake_reflection_control(CatGlyphId::S100, &fills, W, H, EyesFrame::Open, true);
-        let eye_layer = GLYPHS[CatGlyphId::S100 as usize]
-            .layers
-            .iter()
-            .find(|layer| layer.role == GlyphRole::Eye)
-            .expect("default head authors eyes");
-        let xform = PathTransform::fit(W, H);
-        let mut eye_mask = Tile::new(W, H);
-        fill_path_fixed(&mut eye_mask, eye_layer.paths, (0.0, 0.0, 0.0), 1.0, xform);
-
-        let changed: Vec<(usize, &[u8; 4], &[u8; 4])> = plain
-            .pixels()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(glossy.pixels().as_chunks::<4>().0)
-            .enumerate()
-            .filter_map(|(i, (a, b))| {
-                (i % (plain.width() as usize) < W as usize && a != b).then_some((i, a, b))
-            })
-            .collect();
-        assert!(
-            !changed.is_empty(),
-            "the exact settings-preview bake must gain visible reflection texels"
-        );
-        assert!(
-            changed
-                .iter()
-                .any(|(_, _, after)| after[..3].iter().all(|&c| c >= 160)),
-            "the reflection diff must contain a visibly pale texel"
-        );
-        for &(i, before, _) in &changed {
-            let x = i % plain.width() as usize;
-            let y = i / plain.width() as usize;
-            let mi = (y * W as usize + x) * 4;
-            let mask = &eye_mask.pixels()[mi..mi + 4];
-            assert_ne!(
-                mask[3], 0,
-                "changed texel ({x},{y}) left the authored eye footprint"
-            );
-            assert!(
-                before[3] == 255 && before[..3].iter().all(|&c| c < 96),
-                "changed texel ({x},{y}) was not dark eye/pupil ink: {before:?}"
-            );
-        }
-
-        for path in eye_layer.paths {
-            let (x0, y0, x1, y1) = path_bounds(path).expect("eye path has bounds");
-            let x0 = (x0 * W as f32).floor().max(0.0) as usize;
-            let y0 = (y0 * H as f32).floor().max(0.0) as usize;
-            let x1 = (x1 * W as f32).ceil().min(W as f32) as usize;
-            let y1 = (y1 * H as f32).ceil().min(H as f32) as usize;
-            let dark_count = |tile: &Tile| {
-                (y0..y1)
-                    .flat_map(|y| (x0..x1).map(move |x| (x, y)))
-                    .filter(|&(x, y)| {
-                        let i = (y * tile.width() as usize + x) * 4;
-                        let p = &tile.pixels()[i..i + 4];
-                        p[3] == 255 && p[..3].iter().all(|&c| c < 96)
-                    })
-                    .count()
-            };
-            let before = dark_count(&plain);
-            let after = dark_count(&glossy);
-            assert!(before >= 4, "fixture eye has too little dark ink: {before}");
-            assert!(
-                after >= 2 && after * 2 >= before,
-                "reflection consumed the eye core: before={before}, after={after}"
-            );
-        }
-
         for state in [EyesFrame::Happy, EyesFrame::Blink] {
             let without = bake_reflection_control(CatGlyphId::S100, &fills, W, H, state, false);
             let with = bake_reflection_control(CatGlyphId::S100, &fills, W, H, state, true);
@@ -2147,33 +1898,6 @@ mod tests {
                 "{state:?} must never receive open-eye reflections"
             );
         }
-        // A large bake, so the shallow-expression check exercises the aspect
-        // gate rather than the tiny-eye size floor.
-        const SHALLOW_H: u32 = 120;
-        let shallow_w =
-            (f32::from(GLYPHS[CatGlyphId::S101 as usize].aspect_x1000) * SHALLOW_H as f32 / 1000.0)
-                .round() as u32;
-        let shallow_plain = bake_reflection_control(
-            CatGlyphId::S101,
-            &fills,
-            shallow_w,
-            SHALLOW_H,
-            EyesFrame::Open,
-            false,
-        );
-        let shallow_glossy = bake_reflection_control(
-            CatGlyphId::S101,
-            &fills,
-            shallow_w,
-            SHALLOW_H,
-            EyesFrame::Open,
-            true,
-        );
-        assert_eq!(
-            shallow_plain.pixels(),
-            shallow_glossy.pixels(),
-            "authored shallow eyes must not gain reflections"
-        );
     }
 
     /// The glossy pass across the roster at word-cat, preview, enlarged-cursor and

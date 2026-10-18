@@ -3,7 +3,8 @@
 
 //! Every declaration of crates/aterm-windows-sys-052 against the registry
 //! windows-sys 0.52.0, decided by the compiler for the Windows triple being
-//! checked (`../run.sh` runs x86_64- and aarch64-pc-windows-msvc):
+//! checked (`targo --unverified run -p aterm-win32-oracle -- oracle-052` runs
+//! x86_64- and aarch64-pc-windows-msvc):
 //!
 //! - each type alias: identity, both ways, plus size and alignment;
 //! - the constant: its type and value;
@@ -11,11 +12,11 @@
 //!   the ABI string, unsafety, argument and return types.
 //!
 //! The import itself, the symbol a caller references and the DLL it resolves
-//! to, has no const view in Rust; `run.sh` compares it from the compiled
+//! to, has no const view in Rust; the driver compares it from the compiled
 //! objects (the `probe-*` features).
 //!
 //! Under a `plant-*` feature the facade is swapped for a copy with one
-//! planted mismatch, and `run.sh` requires the check to FAIL.
+//! planted mismatch, and the driver requires the check to FAIL.
 
 #![no_std]
 #![allow(non_snake_case, non_camel_case_types)]
@@ -66,7 +67,7 @@ const _: unsafe extern "system" fn(UT::PROCESSOR_FEATURE_ID) -> UF::BOOL =
 const _: unsafe extern "system" fn(ST::PROCESSOR_FEATURE_ID) -> SF::BOOL =
     UT::IsProcessorFeaturePresent;
 
-// --- the import (run.sh's symbol phase) ------------------------------------
+// --- the import (the driver's import phase) --------------------------------
 
 /// One call through the facade: its object's undefined symbol is the import.
 #[cfg(feature = "probe-facade")]

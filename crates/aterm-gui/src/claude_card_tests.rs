@@ -167,10 +167,43 @@ fn painted(app: &App, wid: WindowId) -> &CardPainted {
     &app.windows[&wid].claude_card.painted
 }
 
+/// A painted card's two light streams, `(under, over)`, as they stand.
+fn card_streams(app: &App, wid: WindowId) -> (Vec<GlowQuad>, Vec<GlowQuad>) {
+    let p = painted(app, wid);
+    (p.under.clone(), p.over.clone())
+}
+
+/// The kitty's left edge in a card's streams: its opaque quads' leftmost x.
+fn kitty_x((_, over): &(Vec<GlowQuad>, Vec<GlowQuad>)) -> Option<u16> {
+    over.iter().filter(|q| q.alpha == 255).map(|q| q.x).min()
+}
+
+/// The span the trail's quads cover in a card's streams: its `under` quads
+/// clear of the border's stroke (which holds the stream's outermost
+/// pixels), left to right.
+fn trail_span((under, _): &(Vec<GlowQuad>, Vec<GlowQuad>)) -> Option<(u32, u32)> {
+    let end = |q: &GlowQuad| {
+        (
+            u32::from(q.x) + u32::from(q.w),
+            u32::from(q.y) + u32::from(q.h),
+        )
+    };
+    let x0 = under.iter().map(|q| u32::from(q.x)).min()?;
+    let y0 = under.iter().map(|q| u32::from(q.y)).min()?;
+    let x1 = under.iter().map(|q| end(q).0).max()?;
+    let y1 = under.iter().map(|q| end(q).1).max()?;
+    let inside = under
+        .iter()
+        .filter(|q| u32::from(q.x) > x0 && u32::from(q.y) > y0 && end(q).0 < x1 && end(q).1 < y1);
+    let a = inside.clone().map(|q| u32::from(q.x)).min()?;
+    let b = inside.map(|q| end(q).0).max()?;
+    Some((a, b))
+}
+
 /// The line the card writes for `view` in a pane `cols` wide with its star at
 /// column `at`: the widest of [`line_texts`] that ends inside the border.
 fn expected_line(view: AutopilotView, at: usize, cols: usize) -> String {
-    line_texts(view)
+    line_texts(view, LineEnd::Mode)
         .iter()
         .find(|t| at + LINE_LEAD + text_cells(t) < cols)
         .expect("a line fits")
@@ -290,6 +323,242 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
     host.shutdown_and_join();
 }
 
+/// THE WORKSPACE CARD (Claude Code 2.1.302 on `--effort workspace`, the
+/// measured screen): the mascot holds its wand `╱✦` between its blocks and
+/// the banner, and the card's text sits at column 13 — it wears the border,
+/// the kitty and the line all the same, the line under the card at ITS text
+/// column, the vendor's glyphs untouched. CONTROL (mutation-checked): a
+/// reader that takes the mascot's columns as block glyphs alone leaves this
+/// card bare, as the Together run of 2026-10-16 saw it (defect D1: Claude's
+/// tab showed only the vendor's banner for the whole run).
+#[test]
+fn the_workspace_card_wears_the_card_at_its_own_text_column() {
+    let text =
+        include_str!("../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-120col.txt");
+    let screen: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+    let wand =
+        " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}\u{2584}\u{2571}\u{2726}  ";
+    assert_eq!(
+        screen[0],
+        format!("{wand}{}2.1.302", banner()),
+        "the measured banner row"
+    );
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, 24, 120));
+    feed(&app, session, &screen);
+    publish(&app, session, "2.1.302");
+    let host = supervise(&mut app, session);
+    frame(&mut app, wid);
+    let strip = strip_rows(&app, wid);
+    let (top, text_col) = (0usize, 13usize);
+    let p = painted(&app, wid);
+    assert!(!p.under.is_empty(), "the border and the trail");
+    assert!(
+        p.over.iter().any(|q| q.alpha == u8::MAX),
+        "the kitty: opaque art"
+    );
+    let line_row = strip + top + 3;
+    let want = expected_line(AutopilotView::Cruise, text_col, 120);
+    let start = text_col + LINE_LEAD;
+    assert_eq!(
+        glass_text(&app, wid, line_row, start..start + want.chars().count()),
+        want,
+        "the line under the card at its text column"
+    );
+    assert_eq!(
+        glass_text(&app, wid, strip + top, 0..screen[0].chars().count()),
+        screen[0],
+        "the vendor's banner row, the wand in it, untouched"
+    );
+    host.shutdown_and_join();
+}
+
+/// A frame of Claude Code 2.1.302's fullscreen entrance, the measured JUMP
+/// (`aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-fullscreen-entrance-jump-*`,
+/// one launch, its screen read every ~50 ms, 144x40): the mascot standing,
+/// a row low in its dust (twice), both arms up, and at rest with the wand.
+fn jump(pose: &str) -> Vec<String> {
+    let text = match pose {
+        "1-stand" => include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-fullscreen-entrance-jump-1-stand-144col.txt"
+        ),
+        "2-dust" => include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-fullscreen-entrance-jump-2-dust-144col.txt"
+        ),
+        "3-dust" => include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-fullscreen-entrance-jump-3-dust-144col.txt"
+        ),
+        "4-arms-up" => include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-fullscreen-entrance-jump-4-arms-up-144col.txt"
+        ),
+        "5-rest" => include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-fullscreen-entrance-jump-5-rest-144col.txt"
+        ),
+        other => panic!("no such frame: {other}"),
+    };
+    text.lines().skip(1).map(str::to_owned).collect()
+}
+
+/// The jump's frames in the order the screen drew them.
+const JUMP: [&str; 10] = [
+    "1-stand",
+    "2-dust",
+    "3-dust",
+    "4-arms-up",
+    "1-stand",
+    "2-dust",
+    "3-dust",
+    "4-arms-up",
+    "1-stand",
+    "5-rest",
+];
+
+/// A headless window 144x40 showing the entrance's frame `pose`, the facts
+/// of a 2.1.302 process published and its session supervised under Cruise.
+fn entrance_glass(pose: &str) -> (App, WindowId, u64, crate::harness_host::HostHandle) {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, 40, 144));
+    feed(&app, session, &jump(pose));
+    publish(&app, session, "2.1.302");
+    let host = supervise(&mut app, session);
+    (app, wid, session, host)
+}
+
+/// Where the card decorated on `wid`'s last frame sits, `None` when no card
+/// is on the glass.
+fn decorated(app: &App, wid: WindowId) -> Option<CardPlace> {
+    let on = app.windows[&wid]
+        .claude_card
+        .entries
+        .iter()
+        .any(|e| e.shown)
+        && !painted(app, wid).under.is_empty();
+    on.then(|| laid_key(app, wid).place)
+}
+
+/// THE CARD STAYS ON THE GLASS THROUGH THE VENDOR'S ENTRANCE. Claude Code
+/// 2.1.302's fullscreen renderer plays its mascot's entrance once per build
+/// (the measured jump: stand, dust, dust, arms up, twice; stand; the wand at
+/// rest), and the card found on the standing frame is decorated on every
+/// frame after it — at its place through the dust and the raised arms, which
+/// the reader places nothing on, held by its words — and at the rest's place
+/// once the wand is up. A frame after each that changed nothing reads no
+/// card: a held reading is kept like any other (`CardReading::holds`).
+/// CONTROLS: the dust and arms-up frames alone, on a fresh window, draw no
+/// card. Mutation-checked: a `read_card` that never holds leaves the six
+/// frames of dust and arms bare, the blink main shows in the lab.
+#[test]
+fn the_card_stays_on_the_glass_through_the_entrance() {
+    let (mut app, wid, session, host) = entrance_glass("1-stand");
+    let mut shown = Vec::new();
+    for pose in JUMP {
+        feed(&app, session, &jump(pose));
+        frame(&mut app, wid);
+        let place = decorated(&app, wid);
+        shown.push(place);
+        let _ = crate::work_counts::take_card_reads();
+        frame(&mut app, wid);
+        assert_eq!(
+            (crate::work_counts::take_card_reads(), decorated(&app, wid)),
+            (0, place),
+            "{pose}: the frame after, nothing changed"
+        );
+    }
+    let stand = aterm_phase::launch_card_place(&jump("1-stand")).expect("standing");
+    let rest = aterm_phase::launch_card_place(&jump("5-rest")).expect("at rest");
+    assert_eq!((stand.top, stand.mascot_end, rest.mascot_end), (1, 9, 11));
+    let mut want = vec![Some(stand); 9];
+    want.push(Some(rest));
+    assert_eq!(shown, want, "the card on every frame of the entrance");
+    host.shutdown_and_join();
+    for pose in ["2-dust", "3-dust", "4-arms-up"] {
+        let (mut app, wid, _, host) = entrance_glass(pose);
+        frame(&mut app, wid);
+        assert_eq!(decorated(&app, wid), None, "CONTROL: {pose} alone");
+        host.shutdown_and_join();
+    }
+}
+
+/// A HELD CARD GOES ON THE FRAME ITS BANNER LEAVES, as the window holds it.
+/// Held through the raised arms, it goes when the screen is then cleared:
+/// the held reading is keyed to the card's own row, so a change there reads
+/// anew. Only the LAST reading's card is held: with the card switched off
+/// for two frames — the screen cleared, then the raised arms — the card that
+/// went unseen is not held again when the card is back on. And a resize lets
+/// it go: its place was read on the old grid. CONTROLS: the standing frame
+/// decorates and the arms hold it in each run, and with the card switched
+/// off for the arms alone the card is held when it is back on.
+/// Mutation-checked: a held reading keyed to the reader's own banner (none,
+/// for the raised arms) keeps the card on the cleared screen; an earlier
+/// reading's card held as the last one's keeps it on the arms after the
+/// unseen clear; a pane's text kept across a resize keeps it on the resized
+/// arms.
+#[test]
+fn a_held_card_goes_on_the_frame_its_banner_leaves() {
+    let blank = vec![String::new(); 40];
+    let switch = |app: &mut App, on: bool| {
+        app.config.claude_footer = Some(crate::app_config::ClaudeFooterConfig {
+            card: Some(on),
+            ..Default::default()
+        });
+    };
+    let (mut app, wid, session, host) = entrance_glass("1-stand");
+    frame(&mut app, wid);
+    let stand = decorated(&app, wid).expect("CONTROL: the standing card");
+    feed(&app, session, &jump("4-arms-up"));
+    frame(&mut app, wid);
+    assert_eq!(decorated(&app, wid), Some(stand), "CONTROL: held");
+    feed(&app, session, &blank);
+    frame(&mut app, wid);
+    assert_eq!(decorated(&app, wid), None, "cleared after the hold");
+    host.shutdown_and_join();
+
+    for (screens, want) in [
+        (vec![jump("4-arms-up")], Some(stand)),
+        (vec![blank, jump("4-arms-up")], None),
+    ] {
+        let (mut app, wid, session, host) = entrance_glass("1-stand");
+        frame(&mut app, wid);
+        assert_eq!(
+            decorated(&app, wid),
+            Some(stand),
+            "CONTROL: the standing card"
+        );
+        switch(&mut app, false);
+        for rows in &screens {
+            feed(&app, session, rows);
+            frame(&mut app, wid);
+            assert_eq!(decorated(&app, wid), None, "switched off");
+        }
+        switch(&mut app, true);
+        frame(&mut app, wid);
+        assert_eq!(
+            decorated(&app, wid),
+            want,
+            "back on after {} unseen frames",
+            screens.len()
+        );
+        host.shutdown_and_join();
+    }
+
+    let (mut app, wid, session, host) = entrance_glass("1-stand");
+    frame(&mut app, wid);
+    assert_eq!(
+        decorated(&app, wid),
+        Some(stand),
+        "CONTROL: the standing card"
+    );
+    assert!(app.apply_term_resize(wid, 40, 120));
+    feed(&app, session, &jump("4-arms-up"));
+    frame(&mut app, wid);
+    assert_eq!(decorated(&app, wid), None, "the arms after a resize");
+    host.shutdown_and_join();
+}
+
 /// LAND wears the sunset (red → gold → rose: no light bluer than it is red)
 /// and says so on its line. CONTROL: Cruise's rainbow has blue in it.
 #[test]
@@ -317,6 +586,280 @@ fn land_wears_the_sunset_and_says_land() {
         glass_text(&app, wid, strip + 4, 13..13 + want.chars().count()),
         want
     );
+    host.shutdown_and_join();
+}
+
+/// A TASK'S END ON THE CARD'S LINE (the Autopilot design's §9.4.1, §10.2.1):
+/// under Land and Cruise, the task's face told `landed` ends the line `·
+/// autopilot ✓ landed` and `done` ends it `· autopilot ✓ done` — the same
+/// words under both; spent, theirs, open and unknown keep the mode's own
+/// (`⤓ land`, `∞ cruise`). The words are made once per pair (a frame formats
+/// nothing), the narrower rungs say no mode, and a face's move re-lays the
+/// line and ARMS NO EPISODE. NEGATIVE CONTROL: Off, and no harness, say no
+/// end whatever is told.
+#[test]
+fn a_tasks_end_is_said_on_the_cards_line_under_land_and_cruise() {
+    use aterm_agent::harness::acts::TaskFace;
+    for view in AutopilotView::ALL {
+        let faces = std::iter::once(None).chain(TaskFace::ALL.into_iter().map(Some));
+        for task in faces {
+            let want = match (view, task) {
+                (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Landed)) => {
+                    LineEnd::Landed
+                }
+                (AutopilotView::Land | AutopilotView::Cruise, Some(TaskFace::Done)) => {
+                    LineEnd::Done
+                }
+                _ => LineEnd::Mode,
+            };
+            assert_eq!(LineEnd::of(view, task), want, "{view:?} {task:?}");
+        }
+    }
+    for (end, tail) in [
+        (LineEnd::Mode, "\u{2913} land"),
+        (LineEnd::Landed, "\u{2713} landed"),
+        (LineEnd::Done, "\u{2713} done"),
+    ] {
+        let texts = line_texts(AutopilotView::Land, end);
+        assert!(
+            texts[0].ends_with(&format!("\u{b7} autopilot {tail}")),
+            "{texts:?}"
+        );
+        assert!(
+            std::ptr::eq(texts, line_texts(AutopilotView::Land, end)),
+            "made once"
+        );
+        assert_eq!(
+            texts[1..],
+            line_texts(AutopilotView::Land, LineEnd::Mode)[1..],
+            "the narrower rungs"
+        );
+        if end == LineEnd::Mode {
+            let cruise = line_texts(AutopilotView::Cruise, end);
+            assert!(
+                cruise[0].ends_with("\u{b7} autopilot \u{221e} cruise"),
+                "{cruise:?}"
+            );
+        } else {
+            assert_eq!(
+                line_texts(AutopilotView::Cruise, end),
+                texts,
+                "Cruise says the end in Land's words"
+            );
+        }
+        for view in [AutopilotView::Off, AutopilotView::MasterOff] {
+            assert_eq!(
+                line_texts(view, end),
+                line_texts(view, LineEnd::Mode),
+                "NEGATIVE CONTROL: {view:?} says no end"
+            );
+        }
+    }
+    let fits = |end: LineEnd| {
+        line_texts(AutopilotView::Land, end)
+            .iter()
+            .find(|t| 11 + LINE_LEAD + text_cells(t) < 120)
+            .expect("a line fits")
+            .clone()
+    };
+    for word in [Autopilot::Land, Autopilot::Cruise] {
+        let (mut app, wid, session) = glass(120);
+        let host = supervise(&mut app, session);
+        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        let sid = app
+            .pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .self_id
+            .as_str()
+            .to_string();
+        assert!(app.set_session_autopilot(session, Some(word)));
+        let mut t = Instant::now();
+        set_now(Some(t));
+        frame(&mut app, wid);
+        t += Duration::from_millis(EPISODE_MS + 1000);
+        set_now(Some(t));
+        frame(&mut app, wid);
+        assert_eq!(app.claude_card_deadline(t), None, "settled");
+        let strip = strip_rows(&app, wid);
+        for (face, end) in [
+            (Some(TaskFace::Landed), LineEnd::Landed),
+            (Some(TaskFace::Done), LineEnd::Done),
+            (Some(TaskFace::Spent), LineEnd::Mode),
+            (Some(TaskFace::Theirs), LineEnd::Mode),
+            (Some(TaskFace::Open), LineEnd::Mode),
+            (Some(TaskFace::Landed), LineEnd::Landed),
+            (None, LineEnd::Mode),
+        ] {
+            app.apply_harness_fact(&sid, crate::HarnessFact::Task(face));
+            frame(&mut app, wid);
+            let want = match (word, end) {
+                (Autopilot::Land, _) | (_, LineEnd::Landed | LineEnd::Done) => fits(end),
+                _ => expected_line(AutopilotView::Cruise, 11, 120),
+            };
+            assert_eq!(
+                glass_text(&app, wid, strip + 4, 13..13 + want.chars().count()),
+                want,
+                "{word:?}: {face:?}"
+            );
+            assert_eq!(
+                app.claude_card_deadline(t),
+                None,
+                "{word:?}: {face:?}: a face's move arms no episode"
+            );
+        }
+        set_now(None);
+        host.shutdown_and_join();
+    }
+}
+
+/// A timer's face, `18:00` on the day it was set or (`other_day`) on a
+/// Saturday.
+fn six_pm(other_day: bool) -> crate::claude_lights::LandAtGlass {
+    crate::claude_lights::LandAtGlass {
+        clock: crate::claude_lights::Clock::of_minute(18 * 60),
+        other_day: other_day.then_some(crate::claude_lights::Weekday::Sat),
+    }
+}
+
+/// THE LINE FOLLOWS AN ARMED TIMER (§10.6.1): under Cruise with a timer armed
+/// the line's widest words end `· autopilot ∞ cruise ⤓18:00` — `⤓Sat 18:00`
+/// for a timer on another day, as the title writes it — then narrow to
+/// Cruise's own words, then as before. The words are made once per face of
+/// the timer (a frame formats nothing). CONTROL: no timer, Land, and a
+/// landing's end keep their own words (`LineEnd::timed`).
+#[test]
+fn the_cards_line_follows_an_armed_timer() {
+    let cruise = line_texts(AutopilotView::Cruise, LineEnd::Mode);
+    for (other_day, tail) in [(false, "\u{2913}18:00"), (true, "\u{2913}Sat 18:00")] {
+        let at = six_pm(other_day);
+        let end = LineEnd::Mode.timed(AutopilotView::Cruise, Some(at));
+        assert_eq!(end, LineEnd::CruiseUntil(at));
+        let texts = line_texts(AutopilotView::Cruise, end);
+        assert_eq!(
+            texts[0],
+            format!("{} {tail}", cruise[0]),
+            "the timer's time after Cruise's words"
+        );
+        assert!(
+            texts[0].ends_with(&format!("\u{b7} autopilot \u{221e} cruise {tail}")),
+            "{texts:?}"
+        );
+        assert_eq!(texts[1..], cruise[..], "then Cruise's own rungs");
+        assert!(
+            std::ptr::eq(texts, line_texts(AutopilotView::Cruise, end)),
+            "made once"
+        );
+        assert_eq!(
+            line_texts(AutopilotView::Land, end),
+            line_texts(AutopilotView::Land, LineEnd::Mode),
+            "the timer is Cruise's"
+        );
+    }
+    assert_ne!(
+        line_texts(AutopilotView::Cruise, LineEnd::CruiseUntil(six_pm(false)))[0],
+        line_texts(AutopilotView::Cruise, LineEnd::CruiseUntil(six_pm(true)))[0],
+        "another face, other words"
+    );
+    let at = Some(six_pm(false));
+    assert_eq!(
+        LineEnd::Mode.timed(AutopilotView::Cruise, None),
+        LineEnd::Mode,
+        "CONTROL: no timer"
+    );
+    for (end, view) in [
+        (LineEnd::Mode, AutopilotView::Land),
+        (LineEnd::Landed, AutopilotView::Land),
+        (LineEnd::Done, AutopilotView::Land),
+        (LineEnd::Mode, AutopilotView::Off),
+    ] {
+        assert_eq!(end.timed(view, at), end, "CONTROL: {view:?} {end:?}");
+    }
+}
+
+/// THE TIMER ON THE GLASS: a settled Cruise card whose session arms a timer
+/// for 18:00 says `⤓18:00` at the end of its line on the next frame — laid
+/// out once, no episode armed — and every frame after it replays the
+/// settled frame and its line as they are, laying out nothing and inking
+/// nothing; the timer gone, the line says Cruise's own words again.
+/// CONTROL: the same card with no timer never says a time.
+#[test]
+fn a_cruise_cards_line_says_its_armed_timer() {
+    let (mut app, wid, session) = glass(120);
+    let host = supervise(&mut app, session);
+    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    let mut t = Instant::now();
+    set_now(Some(t));
+    frame(&mut app, wid);
+    t += Duration::from_millis(EPISODE_MS + 1000);
+    set_now(Some(t));
+    frame(&mut app, wid);
+    assert_eq!(app.claude_card_deadline(t), None, "settled");
+    let line_row = strip_rows(&app, wid) + 4;
+    let start = 11 + LINE_LEAD;
+    let read = |app: &App, words: &str| {
+        glass_text(app, wid, line_row, start..start + words.chars().count())
+    };
+    let plain = expected_line(AutopilotView::Cruise, 11, 120);
+    assert_eq!(read(&app, &plain), plain, "CONTROL: no timer, no time");
+    assert!(!glass_text(&app, wid, line_row, 0..120).contains('\u{2913}'));
+    // Armed for 18:00 UTC, set at noon.
+    let day_ms = 20_000 * 86_400_000_i64;
+    let wall = day_ms + 12 * 3_600_000;
+    let utc = |_: i64| Some(0);
+    assert!(
+        app.autopilot_timers
+            .arm(session, day_ms + 18 * 3_600_000, t, wall, &utc, None)
+    );
+    let timed = format!("{plain} \u{2913}18:00");
+    assert!(
+        11 + LINE_LEAD + text_cells(&timed) < 120,
+        "the timed line fits at 120 columns: {timed:?}"
+    );
+    let _ = crate::work_counts::take_card_layouts();
+    frame(&mut app, wid);
+    assert_eq!(read(&app, &timed), timed, "the timer's time on the line");
+    assert_eq!(crate::work_counts::take_card_layouts(), 1, "laid out once");
+    assert_eq!(
+        app.claude_card_deadline(t),
+        None,
+        "a timer's move arms no episode"
+    );
+    let under = painted(&app, wid).under.clone();
+    let row: Vec<RenderCell> = app.windows[&wid].input_scratch.cells[line_row].clone();
+    let _ = crate::work_counts::take_card_line_inks();
+    let _ = crate::work_counts::take_card_ticks();
+    for i in 0..20u64 {
+        set_now(Some(t + Duration::from_millis(1 + i * 7)));
+        frame(&mut app, wid);
+        assert_eq!(painted(&app, wid).under, under, "constant bytes, frame {i}");
+        assert_eq!(
+            app.windows[&wid].input_scratch.cells[line_row], row,
+            "frame {i}"
+        );
+    }
+    assert_eq!(
+        crate::work_counts::take_card_layouts(),
+        0,
+        "nothing laid out"
+    );
+    assert_eq!(
+        crate::work_counts::take_card_line_inks(),
+        0,
+        "nothing inked"
+    );
+    assert_eq!(
+        crate::work_counts::take_card_ticks(),
+        0,
+        "the settled frame, replayed"
+    );
+    // Cancelled: Cruise's own words again.
+    assert!(app.autopilot_timers.forget(session));
+    frame(&mut app, wid);
+    assert_eq!(read(&app, &plain), plain, "the timer gone");
+    assert!(!glass_text(&app, wid, line_row, 0..120).contains('\u{2913}'));
+    set_now(None);
     host.shutdown_and_join();
 }
 
@@ -497,11 +1040,14 @@ fn a_capture_resplice_never_doubles_the_light() {
     host.shutdown_and_join();
 }
 
-/// EPISODES, THEN STILLNESS (§3; `presence_fp_is_zero_over_a_thousand_idle_frames`
-/// is the template): a card first decorated plays its episode — a frame
-/// ahead each step, the repaint key moving every frame — then asks once for
-/// its settled frame, and from there its key is constant and no wake is
-/// armed, over a thousand idle frames. Focus regained plays it again.
+/// EPISODES, THEN STILLNESS (§3): a card first decorated plays its episode — a
+/// frame ahead each step, the repaint key moving every frame — then asks once
+/// for its settled frame, and from there its key is constant and no wake is
+/// armed, over a thousand idle frames. Focus regained plays it again, the
+/// kitty in the seat the glass showed and the trail whole (`harness_card`'s
+/// `Ride`, review of slice 5b): no snap back to the trail's start.
+/// NEGATIVE CONTROL: the first episode's first frame rides (the kitty left of
+/// its seat, no trail yet).
 #[test]
 fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     let (mut app, wid, session) = glass(120);
@@ -514,6 +1060,7 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     set_now(t0);
     assert_eq!(app.claude_card_deadline(t0), None, "nothing on show yet");
     frame(&mut app, wid);
+    let riding = card_streams(&app, wid);
     let mut last_fp = app.claude_footer_fp(wid, &plan);
     let mut t = 0;
     while t + FRAME_MS < EPISODE_MS {
@@ -548,6 +1095,7 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     frame(&mut app, wid);
     let settled = app.claude_footer_fp(wid, &plan);
     let quads = painted(&app, wid).under.clone();
+    let at_rest = card_streams(&app, wid);
     for i in 0..1000u64 {
         let t = end + Duration::from_millis(1 + i * 7);
         set_now(t);
@@ -574,6 +1122,24 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
         Some(back + Duration::from_millis(FRAME_MS)),
         "drawn: the next frame a frame on"
     );
+    let replayed = card_streams(&app, wid);
+    assert_eq!(
+        kitty_x(&replayed),
+        kitty_x(&at_rest),
+        "the kitty stays seated"
+    );
+    assert_eq!(
+        trail_span(&replayed),
+        trail_span(&at_rest),
+        "the trail whole"
+    );
+    assert!(kitty_x(&at_rest).is_some() && trail_span(&at_rest).is_some());
+    // CONTROL: the first episode rode in.
+    assert!(
+        kitty_x(&riding) < kitty_x(&at_rest),
+        "the first episode rides"
+    );
+    assert_ne!(trail_span(&riding), trail_span(&at_rest));
     // NEGATIVE CONTROL: an unfocused window draws the settled frame and arms
     // nothing.
     app.windows.get_mut(&wid).unwrap().focused = false;
@@ -720,7 +1286,12 @@ fn card_rows(cols: usize, model: &str) -> Vec<String> {
 /// text column (four boxed rows); a busy row under the card puts it on the
 /// banner row two cells past the banner (three boxed rows) and the kitty
 /// after it; a narrow pane narrows the words, then drops them; a wide last
-/// glyph ends a row one cell later (`CardPlace::ends`).
+/// glyph ends a row one cell later (`CardPlace::ends`). The kitty stands
+/// three rows tall where the working directory's row is blank from the
+/// trail's start to the kitty's margin — a glyph anywhere in that span, at
+/// either end of it, keeps it two rows tall, one past it does not (the row
+/// is read no further) — and the read is one of the layout's noted tests
+/// ([`Seen`]): a glyph put in the span after it fails them.
 #[test]
 fn the_layout_follows_the_designs_rules() {
     let texts = vec!["w".repeat(40), "v".repeat(20)];
@@ -763,6 +1334,73 @@ fn the_layout_follows_the_designs_rules() {
         (start + TRAIL_MAX + 6 + KITTY_MARGIN).max(11 + 2 + 40)
     );
     assert!(l.cols <= 119);
+    // The tall kitty: `~/aterm` ends long before the trail starts.
+    assert_eq!(l.kitty_rows, 3, "a short path: three rows tall");
+    let margin_end = start + TRAIL_MAX + 6 + KITTY_MARGIN;
+    let path_row = |at: usize| {
+        let mut r = rows.clone();
+        let head: String = r[3].chars().collect();
+        let pad = at - head.chars().count();
+        r[3] = format!("{head}{}x", " ".repeat(pad));
+        r
+    };
+    for (at, tall) in [
+        (start - 1, 3),
+        (start, 2),
+        (start + TRAIL_MAX / 2, 2),
+        (start + TRAIL_MAX + 3, 2),
+        (margin_end - 1, 2),
+        (margin_end, 3),
+    ] {
+        let l = lay(&path_row(at), 120, 6).expect("laid out");
+        assert!(l.kitty_col.is_some(), "a glyph at {at}: the kitty stays");
+        assert_eq!(l.kitty_rows, tall, "a glyph on the path row at {at}");
+    }
+    {
+        let s = scratch_of(&rows, 120);
+        let place = aterm_phase::launch_card_place(&rows).expect("a card");
+        let pane = PaneGeom {
+            strip: 0,
+            row_off: 0,
+            col_off: 0,
+            rows: rows.len(),
+            cols: 120,
+        };
+        let cells = PaneCells {
+            scratch: &s,
+            pane,
+            blank: RenderCell::default(),
+        };
+        let mut seen = Seen::default();
+        let l = layout(&cells, &place, 6, &texts, &mut seen).expect("laid out");
+        assert_eq!(l.kitty_rows, 3);
+        assert!(
+            seen.0.contains(&Probe::Blanks {
+                row: 3,
+                from: start,
+                to: margin_end,
+                len: margin_end - start
+            }),
+            "the path row's read, noted: {:?}",
+            seen.0
+        );
+        assert!(seen.hold(&cells), "the same cells hold");
+        let moved = scratch_of(&path_row(margin_end - 1), 120);
+        let cells = PaneCells {
+            scratch: &moved,
+            ..cells
+        };
+        assert!(
+            !seen.hold(&cells),
+            "CONTROL: a glyph in the span fails them"
+        );
+        let past = scratch_of(&path_row(margin_end), 120);
+        let cells = PaneCells {
+            scratch: &past,
+            ..cells
+        };
+        assert!(seen.hold(&cells), "one past the span: never read");
+    }
     // Text under the card: the line goes on the banner row, the box keeps
     // three rows and the kitty rides after the line.
     let mut busy = rows.clone();
@@ -783,7 +1421,7 @@ fn the_layout_follows_the_designs_rules() {
     assert_eq!((l.line, l.rows), (None, 3));
     // No kitty art at this cell size: the trail goes with it.
     let l = lay(&rows, 120, 0).expect("laid out");
-    assert_eq!((l.kitty_col, l.trail), (None, None));
+    assert_eq!((l.kitty_col, l.trail, l.kitty_rows), (None, None, 2));
     // A wide last glyph on the working directory row ends it a cell later.
     let mut wide = rows.clone();
     wide[3] =
@@ -816,6 +1454,182 @@ fn the_layout_follows_the_designs_rules() {
     let l = layout(&cells, &place, 0, &short, &mut Seen::default()).expect("laid out");
     assert_eq!(l.cols, 38, "the working directory's wide glyph, whole");
     assert!(38 > banner_end.max(model_end).max(11 + LINE_LEAD + 1));
+}
+
+/// The pane width a corpus capture was taken at: its name's `-<n>col`, else
+/// its provenance line's `(<cols>x<rows>`, else its widest row.
+fn capture_cols(name: &str, text: &str, rows: &[String]) -> usize {
+    let digits_before = |s: &str, at: usize| {
+        let head = &s[..at];
+        let from = head
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map_or(0, |i| i + 1);
+        head[from..].parse::<usize>().ok()
+    };
+    let by_name = name.rfind("col.txt").and_then(|at| digits_before(name, at));
+    let by_header = text.lines().next().and_then(|line| {
+        let open = line.find(" (")? + 2;
+        let tail = &line[open..];
+        let x = tail.find('x')?;
+        tail[..x].parse::<usize>().ok()
+    });
+    by_name
+        .or(by_header)
+        .unwrap_or_else(|| rows.iter().map(|r| text_cells(r)).max().unwrap_or(80))
+}
+
+/// THE TALL KITTY OVER THE CORPUS (§10.6.3): every launch card in
+/// `aterm-phase`'s fixtures that the reader places (about 150, Claude Code
+/// 2.1.302's workspace card among them), laid out at its capture's width,
+/// stands the kitty three rows tall exactly where the card's working
+/// directory row is blank from the trail's start to the kitty's margin —
+/// judged here from the row's text — and two rows tall elsewhere. CONTROL:
+/// each card again with its path run on past the trail's start stands the
+/// kitty two rows tall, its place and its trail unchanged.
+#[test]
+fn every_recorded_card_stands_the_kitty_tall_only_beside_a_blank_path_row() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("the fixtures")
+        .map(|e| e.expect("a fixture").path())
+        .collect();
+    paths.sort();
+    let kc = usize::from(kitty_cols(9, 18));
+    let texts = line_texts(AutopilotView::Cruise, LineEnd::Mode);
+    let lay = |rows: &[String], cols: usize| {
+        let s = scratch_of(rows, cols);
+        let place = aterm_phase::launch_card_place(rows)?;
+        let pane = PaneGeom {
+            strip: 0,
+            row_off: 0,
+            col_off: 0,
+            rows: rows.len(),
+            cols,
+        };
+        let cells = PaneCells {
+            scratch: &s,
+            pane,
+            blank: RenderCell::default(),
+        };
+        layout(&cells, &place, kc, texts, &mut Seen::default())
+            .map(|l| (place, l.trail, l.kitty_col, l.kitty_rows))
+    };
+    let (mut tall, mut short, mut bare, mut workspace) = (0, 0, 0, 0);
+    for path in paths {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let rows = aterm_phase::prompt::fixtures::screen(&text);
+        let cols = capture_cols(&name, &text, &rows);
+        let Some((place, trail, kitty_col, rows_tall)) = lay(&rows, cols) else {
+            continue;
+        };
+        let (Some((start, _)), Some(kitty_col)) = (trail, kitty_col) else {
+            assert_eq!(rows_tall, 2, "{name}: no kitty");
+            bare += 1;
+            continue;
+        };
+        let path_row = place.top + 2;
+        let end = kitty_col + kc + KITTY_MARGIN;
+        let blank = rows[path_row]
+            .chars()
+            .chain(std::iter::repeat(' '))
+            .skip(start)
+            .take(end - start)
+            .all(|c| c == ' ');
+        assert_eq!(
+            rows_tall,
+            if blank { 3 } else { 2 },
+            "{name}: {:?}",
+            rows[path_row]
+        );
+        if blank {
+            tall += 1;
+        } else {
+            short += 1;
+        }
+        if name.contains("-workspace-") {
+            assert_eq!(rows_tall, 3, "{name}: the workspace card's short path");
+            workspace += 1;
+        }
+        // CONTROL: the path runs on to the kitty's column.
+        let mut long = rows.clone();
+        let head: String = long[path_row].trim_end().to_string();
+        let run = kitty_col.saturating_sub(text_cells(&head)).max(1);
+        long[path_row] = format!(
+            "{head}{}",
+            "/deep".repeat(run).chars().take(run).collect::<String>()
+        );
+        let (_, trail_long, kitty_long, rows_long) =
+            lay(&long, cols).unwrap_or_else(|| panic!("{name}: the long path's card"));
+        assert_eq!((trail_long, kitty_long), (trail, Some(kitty_col)), "{name}");
+        assert_eq!(
+            rows_long, 2,
+            "{name}: CONTROL: a long path keeps it two rows tall"
+        );
+    }
+    assert!(
+        tall + short + bare >= 140 && tall >= 100 && workspace >= 1,
+        "the corpus must exercise the layout: {tall} tall, {short} short, {bare} bare, \
+         {workspace} workspace"
+    );
+}
+
+/// THE TALL KITTY ON THE GLASS: beside the card's short path the scene says
+/// three rows and the kitty's opaque art is the tall art — 21 of its square
+/// pixels tall, its head where the two-row kitty's is, so at this cell size
+/// it reaches past the two-row art's feet; a path run on past the trail's
+/// start keeps the two-row art, 14 pixels tall. CONTROL: the two cards
+/// differ in the path row alone.
+#[test]
+fn the_kitty_stands_three_rows_tall_beside_a_short_path() {
+    for (long_path, rows_tall, art_h) in [(false, 3u8, 21), (true, 2, 14)] {
+        let (mut app, wid, session) = glass(120);
+        if long_path {
+            let mut screen = card_screen(24, 120, MODEL, VERSION);
+            screen[3] = format!(
+                "{}/a/working/directory/that/runs/on/past/the/trail",
+                screen[3]
+            );
+            feed(&app, session, &screen);
+        }
+        let host = supervise(&mut app, session);
+        frame(&mut app, wid);
+        let strip = strip_rows(&app, wid);
+        let (_, ch) = app.win_cell_size(wid);
+        let p = (ch - (ch / 14).max(1)) / 7;
+        assert!(p >= 1, "a kitty at {ch} px");
+        let art: Vec<&GlowQuad> = painted(&app, wid)
+            .over
+            .iter()
+            .filter(|q| q.alpha == u8::MAX)
+            .collect();
+        assert!(!art.is_empty(), "long path {long_path}: the kitty");
+        let y0 = art.iter().map(|q| usize::from(q.y)).min().unwrap();
+        let y1 = art
+            .iter()
+            .map(|q| usize::from(q.y) + usize::from(q.h))
+            .max()
+            .unwrap();
+        // The card's banner is pane row 1: the head sits half the two-row
+        // art above the line between the card's first two rows.
+        assert_eq!(
+            y0,
+            (strip + 2) * ch - 7 * p,
+            "long path {long_path}: the head"
+        );
+        assert_eq!(
+            y1 - y0,
+            art_h * p,
+            "long path {long_path}: the art's height"
+        );
+        let scene = app.windows[&wid].claude_card.entries[0]
+            .laid
+            .as_ref()
+            .and_then(|(_, laid)| laid.as_ref())
+            .map(|(_, scene)| scene.kitty_rows);
+        assert_eq!(scene, Some(rows_tall), "long path {long_path}");
+        host.shutdown_and_join();
+    }
 }
 
 /// The switch reads on by default, and its Manual row and default are
@@ -1294,7 +2108,7 @@ fn a_native_tab_in_front_arms_no_card_wake() {
         Some(at(FRAME_MS)),
         "CONTROL"
     );
-    assert!(app.open_harness_settings(wid));
+    assert!(app.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top));
     assert!(matches!(
         app.active_visible_content_route(wid),
         Some(crate::VisibleContentRoute::Native { .. })
@@ -2316,7 +3130,7 @@ fn layout_cells_read(app: &App, wid: WindowId, key: &LaidKey) -> usize {
         &pane_cells(scratch, key),
         &key.place,
         kitty_width(key),
-        line_texts(key.view),
+        line_texts(key.view, key.end),
         &mut Seen::default(),
     );
     assert!(laid.is_some(), "the card is laid out");
@@ -3011,4 +3825,61 @@ fn an_episode_cut_off_by_lost_focus_rests_at_no_cost() {
         set_now(None);
         host.shutdown_and_join();
     }
+}
+
+/// A zone re-derivation can keep HH:MM and another-day presence while
+/// changing the weekday. The same timer that changes the card's words
+/// must move the footer key that admits their next composition.
+#[test]
+fn a_timer_weekday_change_moves_the_footer_key_with_its_card_words() {
+    use crate::autopilot_timers::AutopilotTimers;
+    use crate::claude_lights::{ChipGlass, WindowLights};
+
+    let now = Instant::now();
+    let wall = 20_000 * 86_400_000_i64 + 12 * 3_600_000;
+    let at = wall + 86_400_000;
+    let session = 17;
+    let mut timers = AutopilotTimers::default();
+    let lights = WindowLights::default();
+    let west = |_: i64| Some(-10 * 3600);
+    let east = |_: i64| Some(14 * 3600);
+    let term = |glass| {
+        lights.autopilot_term(
+            session,
+            Some(Autopilot::Cruise),
+            AutopilotView::Cruise,
+            ChipGlass {
+                land_at: glass,
+                ..ChipGlass::default()
+            },
+        )
+    };
+    let words = |glass| {
+        line_texts(
+            AutopilotView::Cruise,
+            LineEnd::Mode.timed(AutopilotView::Cruise, glass),
+        )
+    };
+
+    assert!(timers.arm(session, at, now, wall, &west, None));
+    let before = timers.glass(session).expect("armed face");
+    let before_key = term(Some(before));
+    let before_words = words(Some(before));
+    assert_ne!(before_key, term(None), "CONTROL: arming moves the key");
+    assert_ne!(before_words, words(None), "CONTROL: armed timer words");
+    assert!(timers.rederive(now, wall, &west).is_empty());
+    assert_eq!(term(timers.glass(session)), before_key);
+    assert_eq!(words(timers.glass(session)), before_words);
+
+    assert_eq!(timers.rederive(now, wall, &east), vec![session]);
+    let after = timers.glass(session).expect("re-derived face");
+    assert_eq!(before.clock, after.clock, "the same HH:MM");
+    assert!(before.other_day.is_some() && after.other_day.is_some());
+    assert_ne!(before.other_day, after.other_day);
+    assert_ne!(words(Some(after)), before_words, "the card's words moved");
+    assert_ne!(
+        term(Some(after)),
+        before_key,
+        "TIMER_WEEKDAY_DISPLAY_MUST_MOVE_FOOTER_KEY"
+    );
 }

@@ -1,0 +1,29 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 140x45 (aterm 0.105.0 b4ea2ef5a, the harness on), the person's own muse (Meta's installer: `~/.local/bin/muse` execs `muse-bin-1.4.10-R6427.1`), signed in, model muse-wonder-full-1.0 at xhigh, Auto-review, at the end of a real 21-minute task (dogfood: reviewing aterm's muse reader) · rows from its last tool row down · the reply `◆ Top finding: …` ending `  ATERM-TASK-DONE`, then two FOOTNOTES drawn dim (676c74): `◆ Worked for 21m 21s · 3:59 PM · 16/Oct` and `◆ Recap: Finished the … review …` with its wrapped row nine columns in; and in the empty composer a PROMPT HINT `❯ /export saves the conversation to a text file` (the caret 5aa0ff, the hint fg 676c74, no dim attribute; a typed draft is ccd3db) with the cursor at column 2, its start · cursor=25,2 (visible) · the home path redacted at equal length
+◆ Ran 3 commands · Correct reader line cites · Fix exact cite lines · +1 ✓ · 0.7s · ctrl+o
+
+◆ Top finding: my drawer/picker screens (/settings, /model, /effort, marketplace removal, Computer Use setup) have no reader grammar at all,
+  so at authoritative idle the harness would type its continuation into a drawer and its Enter would confirm an arbitrary row.
+
+  Full ranked review (16 sections, file:line cites and verbatim 1.4.10 rows throughout) is in dogfood-muse.md. Next worst: the
+  session-scoped Yes, and don't ask again… grant can be pressed as a one-shot allow via the allow_once fallback, and the network/file/tool
+  approval titles plus the staged keys active in a moment form can leave a live approval reading as nothing. Also covered: recap/background
+  ◆ blocks stealing said_tail/ATERM-TASK-DONE, dead-login and quota turn failures never becoming a wall/Limited, unjoined wrapped
+  (Recommended) labels, shell mode and side chat, the eight-label top rule vs the one-string sniff, prompt-hint/@-menu phantom drafts, and
+  one UNVERIFIED item flagged for a mid-stream capture.
+
+  Verified intact: all 29 muse tests pass and every 1.4.9 anchor is present in the 1.4.10 binary (canary re-run against it); trust box,
+  sign-in wall, status rows, retract and ctrl-c were also confirmed live on a scratch 1.4.10 instance. No tracked file was modified
+  (git diff empty; only the untracked report added), and per the operator constraint the signed-out instance was not driven further and its
+  browser option was never pressed.
+
+  ATERM-TASK-DONE
+
+◆ Worked for 21m 21s · 3:59 PM · 16/Oct
+
+◆ Recap: Finished the Muse 1.4.10 screen-reader review and wrote dogfood-muse.md. Next action: hand the ranked findings to the owner for
+         follow-up.
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /export saves the conversation to a text file
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  muse-wonder-full-1.0 · xhigh · ~/Developer/aterm-dogfood · Auto-review

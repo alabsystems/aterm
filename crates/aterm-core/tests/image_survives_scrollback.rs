@@ -133,3 +133,36 @@ fn a_live_image_keeps_its_row_while_the_viewport_is_partly_scrolled_back() {
         "a one-line scroll moves the live footprint down exactly one row"
     );
 }
+
+/// A window made shorter and then taller again brings its top rows back from
+/// history with their pictures, and they still scroll off whole afterwards, even
+/// when the screen was erased while they were in history.
+#[test]
+fn an_image_a_taller_window_brings_back_keeps_its_tiles() {
+    for erase in ["", "\x1b[2J\x1b[H"] {
+        let mut term = Terminal::new(8, 20);
+        place_card(&mut term, "inline=1;width=4;height=1");
+        term.process(b"\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+        let live = frame_image_cells(&term.cell_frame(8, 20));
+        assert_eq!(live.len(), 4, "precondition: the picture is on screen");
+        term.resize(4, 20);
+        term.process(erase.as_bytes());
+        term.resize(8, 20);
+        if erase.is_empty() {
+            assert_eq!(
+                frame_image_cells(&term.cell_frame(8, 20)),
+                live,
+                "the revealed row keeps its picture"
+            );
+        }
+        for i in 0..20 {
+            term.process(format!("\r\nf{i}").as_bytes());
+        }
+        term.scroll_to_top();
+        assert_eq!(
+            frame_image_cells(&term.cell_frame(8, 20)).len(),
+            4,
+            "{erase:?}: scrolled off again, the picture is still in history"
+        );
+    }
+}

@@ -1,0 +1,43 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the network box answered with the digit `4` (its refusal): `◆ Fetched <url> — denied`, the result `tool failed: web_fetch failed: network access denied` · the lab's random project dir is spelled /private/tmp/at.lab0 here
+◆ Interrupted · Report issues with /feedback
+
+❯ toolstart
+
+◆ Ran touch probe-a.txt — denied
+  └ approval aborted
+    The user rejected this action. Don't retry it unless they ask.
+
+◆ Ran 2 commands · Create the third probe · Create the second probe · 18s · ctrl+o
+
+◆ Tool call done. Result: { "chunk_id": "exec-2-1", "exit_code": 0, "terminal_status": "completed", "output": "", "original_output_bytes": 0,
+  "original_output_tokens": 0, "truncated": false }
+
+❯ toolstart
+
+◆ Ran ls -l /private/tmp/at.lab0/proj/lab.sock — failed
+  └ unix_socket_paths requires managed macOS sandboxing with proxy-only networking
+
+◆ Tool call done. Result: tool failed: unix_socket_paths requires managed macOS sandboxing with proxy-only networking
+
+❯ toolstart
+
+◆ Ran curl -sS -m 5 http://lab-probe.invalid/ ; env | grep -i _proxy | cut -c1-60 — failed
+  └ environment failure: sandbox enforcement unavailable: macOS sandbox executable `/usr/bin/sandbox-exec` failed enforcement probe: allowed pro
+    be write did not complete, status=exit status: 71, stderr=sandbox-exec: sandbox_apply: Operation not permitted
+
+    The execution environment is broken: the command was never started and every later command will fail the same way. Do not retry and do not f
+    abricate command output; report this environment failure.
+
+◆ Tool call done. Result: tool failed: environment failure: sandbox enforcement unavailable: macOS sandbox executable /usr/bin/sandbox-exec
+  failed enforcement probe: allowed probe write did not complete, status=exit status:~
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed: network access denied
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

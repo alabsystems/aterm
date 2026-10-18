@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-theme-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aterm's community theme pack: permissively licensed third-party palettes, embedded with their notices and installed as theme files"
+
+# The pack lives in contrib/themes/pack/; build.rs embeds it. A crate of its
+# own so a pack edit rebuilds this crate and its few users, not every crate
+# that depends on aterm-types.
+
+[dependencies]
+aterm-types = { workspace = true }
+
+[build-dependencies]
+# The theme-id grammar the build refuses a manifest row by is the one the
+# themes folder reads with: `scheme::validate_user_theme_name`.
+aterm-types = { workspace = true }
+
+[dev-dependencies]
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

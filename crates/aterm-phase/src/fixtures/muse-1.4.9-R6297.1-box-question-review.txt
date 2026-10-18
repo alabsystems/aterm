@@ -1,0 +1,15 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own), harness off · after the last question's Enter: the review row `  Review answers before submit` (bold) `· Enter to edit or submit · ↑/↓ to move · Esc to go back` (676c74), the answers `    Colour: Red (Recommended)` and `    Size: Small (Recommended)`, `  ⟩ Submit answers` focused (bold 5aa0ff) and `    Interrupt turn`; Enter on `Submit answers` sends them (a single multi-select question shows this screen too) · cursor=2,33 (hidden) · scratch path redacted at equal length
+❯ ASKTWO please
+
+◆ Request user input Colour, Size — running (7s)
+
+  Review answers before submit · Enter to edit or submit · ↑/↓ to move · Esc to go back
+    Colour: Red (Recommended)
+    Size: Small (Recommended)
+  ⟩ Submit answers
+    Interrupt turn
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Auto-review

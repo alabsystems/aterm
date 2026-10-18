@@ -165,8 +165,8 @@ pub enum OlderHistoryRefusal {
         /// The history, still at the width it was built for.
         older: OlderHistory,
     },
-    /// The grid keeps no in-memory tiered store (a ring-only or disk-backed
-    /// grid) to place history in front of.
+    /// The grid keeps no tiered store (a ring-only grid) to place history in
+    /// front of.
     NoTieredStore(OlderHistory),
     /// The pane's scrollback was cleared (ED3, a reset) after the keys were
     /// reserved ([`OlderHistoryClaim`]), so the history stays cleared: the

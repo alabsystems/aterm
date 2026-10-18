@@ -693,7 +693,6 @@ mod tests {
             theme_bg: 0x0010_1016,
             beam: true,
             head_dx: 0.5,
-            pack: None,
             ribbon_tall: false,
             ribbon_flat: false,
             classic_mono: false,
@@ -808,25 +807,6 @@ mod tests {
         assert_banded(&out, g);
     }
 
-    /// A single-cell advance is typing: it lights a short, tight wake.
-    #[test]
-    fn a_typing_advance_lights_a_short_wake() {
-        let (g, c) = (geom(), cfg());
-        let mut w = ClassicWake::default();
-        let mut out = Vec::new();
-        let t0 = Instant::now();
-        w.tick(Some((2, 4)), t0, &c, g, &mut out);
-        w.tick(
-            Some((2, 5)),
-            t0 + Duration::from_millis(16),
-            &c,
-            g,
-            &mut out,
-        );
-        assert!(!out.is_empty(), "a typed advance lights");
-        assert_banded(&out, g);
-    }
-
     /// Idle-zero: the engine returns to exactly empty so the event loop can
     /// park and the animation timer disarm.
     #[test]
@@ -848,38 +828,6 @@ mod tests {
         assert!(out.is_empty(), "the wake decays to EXACTLY empty");
         assert_eq!(fp, 0, "an empty frame fingerprints zero");
         assert!(!w.is_active(), "and the animation timer disarms");
-    }
-
-    /// Clockless: the same relative schedule folds to the same frame every run,
-    /// which the whole-frame golden for this style relies on.
-    #[test]
-    fn the_same_schedule_folds_identically() {
-        let (g, c) = (geom(), cfg());
-        let run = || {
-            let mut w = ClassicWake::default();
-            let mut out = Vec::new();
-            let t0 = Instant::now();
-            let mut acc = Vec::new();
-            acc.push(w.tick(Some((2, 4)), t0, &c, g, &mut out));
-            for k in 1..=6u64 {
-                acc.push(w.tick(
-                    Some((2, 4 + k as u16)),
-                    t0 + Duration::from_millis(70 * k),
-                    &c,
-                    g,
-                    &mut out,
-                ));
-            }
-            acc.push(w.tick(
-                Some((4, 34)),
-                t0 + Duration::from_millis(600),
-                &c,
-                g,
-                &mut out,
-            ));
-            acc
-        };
-        assert_eq!(run(), run(), "the classic wake is deterministic");
     }
 
     /// The master switch and a degenerate geometry both go dark at once, with

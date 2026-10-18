@@ -43,6 +43,24 @@ pub struct Screen {
     /// sent in [`Self::rows`]), `None` when absent: what a question's policy text is
     /// estimated to fit in.
     pub pane_rows: Option<usize>,
+    /// The server's launch witness at the read (`"launch"`, read under the rows' lock
+    /// and judged against this read's own `"human_seq"`), when it says `person`: the
+    /// shell's last signed command start recorded the person count this read carries,
+    /// and no gesture has been counted since. `None` for every other word, `null`, a
+    /// malformed witness and a host that sends none.
+    pub launch: Option<LaunchWitness>,
+}
+
+/// A `person` launch witness ([`Screen::launch`]; aterm-gui's `launch_witness`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchWitness {
+    /// The command start it was recorded at, one per command line: a witness
+    /// answers one box.
+    pub id: u64,
+    /// The person count recorded in the hold that parsed the command start.
+    pub seq: u64,
+    /// The command's first word: `claude` or `codex`.
+    pub word: String,
 }
 
 /// The server's person stamp on a read ([`Screen::human`]).
@@ -176,6 +194,17 @@ pub fn parse_text_json(body: &str) -> Result<Screen, String> {
         human_seq: v.get("human_seq").and_then(Json::as_u64),
         cols: num(v.get("dims"), "cols").and_then(|c| u16::try_from(c).ok()),
         pane_rows: num(v.get("dims"), "rows").and_then(|r| usize::try_from(r).ok()),
+        launch: v.get("launch").and_then(launch_witness),
+    })
+}
+
+/// A `"launch"` value that says `person`, whole; anything else is none.
+fn launch_witness(v: &Json) -> Option<LaunchWitness> {
+    (v.get("why")?.as_str()? == "person").then_some(())?;
+    Some(LaunchWitness {
+        id: v.get("id")?.as_u64()?,
+        seq: v.get("seq")?.as_u64()?,
+        word: v.get("word")?.as_str()?.to_string(),
     })
 }
 
@@ -387,6 +416,35 @@ pub fn cell_is_dim(line: &str) -> bool {
         .is_some_and(|attrs| attrs.split(',').any(|a| a == "dim"))
 }
 
+/// A valid cell-style reply distinguishes the placeholder from typed text;
+/// missing/malformed evidence stays unknown. The server uses the same attribute
+/// vocabulary through `aterm_codec::cell`.
+#[must_use]
+pub fn cell_is_placeholder(line: &str, hint_fg: Option<&str>) -> Option<bool> {
+    let style = aterm_codec::cell::parse_style(line)?;
+    if style.dim {
+        return Some(true);
+    }
+    match hint_fg {
+        None => Some(false),
+        Some(hint) if aterm_codec::hex::is_hex(hint, 6) => {
+            Some(style.fg.eq_ignore_ascii_case(hint))
+        }
+        Some(_) => None,
+    }
+}
+
+/// Whether one `cell` reply draws its glyph in the colour `fg` (`rrggbb`, the
+/// reply's second field): a placeholder a program marks by its colour, not
+/// the `dim` attribute ([`aterm_phase::ScreenReader::placeholder_fg`]).
+#[must_use]
+pub fn cell_fg_is(line: &str, fg: &str) -> bool {
+    line.trim_end()
+        .strip_prefix("OK ")
+        .and_then(|rest| rest.split(' ').nth(1))
+        .is_some_and(|c| c.eq_ignore_ascii_case(fg))
+}
+
 /// The `<field>=` word of a `status` reply (`-` and absent are `None`).
 pub fn status_field<'s>(stdout: &'s str, field: &str) -> Option<&'s str> {
     let line = stdout.lines().find(|l| crate::is_ok_reply(l))?;
@@ -508,6 +566,40 @@ mod tests {
         assert_eq!(with(""), HumanInput::Unknown, "an older host");
         assert_eq!(with(r#","human_ms":"12""#), HumanInput::Unknown);
         assert_eq!(with(r#","human_ms":-3"#), HumanInput::Unknown);
+    }
+
+    /// `"launch"` (the server's launch witness, in the shape aterm-gui's
+    /// `launch_witness` writes it): a `person` witness is read whole; every
+    /// other word, `null`, a missing field and an older host that sends none
+    /// are no witness.
+    #[test]
+    fn only_a_whole_person_launch_witness_is_read() {
+        let with = |tail: &str| {
+            parse_text_json(&format!(
+                r#"{{"rows":[],"cursor":{{"row":0,"col":0}},"dims":{{"rows":2,"cols":2}},"seq":15,"gen":"2.15","human_ms":900,"human_seq":4{tail}}}"#
+            ))
+            .expect("parses")
+            .launch
+        };
+        assert_eq!(
+            with(r#","launch":{"id":3,"seq":4,"word":"claude","why":"person"},"trimmed":1"#),
+            Some(LaunchWitness {
+                id: 3,
+                seq: 4,
+                word: "claude".to_string()
+            })
+        );
+        for other in [
+            r#","launch":{"why":"since"}"#,
+            r#","launch":{"why":"typed"}"#,
+            r#","launch":{"id":3,"seq":4,"word":"claude","why":"pending"}"#,
+            r#","launch":{"id":3,"word":"claude","why":"person"}"#,
+            r#","launch":{"id":3,"seq":"4","word":"claude","why":"person"}"#,
+            r#","launch":null"#,
+            "",
+        ] {
+            assert_eq!(with(other), None, "{other}");
+        }
     }
 
     /// A `tail=` read's `first` maps the cursor's grid row onto the rows read; a full read

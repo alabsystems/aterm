@@ -432,18 +432,3 @@ fn self_contradicting_rows_are_refused() {
     };
     assert!(cat_wrong_style.validate().is_err());
 }
-
-#[test]
-fn a_recorded_take_outlasts_its_keys() {
-    let cold = PaintRow {
-        keys: "",
-        ..row(Expect::TrailDark, Capture::PinnedVideo, Style::Flying)
-    };
-    assert_eq!(cold.record_secs(), 5);
-    let mature = PaintRow {
-        keys: "t,h,e,r,a,i,n,b,o,w,k,i,t,t,y,p,a,i,n,t,s,t,h,e,a,r,c,o,k",
-        ..cold
-    };
-    // 0.7 + 28 * 0.12 + 29 * 0.15 + 1.0 = 9.41 s
-    assert_eq!(mature.record_secs(), 10);
-}

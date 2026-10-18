@@ -19,6 +19,10 @@
 //! fourth reports which way this host went.
 
 #![cfg(target_os = "macos")]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
+)]
 
 use std::ffi::{CStr, c_void};
 

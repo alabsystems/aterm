@@ -7,26 +7,39 @@
 //! Modified by the aterm project in 2026; see the repository NOTICE.
 //!
 //! The Wayland window.
+//!
+//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the window's
+//! objects are made here on first-party `aterm-wayland`'s tables (sctk's `XdgShell::
+//! create_window` made them before), with listeners that record their events in the loop's
+//! inbox: the `xdg_surface`'s configure is acked as it arrives, as sctk acked it. A window
+//! dropped on another thread lets go of its state before it tells the loop it closed, so the
+//! loop's reference is the last and the window's objects are destroyed on the loop's thread,
+//! between dispatches, never while it dispatches their events.
 
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sctk::reexports::client::protocol::wl_display::WlDisplay;
-use sctk::reexports::client::protocol::wl_surface::WlSurface;
-use sctk::reexports::client::{Proxy, QueueHandle};
-
-use sctk::compositor::{CompositorState, Region, SurfaceData};
-use sctk::reexports::protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
-use sctk::shell::xdg::window::{Window as SctkWindow, WindowDecorations};
-use sctk::shell::WaylandSurface;
-
+use aterm_types::native_window::NativeWindow;
+use aterm_wayland::protocols::fractional_scale_v1::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
+use aterm_wayland::protocols::viewporter::{wp_viewport, wp_viewporter};
+use aterm_wayland::protocols::wayland::{wl_callback, wl_compositor, wl_region, wl_surface};
+use aterm_wayland::protocols::xdg_activation_v1::{xdg_activation_token_v1, xdg_activation_v1};
+use aterm_wayland::protocols::xdg_decoration_unstable_v1::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
+use aterm_wayland::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use aterm_wayland::proxy::{EventArg, Proxy};
 use tracing::warn;
 
 use crate::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{Ime, WindowEvent};
+use crate::platform_impl::common::poll::Waker;
 use crate::platform_impl::{
     Fullscreen, MonitorHandle as PlatformMonitorHandle, OsError, PlatformIcon,
 };
@@ -37,40 +50,35 @@ use crate::window::{
 
 use super::event_loop::sink::EventSink;
 use super::output::MonitorHandle;
-use super::state::WinitState;
-use super::types::xdg_activation::XdgActivationTokenData;
+use super::state::Connection;
+use super::wire::{self, Inbox, Owned, ToplevelEvent, Wire};
 use super::{ActiveEventLoop, WaylandError, WindowId};
 
 pub(crate) mod state;
 
 pub use state::WindowState;
+use state::{protocol_string, WindowObjects};
 
 /// The Wayland window.
 pub struct Window {
-    /// Reference to the underlying SCTK window.
-    window: SctkWindow,
-
     /// Window id.
     window_id: WindowId,
 
-    /// The state of the window.
-    window_state: Arc<Mutex<WindowState>>,
+    /// The state of the window; let go first when the window drops (see `Drop`).
+    window_state: ManuallyDrop<Arc<Mutex<WindowState>>>,
 
-    /// Compositor to handle WlRegion stuff.
-    compositor: Arc<CompositorState>,
+    /// The `wl_surface`, live as long as the window state.
+    surface: Proxy,
 
-    /// The wayland display used solely for raw window handle.
-    #[allow(dead_code)]
-    display: WlDisplay,
+    /// The `xdg_toplevel`, live as long as the window state.
+    toplevel: Proxy,
 
     /// Xdg activation to request user attention.
-    xdg_activation: Option<XdgActivationV1>,
+    // A window may remain callable after the event loop drops its global.
+    xdg_activation: Option<Arc<Owned>>,
 
-    /// The state of the requested attention from the `xdg_activation`.
-    attention_requested: Arc<AtomicBool>,
-
-    /// Handle to the main queue to perform requests.
-    queue_handle: QueueHandle<WinitState>,
+    /// The loop's inbox, for the activation token's event.
+    inbox: Inbox,
 
     /// Window requests to the event loop.
     window_requests: Arc<WindowRequests>,
@@ -78,11 +86,15 @@ pub struct Window {
     /// Observed monitors.
     monitors: Arc<Mutex<Vec<MonitorHandle>>>,
 
-    /// Source to wake-up the event-loop for window requests.
-    event_loop_awakener: calloop::ping::Ping,
+    /// Wakes the event loop for window requests.
+    event_loop_awakener: Waker,
 
     /// The event sink to deliver synthetic events.
     window_events_sink: Arc<Mutex<EventSink>>,
+
+    /// Retain the display through every global above, including activation.
+    #[allow(dead_code)]
+    connection: Arc<Connection>,
 }
 
 impl Window {
@@ -90,36 +102,134 @@ impl Window {
         event_loop_window_target: &ActiveEventLoop,
         attributes: WindowAttributes,
     ) -> Result<Self, RootOsError> {
-        let queue_handle = event_loop_window_target.queue_handle.clone();
         let mut state = event_loop_window_target.state.borrow_mut();
-
+        let inbox = state.inbox.clone();
         let monitors = state.monitors.clone();
-
-        let surface = state.compositor_state.create_surface(&queue_handle);
-        let compositor = state.compositor_state.clone();
-        let xdg_activation =
-            state.xdg_activation.as_ref().map(|activation_state| activation_state.global().clone());
-        let display = event_loop_window_target.connection.display();
+        let compositor = state.compositor();
+        let xdg_activation = state.xdg_activation.clone();
+        let connection = Arc::clone(&state.connection);
 
         let size: Size = attributes.inner_size.unwrap_or(LogicalSize::new(800., 600.).into());
 
-        // We prefer server side decorations, however to not have decorations we ask for client
-        // side decorations instead.
-        let default_decorations = if attributes.decorations {
-            WindowDecorations::RequestServer
-        } else {
-            WindowDecorations::RequestClient
+        // SAFETY: the live compositor; every object below is this window's, owned by its
+        // state, and each listener's events go to the loop's inbox.
+        let surface = unsafe { wl_compositor::create_surface(compositor) }
+            .ok_or_else(|| os_error!(OsError::from(WaylandError::Missing("a wl_surface"))))?;
+        let window_id = super::make_wid(surface);
+        // SAFETY: as above.
+        let surface_owned = unsafe {
+            Owned::listened(surface, wl_surface::destroy, &inbox, move |_, opcode, args| {
+                wire::surface_event(opcode, args)
+                    .map(|event| Wire::Surface { surface: window_id, event })
+            })
         };
 
-        let window =
-            state.xdg_shell.create_window(surface.clone(), default_decorations, &queue_handle);
+        let wm_base = state.xdg_shell.wm_base();
+        // SAFETY: the shell's live wm_base and the role-less surface made above.
+        let xdg = unsafe { xdg_wm_base::get_xdg_surface(wm_base, surface) }
+            .ok_or_else(|| os_error!(OsError::from(WaylandError::Missing("an xdg_surface"))))?;
+        let configured = move |xdg: Proxy, opcode: u32, args: &[EventArg<'_>]| match (opcode, args)
+        {
+            (xdg_surface::evt::CONFIGURE, [EventArg::Uint(serial)]) => {
+                // Acked as it arrives, before the loop hears it (sctk's order).
+                // SAFETY: the live xdg_surface the event came from.
+                unsafe { xdg_surface::ack_configure(xdg, *serial) };
+                Some(Wire::Toplevel { window: window_id, event: ToplevelEvent::Configured })
+            },
+            _ => None,
+        };
+        // SAFETY: as above.
+        let xdg_owned = unsafe { Owned::listened(xdg, xdg_surface::destroy, &inbox, configured) };
+        // SAFETY: the live xdg_surface.
+        let toplevel = unsafe { xdg_surface::get_toplevel(xdg) }
+            .ok_or_else(|| os_error!(OsError::from(WaylandError::Missing("an xdg_toplevel"))))?;
+        // SAFETY: as above.
+        let toplevel_owned = unsafe {
+            Owned::listened(toplevel, xdg_toplevel::destroy, &inbox, move |_, opcode, args| {
+                toplevel_event(opcode, args)
+                    .map(|event| Wire::Toplevel { window: window_id, event })
+            })
+        };
 
+        // We prefer server side decorations, however to not have decorations we ask for client
+        // side decorations instead.
+        let decoration = state.xdg_shell.decoration_manager().and_then(|manager| {
+            // SAFETY: the shell's live decoration manager and the toplevel made above.
+            let decoration =
+                unsafe { zxdg_decoration_manager_v1::get_toplevel_decoration(manager, toplevel) }?;
+            // SAFETY: as above.
+            let decoration = unsafe {
+                Owned::listened(
+                    decoration,
+                    zxdg_toplevel_decoration_v1::destroy,
+                    &inbox,
+                    move |_, opcode, args| match (opcode, args) {
+                        (zxdg_toplevel_decoration_v1::evt::CONFIGURE, [EventArg::Uint(mode)]) => {
+                            Some(Wire::Toplevel {
+                                window: window_id,
+                                event: ToplevelEvent::DecorationMode(*mode),
+                            })
+                        },
+                        _ => None,
+                    },
+                )
+            };
+            let mode = if attributes.decorations {
+                zxdg_toplevel_decoration_v1::mode::SERVER_SIDE
+            } else {
+                zxdg_toplevel_decoration_v1::mode::CLIENT_SIDE
+            };
+            // SAFETY: the live decoration object.
+            unsafe { zxdg_toplevel_decoration_v1::set_mode(decoration.proxy(), mode) };
+            Some(decoration)
+        });
+
+        // The viewport and the fractional scale, where the compositor offers fractional
+        // scaling.
+        let viewport = state.viewporter.as_ref().and_then(|viewporter| {
+            // SAFETY: the live viewporter and this window's surface.
+            let viewport = unsafe { wp_viewporter::get_viewport(viewporter.proxy(), surface) }?;
+            // SAFETY: a viewport made here, without events.
+            Some(unsafe { Owned::new(viewport, wp_viewport::destroy) })
+        });
+        let fractional_scale = state.fractional_scaling_manager.as_ref().and_then(|manager| {
+            // SAFETY: the live manager and this window's surface.
+            let scale = unsafe {
+                wp_fractional_scale_manager_v1::get_fractional_scale(manager.proxy(), surface)
+            }?;
+            // SAFETY: as above.
+            Some(unsafe {
+                Owned::listened(
+                    scale,
+                    wp_fractional_scale_v1::destroy,
+                    &inbox,
+                    move |_, opcode, args| match (opcode, args) {
+                        (wp_fractional_scale_v1::evt::PREFERRED_SCALE, [EventArg::Uint(scale)]) => {
+                            Some(Wire::PreferredScale { window: window_id, scale: *scale })
+                        },
+                        _ => None,
+                    },
+                )
+            })
+        });
+
+        let objects = WindowObjects {
+            frame_callback: None,
+            attention_token: None,
+            viewport,
+            fractional_scale,
+            decoration,
+            toplevel: toplevel_owned,
+            xdg_surface: xdg_owned,
+            surface: surface_owned,
+        };
         let mut window_state = WindowState::new(
-            event_loop_window_target.connection.clone(),
-            &event_loop_window_target.queue_handle,
-            &state,
+            Arc::clone(&state.compositor),
+            Arc::clone(&state.xdg_shell),
+            Arc::clone(&state.seats_book),
+            Arc::clone(&connection),
             size,
-            window.clone(),
+            objects,
             attributes.preferred_theme,
         );
 
@@ -133,7 +243,7 @@ impl Window {
 
         // Set the app_id.
         if let Some(name) = attributes.platform_specific.name.map(|name| name.general) {
-            window.set_app_id(name);
+            window_state.set_app_id(&name);
         }
 
         // Set the window title.
@@ -154,17 +264,14 @@ impl Window {
             Some(Fullscreen::Exclusive(_)) => {
                 warn!("`Fullscreen::Exclusive` is ignored on Wayland");
             },
-            #[cfg_attr(not(x11_platform), allow(clippy::bind_instead_of_map))]
             Some(Fullscreen::Borderless(monitor)) => {
-                let output = monitor.and_then(|monitor| match monitor {
-                    PlatformMonitorHandle::Wayland(monitor) => Some(monitor.proxy),
-                    #[cfg(x11_platform)]
-                    PlatformMonitorHandle::X(_) => None,
-                });
-
-                window.set_fullscreen(output.as_ref())
+                with_live_output(&monitors, monitor, |output| {
+                    // SAFETY: the live toplevel and an output still bound.
+                    unsafe { xdg_toplevel::set_fullscreen(toplevel, output) }
+                })
             },
-            _ if attributes.maximized => window.set_maximized(),
+            // SAFETY: the live toplevel.
+            _ if attributes.maximized => unsafe { xdg_toplevel::set_maximized(toplevel) },
             _ => (),
         };
 
@@ -179,12 +286,27 @@ impl Window {
             window_state.set_resize_increments(Some(increments));
         }
 
+        // Activate the window with the launcher's token, before the initial commit, so
+        // the compositor raises and focuses it and ends the launch's startup sequence.
+        if let (Some(xdg_activation), Some(token)) =
+            (xdg_activation.as_ref(), attributes.platform_specific.activation_token)
+        {
+            // SAFETY: the live activation global and this window's surface.
+            unsafe {
+                xdg_activation_v1::activate(
+                    xdg_activation.proxy(),
+                    &protocol_string(&token),
+                    surface,
+                )
+            };
+        }
+
         // XXX Do initial commit.
-        window.commit();
+        // SAFETY: this window's live surface.
+        unsafe { wl_surface::commit(surface) };
 
         // Add the window and window requests into the state.
         let window_state = Arc::new(Mutex::new(window_state));
-        let window_id = super::make_wid(&surface);
         state.windows.get_mut().insert(window_id, window_state.clone());
 
         let window_requests = WindowRequests {
@@ -197,44 +319,80 @@ impl Window {
         // Setup the event sync to insert `WindowEvents` right from the window.
         let window_events_sink = state.window_events_sink.clone();
 
-        let mut wayland_source = event_loop_window_target.wayland_dispatcher.as_source_mut();
-        let event_queue = wayland_source.queue();
-
         // Do a roundtrip.
-        event_queue.roundtrip(&mut state).map_err(|error| {
-            os_error!(OsError::WaylandError(Arc::new(WaylandError::Dispatch(error))))
-        })?;
+        let queue = &state.connection.queue;
+        let result = queue.roundtrip();
+        state.drain();
+        result.map_err(|error| os_error!(OsError::from(error)))?;
 
         // XXX Wait for the initial configure to arrive.
         while !window_state.lock().unwrap().is_configured() {
-            event_queue.blocking_dispatch(&mut state).map_err(|error| {
-                os_error!(OsError::WaylandError(Arc::new(WaylandError::Dispatch(error))))
-            })?;
+            let result = state.connection.queue.dispatch();
+            state.drain();
+            result.map_err(|error| os_error!(OsError::from(error)))?;
         }
 
         // Wake-up event loop, so it'll send initial redraw requested.
-        let event_loop_awakener = event_loop_window_target.event_loop_awakener.clone();
-        event_loop_awakener.ping();
+        let event_loop_awakener = event_loop_window_target.waker.clone();
+        event_loop_awakener.wake();
 
         Ok(Self {
-            window,
-            display,
-            monitors,
             window_id,
-            compositor,
-            window_state,
-            queue_handle,
+            window_state: ManuallyDrop::new(window_state),
+            surface,
+            toplevel,
+            connection,
             xdg_activation,
-            attention_requested: Arc::new(AtomicBool::new(false)),
-            event_loop_awakener,
+            inbox,
             window_requests,
+            monitors,
+            event_loop_awakener,
             window_events_sink,
         })
     }
 
     pub(crate) fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
-        NonNull::new(self.window.xdg_toplevel().id().as_ptr().cast())
+        NonNull::new(self.toplevel.as_ptr())
     }
+}
+
+/// An `xdg_toplevel` event, decoded.
+fn toplevel_event(opcode: u32, args: &[EventArg<'_>]) -> Option<ToplevelEvent> {
+    use xdg_toplevel::evt;
+    Some(match (opcode, args) {
+        (
+            evt::CONFIGURE,
+            [EventArg::Int(width), EventArg::Int(height), EventArg::Array(states)],
+        ) => {
+            ToplevelEvent::Configure { width: *width, height: *height, states: wire::words(states) }
+        },
+        (evt::CLOSE, []) => ToplevelEvent::Close,
+        (evt::CONFIGURE_BOUNDS, [EventArg::Int(width), EventArg::Int(height)]) => {
+            ToplevelEvent::Bounds { width: *width, height: *height }
+        },
+        (evt::WM_CAPABILITIES, [EventArg::Array(capabilities)]) => {
+            ToplevelEvent::Capabilities(wire::words(capabilities))
+        },
+        _ => return None,
+    })
+}
+
+/// Make `request` with the output `monitor` names, while it is still bound (a monitor handle
+/// may outlive its output), or with `None`, which lets the compositor choose. The monitors'
+/// lock is held for the request: the loop releases a removed output only while holding it.
+fn with_live_output(
+    monitors: &Mutex<Vec<MonitorHandle>>,
+    monitor: Option<PlatformMonitorHandle>,
+    request: impl FnOnce(Option<Proxy>),
+) {
+    let monitors = monitors.lock().unwrap();
+    let output = match monitor {
+        Some(PlatformMonitorHandle::Wayland(monitor)) => {
+            monitors.iter().find(|m| **m == monitor).map(|m| m.output.proxy())
+        },
+        _ => None,
+    };
+    request(output);
 }
 
 impl Window {
@@ -293,13 +451,26 @@ impl Window {
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            self.event_loop_awakener.ping();
+            self.event_loop_awakener.wake();
         }
     }
 
     #[inline]
     pub fn pre_present_notify(&self) {
-        self.window_state.lock().unwrap().request_frame_callback();
+        let inbox = self.inbox.clone();
+        let window_id = self.window_id;
+        self.window_state.lock().unwrap().request_frame_callback(|surface| {
+            // SAFETY: the window's live surface; the callback is the window's, and ends with
+            // its one event.
+            let callback = unsafe { wl_surface::frame(surface) }?;
+            // SAFETY: as above; the proxy is destroyed client-side once done (the protocol
+            // ends the object with its event).
+            Some(unsafe {
+                Owned::listened(callback, Proxy::destroy, &inbox, move |_, opcode, _| {
+                    (opcode == wl_callback::evt::DONE).then_some(Wire::Frame { window: window_id })
+                })
+            })
+        });
     }
 
     #[inline]
@@ -426,6 +597,13 @@ impl Window {
         self.window_state.lock().unwrap().is_decorated()
     }
 
+    /// LOCAL PATCH (aterm), LW.5: the decorations the application must draw
+    /// ([`WindowState::client_decorations`]).
+    #[inline]
+    pub fn client_decorations(&self) -> Option<crate::platform::wayland::ClientDecorations> {
+        self.window_state.lock().unwrap().client_decorations()
+    }
+
     #[inline]
     pub fn set_window_level(&self, _level: WindowLevel) {}
 
@@ -440,7 +618,8 @@ impl Window {
             return;
         }
 
-        self.window.set_minimized();
+        // SAFETY: the window's live toplevel (the state holds it while the window lives).
+        unsafe { xdg_toplevel::set_minimized(self.toplevel) };
     }
 
     #[inline]
@@ -456,10 +635,13 @@ impl Window {
 
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
-        if maximized {
-            self.window.set_maximized()
-        } else {
-            self.window.unset_maximized()
+        // SAFETY: the window's live toplevel.
+        unsafe {
+            if maximized {
+                xdg_toplevel::set_maximized(self.toplevel)
+            } else {
+                xdg_toplevel::unset_maximized(self.toplevel)
+            }
         }
     }
 
@@ -488,17 +670,14 @@ impl Window {
             Some(Fullscreen::Exclusive(_)) => {
                 warn!("`Fullscreen::Exclusive` is ignored on Wayland");
             },
-            #[cfg_attr(not(x11_platform), allow(clippy::bind_instead_of_map))]
             Some(Fullscreen::Borderless(monitor)) => {
-                let output = monitor.and_then(|monitor| match monitor {
-                    PlatformMonitorHandle::Wayland(monitor) => Some(monitor.proxy),
-                    #[cfg(x11_platform)]
-                    PlatformMonitorHandle::X(_) => None,
-                });
-
-                self.window.set_fullscreen(output.as_ref())
+                with_live_output(&self.monitors, monitor, |output| {
+                    // SAFETY: the window's live toplevel and an output still bound.
+                    unsafe { xdg_toplevel::set_fullscreen(self.toplevel, output) }
+                })
             },
-            None => self.window.unset_fullscreen(),
+            // SAFETY: the window's live toplevel.
+            None => unsafe { xdg_toplevel::unset_fullscreen(self.toplevel) },
         }
     }
 
@@ -519,28 +698,51 @@ impl Window {
 
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
         let xdg_activation = match self.xdg_activation.as_ref() {
-            Some(xdg_activation) => xdg_activation,
+            Some(xdg_activation) => xdg_activation.proxy(),
             None => {
                 warn!("`request_user_attention` isn't supported");
                 return;
             },
         };
 
+        let mut window_state = self.window_state.lock().unwrap();
         // Urgency is only removed by the compositor and there's no need to raise urgency when it
         // was already raised.
-        if request_type.is_none() || self.attention_requested.load(Ordering::Relaxed) {
+        if request_type.is_none() || window_state.attention_requested {
             return;
         }
 
-        self.attention_requested.store(true, Ordering::Relaxed);
-        let surface = self.surface().clone();
-        let data = XdgActivationTokenData::Attention((
-            surface.clone(),
-            Arc::downgrade(&self.attention_requested),
-        ));
-        let xdg_activation_token = xdg_activation.get_activation_token(&self.queue_handle, data);
-        xdg_activation_token.set_surface(&surface);
-        xdg_activation_token.commit();
+        // SAFETY: the live activation global.
+        let Some(token) = (unsafe { xdg_activation_v1::get_activation_token(xdg_activation) })
+        else {
+            return;
+        };
+        window_state.attention_requested = true;
+        let window_id = self.window_id;
+        // SAFETY: a token made here, without a listener; the window's state owns it until its
+        // `done` is applied.
+        let token = unsafe {
+            Owned::listened(
+                token,
+                xdg_activation_token_v1::destroy,
+                &self.inbox,
+                move |_, opcode, args| match (opcode, args) {
+                    (xdg_activation_token_v1::evt::DONE, [EventArg::Str(token)]) => {
+                        Some(Wire::ActivationDone {
+                            window: window_id,
+                            token: wire::text(*token).unwrap_or_default(),
+                        })
+                    },
+                    _ => None,
+                },
+            )
+        };
+        // SAFETY: the live token and the window's live surface.
+        unsafe {
+            xdg_activation_token_v1::set_surface(token.proxy(), self.surface);
+            xdg_activation_token_v1::commit(token.proxy());
+        }
+        window_state.objects.attention_token = Some(token);
     }
 
     #[inline]
@@ -567,17 +769,22 @@ impl Window {
 
     #[inline]
     pub fn set_cursor_hittest(&self, hittest: bool) -> Result<(), ExternalError> {
-        let surface = self.window.wl_surface();
-
+        let compositor = self.window_state.lock().unwrap().compositor();
         if hittest {
-            surface.set_input_region(None);
+            // SAFETY: the window's live surface.
+            unsafe { wl_surface::set_input_region(self.surface, None) };
             Ok(())
         } else {
-            let region = Region::new(&*self.compositor).map_err(|_| {
+            // SAFETY: the live compositor.
+            let region = unsafe { wl_compositor::create_region(compositor) }.ok_or_else(|| {
                 ExternalError::Os(os_error!(OsError::Misc("failed to set input region.")))
             })?;
-            region.add(0, 0, 0, 0);
-            surface.set_input_region(Some(region.wl_region()));
+            // SAFETY: the region made above, destroyed once here (the surface copies it).
+            unsafe {
+                wl_region::add(region, 0, 0, 0, 0);
+                wl_surface::set_input_region(self.surface, Some(region));
+                wl_region::destroy(region);
+            }
             Ok(())
         }
     }
@@ -600,7 +807,7 @@ impl Window {
         if window_state.ime_allowed() != allowed && window_state.set_ime_allowed(allowed) {
             let event = WindowEvent::Ime(if allowed { Ime::Enabled } else { Ime::Disabled });
             self.window_events_sink.lock().unwrap().push_window_event(event, self.window_id);
-            self.event_loop_awakener.ping();
+            self.event_loop_awakener.wake();
         }
     }
 
@@ -613,14 +820,8 @@ impl Window {
     pub fn focus_window(&self) {}
 
     #[inline]
-    pub fn surface(&self) -> &WlSurface {
-        self.window.wl_surface()
-    }
-
-    #[inline]
     pub fn current_monitor(&self) -> Option<MonitorHandle> {
-        let data = self.window.wl_surface().data::<SurfaceData>()?;
-        data.outputs().next().map(MonitorHandle::new)
+        self.window_state.lock().unwrap().outputs.first().cloned().map(MonitorHandle::new)
     }
 
     #[inline]
@@ -634,26 +835,16 @@ impl Window {
         None
     }
 
-    #[cfg(feature = "rwh_06")]
+    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
+    /// the Linux half): the window's handles for first-party `aterm_types::native_window`, which
+    /// the GL arm and the CPU presenter read; the opt-in `rwh_06` handle wraps this same answer.
     #[inline]
-    pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
-        Ok(rwh_06::WaylandWindowHandle::new({
-            let ptr = self.window.wl_surface().id().as_ptr();
-            std::ptr::NonNull::new(ptr as *mut _).expect("wl_surface will never be null")
-        })
-        .into())
-    }
-
-    #[cfg(feature = "rwh_06")]
-    #[inline]
-    pub fn raw_display_handle_rwh_06(
-        &self,
-    ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        Ok(rwh_06::WaylandDisplayHandle::new({
-            let ptr = self.display.id().as_ptr();
-            std::ptr::NonNull::new(ptr as *mut _).expect("wl_proxy should never be null")
-        })
-        .into())
+    pub fn native_window(&self) -> NativeWindow {
+        NativeWindow::Wayland {
+            display: NonNull::new(self.connection.display().as_ptr())
+                .expect("wl_display is never null"),
+            surface: NonNull::new(self.surface.as_ptr()).expect("wl_surface will never be null"),
+        }
     }
 
     #[inline]
@@ -676,8 +867,13 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.window_requests.closed.store(true, Ordering::Relaxed);
-        self.event_loop_awakener.ping();
+        // The window's reference to its state goes before the loop hears the window closed,
+        // so the loop's, dropped once it has (`take_closed`), is the last: the window's objects
+        // are destroyed on the loop's thread, never on this one while the loop dispatches them.
+        // SAFETY: the field is not used again; this is the window's drop.
+        unsafe { ManuallyDrop::drop(&mut self.window_state) };
+        self.window_requests.closed.store(true, Ordering::Release);
+        self.event_loop_awakener.wake();
     }
 }
 
@@ -692,8 +888,10 @@ pub struct WindowRequests {
 }
 
 impl WindowRequests {
+    /// Whether the window closed. Acquire, with the window's Release store: the window's own
+    /// reference to its state was gone before it.
     pub fn take_closed(&self) -> bool {
-        self.closed.swap(false, Ordering::Relaxed)
+        self.closed.swap(false, Ordering::Acquire)
     }
 
     pub fn take_redraw_requested(&self) -> bool {

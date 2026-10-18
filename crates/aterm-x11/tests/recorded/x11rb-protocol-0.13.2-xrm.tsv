@@ -1,0 +1,185 @@
+# Resource databases (x11rb-protocol 0.13.2 Database::new_from_data) and its
+# answer to each query (get_bytes), recorded 2026-10-17 by tests/recorder
+# (LW.6). db <name> <hex>; q <db> <name> <class> <=hex answer or ->
+db	xrdb	5866742e616e7469616c6961733a09310a5866742e6470693a093134340a5866742e68696e74696e673a09310a5866742e726762613a097267620a2a637573746f6d697a6174696f6e3a092d636f6c6f720a
+q	xrdb	Xft.dpi		=313434
+q	xrdb	Xft.dpi	Xft.Dpi	=313434
+q	xrdb	xft.dpi	Xft.Dpi	=313434
+q	xrdb	Xft.antialias		=31
+q	xrdb	Xft.rgba		=726762
+q	xrdb	Xft.missing		-
+q	xrdb	aterm.customization	ATerm.Customization	=2d636f6c6f72
+q	xrdb	aterm.background	ATerm.Background	-
+q	xrdb	aterm.foreground	ATerm.Foreground	-
+q	xrdb	other.foreground	Other.Foreground	-
+q	xrdb	aterm.font	ATerm.font	-
+q	xrdb	a.b		-
+q	xrdb	a.c		-
+q	xrdb	a.d		-
+q	xrdb	a.e		-
+q	xrdb	a.f		-
+q	xrdb	a.g		-
+q	xrdb	a.h		-
+q	xrdb	a.i		-
+q	xrdb	a		-
+q	xrdb	x.y		-
+q	xrdb	q.r.z		-
+q	xrdb			-
+q	xrdb	bad*query		-
+q	xrdb	Xft.?		-
+db	precedence	2a6470693a20310a5866742a6470693a20320a5866742e6470693a20330a3f2e6470693a20340a7866742e4470693a20350a5866742e3f3a20360a2a5866742e6470693a20370a5866742e6470693a20380a
+q	precedence	Xft.dpi		=38
+q	precedence	Xft.dpi	Xft.Dpi	=38
+q	precedence	xft.dpi	Xft.Dpi	=35
+q	precedence	Xft.antialias		-
+q	precedence	Xft.rgba		-
+q	precedence	Xft.missing		-
+q	precedence	aterm.customization	ATerm.Customization	-
+q	precedence	aterm.background	ATerm.Background	-
+q	precedence	aterm.foreground	ATerm.Foreground	-
+q	precedence	other.foreground	Other.Foreground	-
+q	precedence	aterm.font	ATerm.font	-
+q	precedence	a.b		-
+q	precedence	a.c		-
+q	precedence	a.d		-
+q	precedence	a.e		-
+q	precedence	a.f		-
+q	precedence	a.g		-
+q	precedence	a.h		-
+q	precedence	a.i		-
+q	precedence	a		-
+q	precedence	x.y		-
+q	precedence	q.r.z		-
+q	precedence			-
+q	precedence	bad*query		-
+q	precedence	Xft.?		-
+db	classes	617465726d2e4261636b67726f756e643a20636c6173730a617465726d2e6261636b67726f756e643a20696e7374616e63650a415465726d2a466f726567726f756e643a206c6f6f73652d636c6173730a2a666f726567726f756e643a206c6f6f73650a415465726d2e666f6e743a2074696768742d636c6173730a
+q	classes	Xft.dpi		-
+q	classes	Xft.dpi	Xft.Dpi	-
+q	classes	xft.dpi	Xft.Dpi	-
+q	classes	Xft.antialias		-
+q	classes	Xft.rgba		-
+q	classes	Xft.missing		-
+q	classes	aterm.customization	ATerm.Customization	-
+q	classes	aterm.background	ATerm.Background	=696e7374616e6365
+q	classes	aterm.foreground	ATerm.Foreground	=6c6f6f73652d636c617373
+q	classes	other.foreground	Other.Foreground	=6c6f6f7365
+q	classes	aterm.font	ATerm.font	=74696768742d636c617373
+q	classes	a.b		-
+q	classes	a.c		-
+q	classes	a.d		-
+q	classes	a.e		-
+q	classes	a.f		-
+q	classes	a.g		-
+q	classes	a.h		-
+q	classes	a.i		-
+q	classes	a		-
+q	classes	x.y		-
+q	classes	q.r.z		-
+q	classes			-
+q	classes	bad*query		-
+q	classes	Xft.?		-
+db	escapes	612e623a205c20206c656164696e672073706163650a612e633a207461625c74686572650a612e643a206e65775c6e6c696e650a612e653a206261636b5c5c736c6173680a612e663a206f6374616c5c3130315c31785c3737370a612e673a20636f6e74205c0a696e7565640a612e683a5c0a202020777261707065640a612e693a20747261696c696e675c
+q	escapes	Xft.dpi		-
+q	escapes	Xft.dpi	Xft.Dpi	-
+q	escapes	xft.dpi	Xft.Dpi	-
+q	escapes	Xft.antialias		-
+q	escapes	Xft.rgba		-
+q	escapes	Xft.missing		-
+q	escapes	aterm.customization	ATerm.Customization	-
+q	escapes	aterm.background	ATerm.Background	-
+q	escapes	aterm.foreground	ATerm.Foreground	-
+q	escapes	other.foreground	Other.Foreground	-
+q	escapes	aterm.font	ATerm.font	-
+q	escapes	a.b		=20206c656164696e67207370616365
+q	escapes	a.c		=7461625c7468657265
+q	escapes	a.d		=6e65770a6c696e65
+q	escapes	a.e		=6261636b5c736c617368
+q	escapes	a.f		=6f6374616c415c3178ff
+q	escapes	a.g		=636f6e7420696e756564
+q	escapes	a.h		=77726170706564
+q	escapes	a.i		=747261696c696e675c
+q	escapes	a		-
+q	escapes	x.y		-
+q	escapes	q.r.z		-
+q	escapes			-
+q	escapes	bad*query		-
+q	escapes	Xft.?		-
+db	malformed	6e6f20636f6c6f6e20686572650a3a20656d7074790a3f3a2077696c6463617264206c6173740a2e613a206f6b0a21636f6d6d656e743a206e6f0a23696e636c75646520226e6f7768657265220a2020612e6220203a20207370616365640a782e793a0a2a2e2a7a3a20646f74730a
+q	malformed	Xft.dpi		-
+q	malformed	Xft.dpi	Xft.Dpi	-
+q	malformed	xft.dpi	Xft.Dpi	-
+q	malformed	Xft.antialias		-
+q	malformed	Xft.rgba		-
+q	malformed	Xft.missing		-
+q	malformed	aterm.customization	ATerm.Customization	-
+q	malformed	aterm.background	ATerm.Background	-
+q	malformed	aterm.foreground	ATerm.Foreground	-
+q	malformed	other.foreground	Other.Foreground	-
+q	malformed	aterm.font	ATerm.font	-
+q	malformed	a.b		-
+q	malformed	a.c		-
+q	malformed	a.d		-
+q	malformed	a.e		-
+q	malformed	a.f		-
+q	malformed	a.g		-
+q	malformed	a.h		-
+q	malformed	a.i		-
+q	malformed	a		=6f6b
+q	malformed	x.y		=
+q	malformed	q.r.z		=646f7473
+q	malformed			-
+q	malformed	bad*query		-
+q	malformed	Xft.?		-
+db	bytes	612e623a20fffe207261770a612e633a20c3a974c3a90a
+q	bytes	Xft.dpi		-
+q	bytes	Xft.dpi	Xft.Dpi	-
+q	bytes	xft.dpi	Xft.Dpi	-
+q	bytes	Xft.antialias		-
+q	bytes	Xft.rgba		-
+q	bytes	Xft.missing		-
+q	bytes	aterm.customization	ATerm.Customization	-
+q	bytes	aterm.background	ATerm.Background	-
+q	bytes	aterm.foreground	ATerm.Foreground	-
+q	bytes	other.foreground	Other.Foreground	-
+q	bytes	aterm.font	ATerm.font	-
+q	bytes	a.b		=fffe20726177
+q	bytes	a.c		=c3a974c3a9
+q	bytes	a.d		-
+q	bytes	a.e		-
+q	bytes	a.f		-
+q	bytes	a.g		-
+q	bytes	a.h		-
+q	bytes	a.i		-
+q	bytes	a		-
+q	bytes	x.y		-
+q	bytes	q.r.z		-
+q	bytes			-
+q	bytes	bad*query		-
+q	bytes	Xft.?		-
+db	empty	
+q	empty	Xft.dpi		-
+q	empty	Xft.dpi	Xft.Dpi	-
+q	empty	xft.dpi	Xft.Dpi	-
+q	empty	Xft.antialias		-
+q	empty	Xft.rgba		-
+q	empty	Xft.missing		-
+q	empty	aterm.customization	ATerm.Customization	-
+q	empty	aterm.background	ATerm.Background	-
+q	empty	aterm.foreground	ATerm.Foreground	-
+q	empty	other.foreground	Other.Foreground	-
+q	empty	aterm.font	ATerm.font	-
+q	empty	a.b		-
+q	empty	a.c		-
+q	empty	a.d		-
+q	empty	a.e		-
+q	empty	a.f		-
+q	empty	a.g		-
+q	empty	a.h		-
+q	empty	a.i		-
+q	empty	a		-
+q	empty	x.y		-
+q	empty	q.r.z		-
+q	empty			-
+q	empty	bad*query		-
+q	empty	Xft.?		-

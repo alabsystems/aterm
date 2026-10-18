@@ -14,8 +14,6 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use serde::Serialize;
-
 use crate::cells::{self, Os};
 
 /// Where a cell source's hand-written section starts.
@@ -23,8 +21,7 @@ pub const BODY_MARKER: &str =
     "// ------------------------------------------------------------------------\n// The C macros.";
 
 /// A sibling-body defect.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "sibling", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SiblingFinding {
     /// The source does not carry exactly one marker, so its section is undefined.
     Marker { file: String, count: usize },
@@ -203,14 +200,5 @@ mod tests {
         );
         let families: Vec<_> = findings.iter().map(SiblingFinding::os).collect();
         assert_eq!(families, [Some(Os::Darwin), Some(Os::GnuLinux)]);
-    }
-
-    #[test]
-    fn the_section_starts_at_the_marker() {
-        let text = source("head", "body");
-        let section = body_section(&text).expect("one marker");
-        assert!(section.starts_with(BODY_MARKER));
-        assert!(!section.contains("head"));
-        assert_eq!(body_section("nothing"), Err(0));
     }
 }

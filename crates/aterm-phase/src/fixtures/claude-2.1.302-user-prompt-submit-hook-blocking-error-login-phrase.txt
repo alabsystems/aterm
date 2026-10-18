@@ -1,0 +1,24 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a UserPromptSubmit hook (command ./ue) that exits 2 with 'Not logged in · Please run /login' on stderr, the prompt typed twice and the draft cleared: Claude Code's ⏺ row (UserPromptSubmit operation blocked by hook:), the stderr behind the hook's command on the row under it, the original prompt below
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+⏺ UserPromptSubmit operation blocked by hook:
+  [./ue]: Not logged in · Please run /login
+
+
+  Original prompt: say nothing
+
+⏺ UserPromptSubmit operation blocked by hook:
+  [./ue]: Not logged in · Please run /login
+
+
+  Original prompt: say nothing
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

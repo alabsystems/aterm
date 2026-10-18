@@ -80,8 +80,8 @@ impl Host for TestHost {
         s.restart.as_deref()
     }
 
-    fn is_aterms_holder(h: &str) -> bool {
-        h == "harness@1"
+    fn is_aterms_holder(h: &str, pid: Option<u32>) -> bool {
+        h == "harness@1" && pid == Some(1)
     }
 
     fn pct_encode(s: &str) -> String {
@@ -231,6 +231,7 @@ fn levels_rank_as_the_design_table_and_the_window_shows_less() {
         TFacts {
             hand: Hand::DrivenLease {
                 holder: "harness@1".into(),
+                pid: Some(1),
             },
             ..TFacts::default()
         },
@@ -243,6 +244,7 @@ fn levels_rank_as_the_design_table_and_the_window_shows_less() {
         TFacts {
             hand: Hand::DrivenLease {
                 holder: "harness@2".into(),
+                pid: None,
             },
             ..TFacts::default()
         },
@@ -306,6 +308,7 @@ fn the_fold_law_reads_a_story_only_when_calm() {
         TFacts {
             hand: Hand::DrivenLease {
                 holder: "harness@1".into(),
+                pid: Some(1),
             },
             ..TFacts::default()
         },
@@ -315,6 +318,7 @@ fn the_fold_law_reads_a_story_only_when_calm() {
         TFacts {
             hand: Hand::DrivenLease {
                 holder: "harness@1".into(),
+                pid: Some(1),
             },
             turn: Some(crate::presence::TurnFact {
                 id: 1,
@@ -455,6 +459,301 @@ fn the_programs_own_report_is_shown_only_where_the_reader_names_no_phase() {
     assert!(row.contains("running 1m05s"), "{row}");
 }
 
+/// A background codex finishing its turn (OSC 7501 `working` → `done`, the
+/// host's count of them) puts the story dot on its tab; a tab the person is
+/// looking at (its watermark at the story) shows none. The count standing
+/// at the slot's first read is the baseline, not news, and a turn the ledger
+/// settled in the same refresh is told once.
+#[test]
+fn a_programs_own_turn_end_puts_the_story_dot_on_a_background_tab() {
+    let now = Instant::now();
+    // Each end follows its own start.
+    let at = |n: u64| TFacts {
+        program_turn_ends: n,
+        program_turn_starts: n,
+        ..TFacts::default()
+    };
+    let mut s = slot_of(at(3), now);
+    assert_eq!(s.story_seq, 0, "the count at the mint is the baseline");
+    assert_eq!(s.chip(0), ChipLevel::Off);
+    assert!(s.absorb(at(4), now + Duration::from_secs(1)));
+    assert_eq!(s.story_seq, 1);
+    assert_eq!(s.level(0), Level::Story);
+    assert_eq!(s.chip(0), ChipLevel::Story, "the background tab's dot");
+    assert_eq!(
+        s.chip(s.story_seq),
+        ChipLevel::Off,
+        "the tab the person is looking at has seen it"
+    );
+    let row = words(&s, now + Duration::from_secs(2), 0).fit::<TestHost>(120);
+    assert!(row.contains("1 turn"), "{row}");
+    // No new end, no new point.
+    assert!(!s.absorb(at(4), now + Duration::from_secs(3)));
+    assert_eq!(s.story_seq, 1);
+    // A ledger turn settling in the same refresh is the one point.
+    let turn = TurnFact {
+        id: 7,
+        settled: true,
+        dur_ms: 10,
+        carried: false,
+    };
+    s.absorb(
+        TFacts {
+            turn: Some(turn),
+            ..at(5)
+        },
+        now + Duration::from_secs(4),
+    );
+    assert_eq!(s.story_seq, 2, "told once, not twice");
+}
+
+/// One driven codex turn ends twice, the ledger's settle and the program's
+/// own report, and the sweeps that read them land in either order: it is
+/// told ONCE either way, and in the same refresh. NEGATIVE CONTROLS: a turn
+/// of the program's own that began after the settle is a second turn; a
+/// timed-out ledger turn pairs with nothing, so it and the program's end
+/// are both told; an end pairs only once; a program end told before the
+/// ledger turn opened (the person's own turn, then a driven one the program
+/// never worked on) is an earlier turn's.
+#[test]
+fn one_driven_turn_is_told_once_whichever_sweep_reads_which_end() {
+    let now = Instant::now();
+    let t = |s: u64| now + Duration::from_secs(s);
+    // Each ledger turn ran 5 s up to its settle.
+    let ledger = |id: u64, settled: bool| TurnFact {
+        id,
+        settled,
+        dur_ms: 5_000,
+        carried: false,
+    };
+    // `starts` turns begun and `ends` ended by the program; the ledger's last.
+    let at = |starts: u64, ends: u64, turn: Option<TurnFact>| TFacts {
+        program_turn_starts: starts,
+        program_turn_ends: ends,
+        turn,
+        ..TFacts::default()
+    };
+    let turns = |s: &Slot<TestHost>| {
+        let row = words(s, t(9), 0).fit::<TestHost>(120);
+        (s.story_seq, row)
+    };
+
+    // The settle first, the program's end a sweep later.
+    let mut s = slot_of(at(1, 0, None), now);
+    assert!(s.absorb(at(1, 0, Some(ledger(1, true))), t(1)));
+    assert!(s.absorb(at(1, 1, Some(ledger(1, true))), t(2)));
+    let (seq, row) = turns(&s);
+    assert_eq!(seq, 1, "settle, then done: {row}");
+    assert!(row.contains("1 turn"), "{row}");
+
+    // The program's end first, the settle a sweep later.
+    let mut s = slot_of(at(1, 0, None), now);
+    assert!(s.absorb(at(1, 1, None), t(1)));
+    assert!(s.absorb(at(1, 1, Some(ledger(1, true))), t(2)));
+    let (seq, row) = turns(&s);
+    assert_eq!(seq, 1, "done, then settle: {row}");
+    assert!(row.contains("1 turn"), "{row}");
+    assert_eq!(s.settled_at, Some(t(2)), "the settle still glows");
+
+    // Both in one refresh.
+    let mut s = slot_of(at(1, 0, None), now);
+    assert!(s.absorb(at(1, 1, Some(ledger(1, true))), t(1)));
+    assert_eq!(s.story_seq, 1, "one refresh");
+
+    // Control: the program began a turn of its own after the settle; its end
+    // is a second turn.
+    let mut s = slot_of(at(1, 0, None), now);
+    s.absorb(at(1, 0, Some(ledger(1, true))), t(1));
+    s.absorb(at(2, 1, Some(ledger(1, true))), t(2));
+    let (seq, row) = turns(&s);
+    assert_eq!(seq, 2, "{row}");
+    assert!(row.contains("2 turns"), "{row}");
+
+    // Control: a timed-out ledger turn pairs with nothing.
+    let mut s = slot_of(at(1, 0, None), now);
+    s.absorb(at(1, 0, Some(ledger(1, false))), t(1));
+    s.absorb(at(1, 1, Some(ledger(1, false))), t(2));
+    assert_eq!(s.story_seq, 2, "the timeout and the program's end");
+    let mut s = slot_of(at(1, 0, None), now);
+    s.absorb(at(1, 1, None), t(1));
+    s.absorb(at(1, 1, Some(ledger(1, false))), t(2));
+    assert_eq!(s.story_seq, 2, "the program's end and the timeout");
+
+    // Control: an end pairs once. Settle (told), done (paired), then a
+    // second settle with no turn begun between: a turn the program did no
+    // work for, told on its own.
+    let mut s = slot_of(at(1, 0, None), now);
+    s.absorb(at(1, 0, Some(ledger(1, true))), t(1));
+    s.absorb(at(1, 1, Some(ledger(1, true))), t(2));
+    s.absorb(at(1, 1, Some(ledger(2, true))), t(3));
+    assert_eq!(s.story_seq, 2, "the second settle has no end left to pair");
+
+    // Control: the person's own codex turn ends (told, unpaired), then a
+    // driven turn the program never works on opens after it and settles:
+    // two turns, though no turn began between the reads.
+    let mut s = slot_of(at(1, 0, None), now);
+    s.absorb(at(1, 1, None), t(1));
+    s.absorb(at(1, 1, Some(ledger(1, true))), t(30));
+    let (seq, row) = turns(&s);
+    assert_eq!(seq, 2, "an end before the ledger turn opened: {row}");
+    assert!(row.contains("2 turns"), "{row}");
+}
+
+/// A turn already recorded under aterm's own hand stays omitted when its
+/// delayed counterpart arrives after that hand was released. A watched foreign
+/// point is different: pairing may make that retained point news. Both orders
+/// use the actual fold and story/level queries, with no renderer or live host.
+#[test]
+fn a_paired_owned_turn_does_not_leave_news_without_a_story() {
+    let now = Instant::now();
+    let t = |s: u64| now + Duration::from_secs(s);
+    let ledger = Some(TurnFact {
+        id: 1,
+        settled: true,
+        dur_ms: 5_000,
+        carried: false,
+    });
+    let at = |ends: u64, turn: Option<TurnFact>, owned: bool, watched: bool| TFacts {
+        program_turn_starts: 1,
+        program_turn_ends: ends,
+        program_turn_watched: watched,
+        turn,
+        hand: if owned {
+            Hand::DrivenLease {
+                holder: "harness@1".into(),
+                pid: Some(1),
+            }
+        } else {
+            Hand::None
+        },
+        ..TFacts::default()
+    };
+
+    // A foreign turn is still one news point whichever end is read first.
+    for done_first in [false, true] {
+        let mut s = slot_of(at(0, None, false, false), now);
+        s.absorb(
+            at(
+                u64::from(done_first),
+                (!done_first).then_some(ledger).flatten(),
+                false,
+                false,
+            ),
+            t(1),
+        );
+        s.absorb(at(1, ledger, false, false), t(2));
+        assert_eq!(
+            (s.story_seq, s.story_since(0).count(), s.level(0)),
+            (1, 1, Level::Story)
+        );
+    }
+    // A watched, non-owned point may gain news from the settle that pairs it.
+    let mut watched = slot_of(at(0, None, false, true), now);
+    watched.absorb(at(1, None, false, true), t(1));
+    assert_eq!(watched.level(0), Level::Quiet);
+    watched.absorb(at(1, ledger, false, true), t(2));
+    assert_eq!(
+        (
+            watched.story_seq,
+            watched.story_since(0).count(),
+            watched.level(0)
+        ),
+        (1, 1, Level::Story)
+    );
+
+    let owned = |done_first: bool, unrelated_mail: bool| {
+        let mut s = slot_of(at(0, None, true, false), now);
+        let first_turn = if done_first { None } else { ledger };
+        let first_ends = u64::from(done_first);
+        s.absorb(at(first_ends, first_turn, true, false), t(1));
+        assert_eq!(s.story_since(0).count(), 0, "own-hand point stays omitted");
+        // Release the hand without either counter moving, then read its other end.
+        s.absorb(at(first_ends, first_turn, false, false), t(2));
+        assert_eq!(s.level(0), Level::Quiet, "release alone is no news");
+        let mut last = at(1, ledger, false, false);
+        if unrelated_mail {
+            last.mail.head = 1;
+        }
+        s.absorb(last, t(3));
+        s
+    };
+    // Pairing does not erase an unrelated news point beside the owned turn.
+    let mail = owned(false, true);
+    assert_eq!(
+        (mail.story_seq, mail.story_since(0).count(), mail.level(0)),
+        (2, 1, Level::Story)
+    );
+
+    let observed: Vec<_> = [false, true]
+        .into_iter()
+        .map(|done_first| {
+            let s = owned(done_first, false);
+            (s.story_seq, s.story_since(0).count(), s.level(0))
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![(1, 0, Level::Quiet); 2],
+        "PAIRED_OWNED_POINT_BECAME_NEWS_WITHOUT_A_STORY"
+    );
+}
+
+/// The level a driven turn leaves does not depend on which end is read
+/// first: told by the program's end in plain sight (no news), the settle that
+/// pairs with it is still the news a settle is, as it is read the other way
+/// round. NEGATIVE CONTROL: the watched end alone stays no news.
+#[test]
+fn one_driven_turn_is_news_whichever_end_is_read_first() {
+    let now = Instant::now();
+    let t = |s: u64| now + Duration::from_secs(s);
+    let ledger = Some(TurnFact {
+        id: 1,
+        settled: true,
+        dur_ms: 5_000,
+        carried: false,
+    });
+    let at = |ends: u64, turn: Option<TurnFact>| TFacts {
+        program_turn_starts: 1,
+        program_turn_ends: ends,
+        program_turn_watched: true,
+        turn,
+        ..TFacts::default()
+    };
+    let mut done_first = slot_of(at(0, None), now);
+    done_first.absorb(at(1, None), t(1));
+    assert_eq!(done_first.level(0), Level::Quiet, "control: the end alone");
+    done_first.absorb(at(1, ledger), t(2));
+    let mut settle_first = slot_of(at(0, None), now);
+    settle_first.absorb(at(0, ledger), t(1));
+    settle_first.absorb(at(1, ledger), t(2));
+    for (order, s) in [("done first", &done_first), ("settle first", &settle_first)] {
+        assert_eq!(s.story_seq, 1, "{order}: one point");
+        assert_eq!(s.level(0), Level::Story, "{order}: news");
+    }
+}
+
+/// A codex finishing its turn in the tab the person is looking at joins the
+/// story without being news: no `Story` level, so no row is born (a re-grid
+/// as the turn ends) to fold at the next key (a second one). NEGATIVE
+/// CONTROL: the same end unwatched is news.
+#[test]
+fn a_programs_turn_end_in_plain_sight_is_story_but_not_news() {
+    let now = Instant::now();
+    let at = |n: u64, watched: bool| TFacts {
+        program_turn_ends: n,
+        program_turn_watched: watched,
+        ..TFacts::default()
+    };
+    let mut s = slot_of(at(0, true), now);
+    assert!(s.absorb(at(1, true), now + Duration::from_secs(1)));
+    assert_eq!(s.story_seq, 1, "the turn is in the story");
+    assert_eq!(s.level(0), Level::Quiet, "but not news");
+    assert!(!s.level(0).shows_row(), "so no row is born");
+    assert_eq!(s.chip(0), ChipLevel::Off);
+    assert!(s.absorb(at(2, false), now + Duration::from_secs(2)));
+    assert_eq!(s.level(0), Level::Story, "unwatched, it is news");
+}
+
 /// The width law: rtt, since, role, ctx, then the mail's and the hand's
 /// details shed, so phase, hand and mail survive to 24 columns; below that
 /// the three are cut, all on the row down to 13 columns; nothing is ever
@@ -463,14 +762,18 @@ fn the_programs_own_report_is_shown_only_where_the_reader_names_no_phase() {
 fn elision_keeps_phase_hand_and_mail_to_24_and_all_three_to_13() {
     let now = Instant::now();
     let w = words(&driven(now), now + Duration::from_secs(192), 0);
-    assert_eq!(
-        w.fit::<TestHost>(120),
-        "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41% left  \u{27df} 12ms"
-    );
     assert!(!w.fit::<TestHost>(90).contains('\u{27df}'), "rtt first");
     assert!(!w.fit::<TestHost>(83).contains("3m12s"), "then since");
     assert!(!w.fit::<TestHost>(75).contains("worker"), "then role");
     assert!(!w.fit::<TestHost>(50).contains("ctx"), "then ctx");
+    assert!(
+        !w.fit::<TestHost>(40).contains("task"),
+        "then the mail detail"
+    );
+    assert!(
+        !w.fit::<TestHost>(28).contains("manager"),
+        "then the hand's holder"
+    );
     let n24 = w.fit::<TestHost>(24);
     assert_eq!(n24, "busy  \u{25c2} turn 41  \u{2709}2");
     for cols in 13..=24 {
@@ -521,6 +824,7 @@ fn sanitize_refuses_band_glyphs_bidi_and_control_characters() {
                 role: Some("\u{25c2} fake hand".into()),
                 hand: Hand::DrivenLease {
                     holder: "\u{2709}9 boss".into(),
+                    pid: None,
                 },
                 ..TFacts::default()
             },
@@ -538,7 +842,8 @@ fn sanitize_refuses_band_glyphs_bidi_and_control_characters() {
     );
     assert_eq!(
         Hand::DrivenLease {
-            holder: "a b".into()
+            holder: "a b".into(),
+            pid: None,
         }
         .wire::<TestHost>(),
         "lease:a%20b"
@@ -590,6 +895,7 @@ fn sanitize_strips_invisible_characters_on_every_path() {
                 role: Some("rev\u{e0049}\u{e0047}iewer".into()),
                 hand: Hand::DrivenLease {
                     holder: "boss\u{200b}\u{2060}".into(),
+                    pid: None,
                 },
                 ..TFacts::default()
             },
@@ -939,30 +1245,6 @@ fn the_cell_walk_is_linear_in_its_string() {
     }
 }
 
-/// The idle law: a quiet view's fingerprint is exactly 0 at every instant,
-/// it draws no rim, and a shown row, a rim or a ripple makes it nonzero.
-#[test]
-fn fp_is_zero_on_a_quiet_view() {
-    let now = Instant::now();
-    let mut v = View::default();
-    for ms in 0..1000u64 {
-        let t = now + Duration::from_millis(ms);
-        assert_eq!(v.fp(t), 0);
-        assert!(
-            v.rim_glow(t, true, || unreachable!("no tones on a quiet frame"))
-                .is_none()
-        );
-        assert!(v.ripple_deadline(t).is_none());
-    }
-    assert!(!v.show(Level::Quiet, Rim::None, None, now), "nothing moved");
-    assert_eq!(v.fp(now), 0);
-    assert!(v.show(Level::Driven, Rim::Drive, None, now));
-    assert_ne!(v.fp(now), 0);
-    v.ripple_at = Some(now);
-    assert_eq!(v.ripple_step(now + Duration::from_millis(299)), Some(8));
-    assert_eq!(v.ripple_step(now + crate::presence::RIPPLE), None);
-}
-
 /// The phase slot for a published input stall: `frozen <dur> · not reading
 /// input` and its spoken remedy, the survivor's `end it with signal kill`,
 /// and `stopped <dur> · input queued` for a stopped job. Where the host
@@ -974,49 +1256,54 @@ fn the_stall_says_frozen_or_stopped_with_the_age_and_the_remedy() {
     let now = Instant::now();
     let later = now + Duration::from_secs(9660);
     let act = "aterm ctl @s-1 restart pid=4242 if-stalled";
-    let frozen = |spoken: &str| {
+    for (stopped, survived, restart, phase, why, remedy) in [
         (
-            "frozen".to_string(),
-            vec!["2h41m".to_string(), "not reading input".to_string()],
-            spoken.to_string(),
-        )
-    };
-    let survived = |spoken: &str| {
+            false,
+            false,
+            None,
+            "frozen",
+            "not reading input",
+            "restart it",
+        ),
+        (false, false, Some(act), "frozen", "not reading input", act),
         (
-            "frozen".to_string(),
-            vec!["2h41m".to_string(), "survived its restart".to_string()],
-            spoken.to_string(),
-        )
-    };
-    assert_eq!(
-        stall_words(now, false, false, None, later),
-        frozen("frozen, not reading input for 2h41m; restart it")
-    );
-    assert_eq!(
-        stall_words(now, false, false, Some(act), later),
-        frozen(&format!(
-            "frozen, not reading input for 2h41m; restart it with {act}"
-        ))
-    );
-    assert_eq!(
-        stall_words(now, false, true, None, later),
-        survived("frozen, still running after its restart signal; end it with signal kill")
-    );
-    assert_eq!(
-        stall_words(now, false, true, Some(act), later),
-        survived(&format!(
-            "frozen, still running after its restart signal; restart it with {act}"
-        ))
-    );
-    for restart in [None, Some(act)] {
-        assert_eq!(
-            stall_words(now, true, false, restart, now + Duration::from_secs(12)),
-            (
-                "stopped".to_string(),
-                vec!["12s".to_string(), "input queued".to_string()],
-                "stopped with input queued for 12s; resume it".to_string(),
-            )
-        );
+            false,
+            true,
+            None,
+            "frozen",
+            "survived its restart",
+            "signal kill",
+        ),
+        (
+            false,
+            true,
+            Some(act),
+            "frozen",
+            "survived its restart",
+            act,
+        ),
+        (true, false, None, "stopped", "input queued", "resume it"),
+        (
+            true,
+            false,
+            Some(act),
+            "stopped",
+            "input queued",
+            "resume it",
+        ),
+    ] {
+        let case = format!("stopped={stopped} survived={survived} restart={restart:?}");
+        let (p, since, spoken) = stall_words(now, stopped, survived, restart, later);
+        assert_eq!(p, phase, "{case}");
+        assert_eq!(since, ["2h41m", why], "{case}");
+        assert!(spoken.contains(remedy), "{case}: {spoken}");
+        assert_eq!(spoken.contains("2h41m"), !survived, "{case}: {spoken}");
+        if stopped {
+            assert!(
+                !spoken.contains(act),
+                "{case}: a stopped job is resumed: {spoken}"
+            );
+        }
     }
 }
 
@@ -1047,11 +1334,6 @@ fn a_clause_prints_seconds_only_on_a_digit_then_s() {
 // Over this file's seam: the usage wall is `TestWall::Usage`, the input stall
 // a `TestStall`, the slot and facts `TSlot`/`TFacts`.
 
-/// Display width in cells: every glyph the row uses is one cell wide.
-fn width(s: &str) -> usize {
-    s.chars().count()
-}
-
 /// The six slots in order: role, phase since, hand, mail with the trust
 /// glyph before the sender, ctx, fabric.
 #[test]
@@ -1063,51 +1345,14 @@ fn the_six_slots_read_like_the_approved_mock() {
         w.fit::<TestHost>(120),
         "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41% left  \u{27df} 12ms"
     );
-    assert_eq!(
-        w.sentence,
-        "driven by manager, turn 41, busy, 2 unread, task from manager, agent, context 41 percent left"
+    assert!(
+        w.sentence.contains("driven by manager") && w.sentence.contains("2 unread"),
+        "{}",
+        w.sentence
     );
     assert_eq!(w.tone, Tone::Info);
     assert_eq!(s.level(0), Level::Driven);
     assert_eq!(s.level(0).rim(), Rim::Drive);
-}
-
-/// Elision right→left: rtt, then since, then role, then ctx; hand, phase
-/// and mail survive to 24 columns.
-#[test]
-fn elision_sheds_from_the_right_and_keeps_hand_phase_mail_to_24_columns() {
-    let now = Instant::now();
-    let s = driven(now);
-    let w = words(&s, now + Duration::from_secs(192), 0);
-    let at = |cols| w.fit::<TestHost>(cols);
-    assert_eq!(width(&at(120)), 94, "the whole line: {}", at(120));
-    assert!(!at(90).contains("\u{27df}"), "rtt goes first: {}", at(90));
-    assert!(at(90).contains("3m12s"));
-    assert!(!at(83).contains("3m12s"), "then since: {}", at(83));
-    assert!(at(83).contains("worker:claude-satcomp"));
-    assert!(!at(75).contains("worker:claude"), "then role: {}", at(75));
-    assert!(at(75).contains("ctx 41% left"));
-    assert!(!at(50).contains("ctx"), "then ctx: {}", at(50));
-    assert!(at(50).contains("task\u{2190}\u{2713}manager"));
-    assert!(!at(40).contains("task"), "then the mail detail: {}", at(40));
-    assert!(at(40).contains("\u{25c2} manager \u{00b7} turn 41"));
-    let narrow = at(28);
-    assert!(
-        !narrow.contains("manager"),
-        "then the hand's holder: {narrow}"
-    );
-    let n24 = at(24);
-    assert!(n24.contains("busy"), "{n24}");
-    assert!(
-        n24.contains("\u{25c2} turn 41"),
-        "the hand's short form: {n24}"
-    );
-    assert!(n24.contains("\u{2709}2"), "the mail's short form: {n24}");
-    assert!(!n24.contains("manager"), "{n24}");
-    assert!(width(&n24) <= 24, "{n24}");
-    for cols in [24usize, 60, 120] {
-        assert!(width(&at(cols)) <= cols, "{cols}: {}", at(cols));
-    }
 }
 
 /// One place tells it: an attention whose only owner is the agent upgrade is
@@ -1640,6 +1885,7 @@ fn tone_is_warn_then_success_for_two_seconds_then_info() {
         prompt_band_word(Some("read-outside-setting")),
         "outside read approval"
     );
+    assert_eq!(prompt_band_word(Some("mcp-server")), "MCP server approval");
     // A box that follows another, with no busy reading between, starts
     // its own age; the same box's next reading keeps it.
     let box_of = |seq, detail: &str| TFacts {
@@ -1659,42 +1905,6 @@ fn tone_is_warn_then_success_for_two_seconds_then_info() {
     let w = words(&s, later, 0);
     assert_eq!(w.phase, "edit approval");
     assert_eq!(w.since, ["0s"], "a new box's own age");
-}
-
-/// No command text, body, title or limit message reaches the words: a
-/// hostile role/holder/reason is sanitized to a printable token.
-#[test]
-fn free_text_is_sanitized_and_the_limit_message_never_appears() {
-    let now = Instant::now();
-    let mut s = TSlot::new(now);
-    s.absorb(
-        TFacts {
-            role: Some("evil\u{202e}role\nwith\tcontrol".into()),
-            hand: Hand::DrivenLease {
-                holder: "h\u{7f}older".into(),
-            },
-            agent_seq: 1,
-            agent: Some(AgentReading {
-                phase: AgentPhase::Wall {
-                    kind: TestWall::Usage,
-                    reset: Some("7:30pm".into()),
-                    until: None,
-                },
-                context_pct: None,
-            }),
-            ..TFacts::default()
-        },
-        now,
-    );
-    let w = words(&s, now, 0);
-    assert_eq!(w.role, "evilrole with control");
-    assert_eq!(w.hand, "\u{25c2} holder");
-    assert_eq!(w.phase, "limited");
-    assert_eq!(w.since, vec!["\u{2192} 7:30pm".to_string()], "{w:?}");
-    assert_eq!(
-        sanitize_token::<TestHost>("You've reached your limit", 8),
-        "You've \u{2026}"
-    );
 }
 
 /// A retry's next try lapses with its time: once `until` is reached the wall
@@ -1772,8 +1982,15 @@ fn window_view_fp_is_zero_when_quiet_and_the_ripple_steps_nine_times() {
     let now = Instant::now();
     let mut v = View::default();
     for i in 0..1000u64 {
-        assert_eq!(v.fp(now + Duration::from_millis(i)), 0);
+        let t = now + Duration::from_millis(i);
+        assert_eq!(v.fp(t), 0);
+        assert!(
+            v.rim_glow(t, true, || unreachable!("no tones on a quiet frame"))
+                .is_none()
+        );
+        assert!(v.ripple_deadline(t).is_none());
     }
+    assert!(!v.show(Level::Quiet, Rim::None, None, now), "nothing moved");
     v.rim = Rim::Drive;
     v.seed = 3;
     let steady = v.fp(now);

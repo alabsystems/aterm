@@ -2,213 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runtime invariant tests: verify assert_invariants holds after
-//! every sequence type, partial sequences, resets, and edge cases.
+//! Runtime invariant tests: `assert_invariants` holds from every
+//! representative state through every two-byte tail.
 
 use super::super::*;
-use super::RecordingSink;
-
-#[test]
-fn assert_invariants_new_parser() {
-    let parser = Parser::new();
-    // Should not panic - fresh parser is in valid state
-    parser.assert_invariants();
-}
-
-#[test]
-fn assert_invariants_after_plain_text() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    parser.advance(b"Hello, World!", &mut sink);
-    parser.assert_invariants();
-
-    // Verify the sink received all printable characters
-    let printed: String = sink.prints.iter().collect();
-    assert_eq!(printed, "Hello, World!");
-}
-
-#[test]
-fn assert_invariants_after_csi_sequence() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // SGR sequence with multiple params: bold(1), fg red(31), bg green(42)
-    parser.advance(b"\x1b[1;31;42m", &mut sink);
-    parser.assert_invariants();
-
-    // Verify the CSI dispatch was recorded with correct params and final byte
-    assert_eq!(
-        sink.csi_dispatches.len(),
-        1,
-        "expected exactly one CSI dispatch"
-    );
-    assert_eq!(
-        sink.csi_dispatches[0].0,
-        vec![1, 31, 42],
-        "SGR params mismatch"
-    );
-    assert_eq!(
-        sink.csi_dispatches[0].2, b'm',
-        "SGR final byte should be 'm'"
-    );
-}
-
-#[test]
-fn assert_invariants_after_osc_sequence() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Set window title (OSC 0 ; title BEL)
-    parser.advance(b"\x1b]0;My Title\x07", &mut sink);
-    parser.assert_invariants();
-
-    // Verify the OSC dispatch was recorded with the title payload
-    assert_eq!(
-        sink.osc_dispatches.len(),
-        1,
-        "expected exactly one OSC dispatch"
-    );
-    assert_eq!(sink.osc_dispatches[0][0], b"0", "OSC command should be '0'");
-    assert_eq!(
-        sink.osc_dispatches[0][1], b"My Title",
-        "OSC payload mismatch"
-    );
-}
-
-#[test]
-fn assert_invariants_after_dcs_sequence() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // DECRQSS (DCS q $ s ST)
-    parser.advance(b"\x1bPq$s\x1b\\", &mut sink);
-    parser.assert_invariants();
-
-    // Verify the DCS hook was called (final byte 'q', intermediate '$')
-    assert_eq!(sink.dcs_hooks.len(), 1, "expected exactly one DCS hook");
-    assert_eq!(sink.dcs_hooks[0].2, b'q', "DCS final byte should be 'q'");
-    // DCS unhook should fire when ST is received
-    assert_eq!(sink.dcs_unhooks, 1, "DCS should be unhooked after ST");
-}
-
-#[test]
-fn assert_invariants_after_partial_sequence() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Start CSI but don't finish — no dispatch yet
-    parser.advance(b"\x1b[1;2", &mut sink);
-    parser.assert_invariants();
-    assert!(
-        sink.csi_dispatches.is_empty(),
-        "partial CSI should not dispatch until final byte"
-    );
-
-    // Now finish it with 'm' (SGR)
-    parser.advance(b"m", &mut sink);
-    parser.assert_invariants();
-    assert_eq!(
-        sink.csi_dispatches.len(),
-        1,
-        "completed CSI should dispatch"
-    );
-    assert_eq!(
-        sink.csi_dispatches[0].0,
-        vec![1, 2],
-        "params should be [1, 2]"
-    );
-    assert_eq!(sink.csi_dispatches[0].2, b'm');
-}
-
-#[test]
-fn assert_invariants_after_utf8() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Multi-byte UTF-8 character (€ = E2 82 AC)
-    parser.advance_fast("Hello € World".as_bytes(), &mut sink);
-    parser.assert_invariants();
-
-    // Verify all characters including the multi-byte € were printed
-    let printed: String = sink.prints.iter().collect();
-    assert_eq!(printed, "Hello € World");
-}
-
-#[test]
-fn assert_invariants_after_subparams() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Underline style with subparam (4:3 = curly underline)
-    parser.advance(b"\x1b[4:3m", &mut sink);
-    parser.assert_invariants();
-
-    // Verify the subparam dispatch was recorded
-    assert_eq!(
-        sink.csi_dispatches_with_subparams.len(),
-        1,
-        "subparam CSI should trigger csi_dispatch_with_subparams"
-    );
-    assert_eq!(sink.csi_dispatches_with_subparams[0].2, b'm');
-}
-
-#[test]
-fn assert_invariants_after_max_params() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Sequence with 16 parameters
-    parser.advance(b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16m", &mut sink);
-    parser.assert_invariants();
-
-    // Verify all 16 params were captured in the dispatch
-    assert_eq!(sink.csi_dispatches.len(), 1, "expected one CSI dispatch");
-    assert_eq!(
-        sink.csi_dispatches[0].0.len(),
-        16,
-        "all 16 parameters should be captured"
-    );
-    assert_eq!(sink.csi_dispatches[0].0[0], 1);
-    assert_eq!(sink.csi_dispatches[0].0[15], 16);
-}
-
-#[test]
-fn assert_invariants_after_reset() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // Put parser in various states
-    parser.advance(b"\x1b[1;2;3m", &mut sink);
-    parser.advance(b"\x1b]0;title", &mut sink); // Partial OSC
-
-    parser.reset();
-    parser.assert_invariants();
-
-    // After reset, should be back to ground state
-    assert_eq!(parser.state(), State::Ground);
-}
-
-#[test]
-fn assert_invariants_apc_sequence() {
-    let mut parser = Parser::new();
-    let mut sink = RecordingSink::default();
-
-    // APC sequence (ESC _ ... ST)
-    parser.advance(b"\x1b_application data\x1b\\", &mut sink);
-    parser.assert_invariants();
-
-    // APC should have been dispatched: one start, data bytes, one end
-    assert_eq!(sink.apc_starts, 1, "APC start should fire once");
-    assert_eq!(sink.apc_ends, 1, "APC end should fire once");
-    assert_eq!(
-        sink.apc_data,
-        b"application data".to_vec(),
-        "APC payload should match the data between ESC_ and ST"
-    );
-    // Parser should return to Ground after ST
-    assert_eq!(parser.state(), State::Ground);
-}
 
 /// Representative states at every bound the invariant names: each of the 14
 /// states, a full parameter list, a saturated parameter, a subparameter, a
@@ -294,60 +91,47 @@ fn assert_invariants_at(parser: &Parser, at: impl Fn() -> String) {
 /// `TypeInvariant`, the flag-state couplings, the UTF-8 decoder's consistency
 /// and the string-head placement — after every byte: so every lead
 /// `0xC0..=0xF7` meets every two following bytes, and each row's pending
-/// prefixes every two bytes more. Each path is driven from the states it
-/// reaches itself: the fast path (`advance_fast`, the one every terminal runs)
-/// and the byte path (`advance`), which collects no UTF-8 and so never holds a
-/// pending character (it skips the `Ground` starts that are one: their bytes
-/// are tails of the starts it does sweep). Two transitions are pinned on the
+/// prefixes every two bytes more, driven through `advance_fast` from the
+/// states it reaches itself. Two transitions are pinned on the
 /// way: CAN (0x18) and SUB (0x1A) end every sequence at `Ground`, and with C1
 /// controls off no byte in 0x80..=0x9F moves a `Ground` parser.
 #[test]
 fn every_state_every_byte_keeps_the_type_invariant() {
     let starts = reachable_starts();
     for c1 in [false, true] {
-        for fast in [false, true] {
-            let feed = |parser: &mut Parser, bytes: &[u8]| {
-                if fast {
-                    parser.advance_fast(bytes, &mut NullSink);
-                } else {
-                    parser.advance(bytes, &mut NullSink);
-                }
+        let feed = |parser: &mut Parser, bytes: &[u8]| {
+            parser.advance_fast(bytes, &mut NullSink);
+        };
+        for (prefix, state) in &starts {
+            let mut start = if c1 {
+                Parser::with_c1_controls()
+            } else {
+                Parser::new()
             };
-            for (prefix, state) in &starts {
-                if !fast && *state == State::Ground && !prefix.is_empty() {
-                    continue;
+            feed(&mut start, prefix);
+            let at = || format!("c1={c1} {prefix:02x?}");
+            assert_eq!(start.state(), *state, "{} reaches {state:?}", at());
+            if *state == State::Ground && crate::utf8::Utf8Prefix::from_bytes(prefix).is_some() {
+                assert_eq!(usize::from(start.utf8_len), prefix.len(), "{} pends", at());
+            }
+            assert_invariants_at(&start, at);
+            for first in 0..=u8::MAX {
+                let mut one = start.clone();
+                feed(&mut one, &[first]);
+                let at = || format!("c1={c1} {prefix:02x?} + {first:02x}");
+                assert_invariants_at(&one, at);
+                if first == 0x18 || first == 0x1A {
+                    assert_eq!(one.state(), State::Ground, "{}", at());
                 }
-                let mut start = if c1 {
-                    Parser::with_c1_controls()
-                } else {
-                    Parser::new()
-                };
-                feed(&mut start, prefix);
-                let at = || format!("c1={c1} fast={fast} {prefix:02x?}");
-                assert_eq!(start.state(), *state, "{} reaches {state:?}", at());
-                if *state == State::Ground && crate::utf8::Utf8Prefix::from_bytes(prefix).is_some()
-                {
-                    assert_eq!(usize::from(start.utf8_len), prefix.len(), "{} pends", at());
+                if !c1 && *state == State::Ground && (0x80..=0x9F).contains(&first) {
+                    assert_eq!(one.state(), State::Ground, "{}", at());
                 }
-                assert_invariants_at(&start, at);
-                for first in 0..=u8::MAX {
-                    let mut one = start.clone();
-                    feed(&mut one, &[first]);
-                    let at = || format!("c1={c1} fast={fast} {prefix:02x?} + {first:02x}");
-                    assert_invariants_at(&one, at);
-                    if first == 0x18 || first == 0x1A {
-                        assert_eq!(one.state(), State::Ground, "{}", at());
-                    }
-                    if !c1 && *state == State::Ground && (0x80..=0x9F).contains(&first) {
-                        assert_eq!(one.state(), State::Ground, "{}", at());
-                    }
-                    for second in 0..=u8::MAX {
-                        let mut two = one.clone();
-                        feed(&mut two, &[second]);
-                        assert_invariants_at(&two, || {
-                            format!("c1={c1} fast={fast} {prefix:02x?} + {first:02x} {second:02x}")
-                        });
-                    }
+                for second in 0..=u8::MAX {
+                    let mut two = one.clone();
+                    feed(&mut two, &[second]);
+                    assert_invariants_at(&two, || {
+                        format!("c1={c1} {prefix:02x?} + {first:02x} {second:02x}")
+                    });
                 }
             }
         }

@@ -17,12 +17,13 @@ facade = { package = "windows-sys-052-under-test", path = "../under-test", featu
 upstream = { package = "windows-sys", version = "=0.52.0", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [features]
-# `probe-*` compile one call through one side, for run.sh's symbol phase.
+# `probe-*` compile one call through one side, for the driver's import phase
+# (aterm-win32-oracle's `oracle-052`).
 probe-facade = []
 probe-upstream = []
 # NEGATIVE CONTROLS: each swaps the facade for a copy with ONE planted
-# mismatch. run.sh requires every one to fail (a const-assert, a coercion, or
-# the symbol or DLL comparison), so no check here can pass vacuously.
+# mismatch. The driver requires every one to fail (a const-assert, a coercion,
+# or the symbol or DLL comparison), so no check here can pass vacuously.
 plant-type = []
 plant-size = []
 plant-const = []

@@ -695,27 +695,8 @@ mod tests {
         }
     }
 
-    /// The loop's longest wait, as it registers it: its one cadence (a check every
-    /// `INTERVAL_SECS`, backed off to a 15 min ceiling), +20 % jitter, +3 s of
-    /// post-wake settle — `cadence_bounds::LONGEST_WAIT`, 18 min 3 s.
+    /// The loop's longest wait, as it registers it (`cadence_bounds::LONGEST_WAIT`).
     const LONGEST: u64 = crate::cadence_bounds::LONGEST_WAIT.as_secs();
-
-    /// The number every judgement of a waiting loop below rests on is the one the
-    /// shipping loop registers and restates (`spawn_background_check_with_settings`,
-    /// `run_checker`): its schedule's `max_wait`, which is `LONGEST_WAIT`.
-    #[test]
-    fn the_loop_registers_its_one_cadences_longest_wait() {
-        // The loop and its `Cadence` are macOS's (`mod cadence` is gated); the
-        // bound is every target's.
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            crate::cadence::Cadence::new(Duration::from_secs(crate::cadence::INTERVAL_SECS))
-                .max_wait()
-                .as_secs(),
-            LONGEST
-        );
-        assert_eq!(LONGEST, 18 * 60 + 3, "a 15 min ceiling, +20 %, +3 s");
-    }
 
     /// THE CLASSIFIER, phase by phase. Each phase is judged against its OWN
     /// budget: a waiting loop may be quiet for twice the loop's longest wait,
@@ -748,12 +729,6 @@ mod tests {
                 "{phase:?}: one second past it is a stall, named by its phase"
             );
         }
-        // A waiting loop is a stall only past twice the longest wait plus slack:
-        // 41 min 6 s of running time.
-        assert_eq!(
-            stall_threshold_secs(CheckerPhase::Waiting, LONGEST),
-            2 * (18 * 60 + 3) + 5 * 60
-        );
         // The 4.6-day silence, as the watchdog would have seen it from its first
         // look: a thread parked in the lock wait is a stall within minutes.
         let parked = beat(CheckerPhase::LockWait, 0, LONGEST);

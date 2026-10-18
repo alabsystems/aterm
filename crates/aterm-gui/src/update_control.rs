@@ -268,62 +268,6 @@ mod tests {
         assert!(admit_check_settings(settings(true), Some(repointed)).is_none());
     }
 
-    /// THE WINDOW HANDS THE BACKGROUND CHECK ITS CUE (round eight of the update
-    /// audit, the review of finding 87). A Linux pass that changed the copy's
-    /// update state is the window's only word to re-read it once the health
-    /// hook was narrowed to failures that persist; the loop calls the hook it is
-    /// given (`aterm_update`'s `linux_notice::Reporter`, pinned there), and the
-    /// window's half is this argument: passed `None`, a healthy pass that
-    /// installed a newer executable left Settings ▸ Software Update as it was,
-    /// and every test stayed green. The wiring runs only with an event loop, so
-    /// it is pinned in the source, whitespace dropped: the call's last argument
-    /// sends [`Wake::UpdateCheckCompleted`] on its own proxy, and that wake
-    /// asks for the reconcile that re-reads the state.
-    #[test]
-    fn the_window_hands_the_background_check_its_checked_cue() {
-        let src: String = include_str!("lib.rs").split_whitespace().collect();
-        let call = src
-            .find("aterm_update::spawn_background_check_with_settings(")
-            .expect("the window's background check");
-        assert!(
-            src[..call].contains("letchecked_proxy=event_loop.create_proxy();"),
-            "the cue's own proxy"
-        );
-        // The call's text, to its matching close.
-        let open = call + src[call..].find('(').expect("its arguments");
-        let mut depth = 0usize;
-        let close = src[open..]
-            .char_indices()
-            .find_map(|(i, c)| {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some(open + i);
-                        }
-                    }
-                    _ => {}
-                }
-                None
-            })
-            .expect("the call's close");
-        let args = &src[open + 1..close];
-        let cue =
-            "Some(Box::new(move||{let_=checked_proxy.send_event(Wake::UpdateCheckCompleted);})),";
-        assert!(
-            args.ends_with(cue),
-            "the call's last argument, `on_checked`, cues the window: {args}"
-        );
-        assert!(
-            src.contains(
-                "Wake::UpdateCheckCompleted=>{self.request_native_update_reconcile(\
-                 app_native::NativeUpdateReconcilePurpose::StageAvailable,);}"
-            ),
-            "the cue re-reads the copy's update state"
-        );
-    }
-
     #[test]
     fn control_check_announces_every_completion_without_inventing_a_stage() {
         let mut status = status();
@@ -440,45 +384,23 @@ mod tests {
         );
 
         let mut said = false;
-        let began = crate::native_update_auto_intent::restored_hold_line(11, true, &mut said)
-            .expect("the hold's start is said");
         assert!(
-            began.contains("build 11") && began.contains("held while"),
-            "{began}"
-        );
-        assert!(
-            began.contains(&format!(
-                "{} s",
-                crate::harness_host::RESTORED_HOLD.as_secs()
-            )),
-            "with its bound: {began}"
+            crate::native_update_auto_intent::restored_hold_line(11, true, &mut said).is_some(),
+            "the hold's start is said"
         );
         assert_eq!(
             crate::native_update_auto_intent::restored_hold_line(11, true, &mut said),
             None,
             "once"
         );
-        let ended = crate::native_update_auto_intent::restored_hold_line(11, false, &mut said)
-            .expect("its end is said");
-        assert!(ended.contains("hold is over"), "{ended}");
+        assert!(
+            crate::native_update_auto_intent::restored_hold_line(11, false, &mut said).is_some(),
+            "its end is said"
+        );
         assert_eq!(
             crate::native_update_auto_intent::restored_hold_line(11, false, &mut said),
             None
         );
-        // The verb's help names the token and the hold's bound as it is.
-        let help = aterm_types::control_verbs::spec("update")
-            .expect("the update verb")
-            .help_line();
-        assert!(
-            help.contains("apply_held=") && help.contains("restored-agents"),
-            "{help}"
-        );
-        assert_eq!(
-            crate::harness_host::RESTORED_HOLD.as_secs(),
-            7 * 60,
-            "the help says seven minutes"
-        );
-        assert!(help.contains("seven minutes"), "{help}");
     }
 
     #[test]

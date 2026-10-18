@@ -5,17 +5,15 @@
 //! by both backends.
 //!
 //! Each row holds entry points, blend, write mask, colour-target role, vertex
-//! layout and topology. `renderer.rs` builds its wgpu descriptors from
-//! [`PIPELINES`] ([`PipelineSpec::wgpu_color_target`],
-//! [`PipelineSpec::wgpu_vertex_buffers`], [`PipelineSpec::wgpu_primitive`],
-//! `spec.vs` / `spec.fs`), and `metal/pipelines.rs` builds
-//! `MTLRenderPipelineState`s from the same rows; `metal/shaders.rs` derives its
-//! entry-point roster from them. No construction site spells this state, so
-//! the backends cannot drift.
-//!
-//! Guards: `tests/pipeline_table_guard.rs`'s source scan fails a
-//! re-inlined literal, and `metal::pipelines::tests` fails a row Metal cannot
-//! express.
+//! layout and topology. The wgpu backend builds every pipeline through
+//! [`build_wgpu`], this module's one constructor, whose descriptor parts are
+//! private here, and `metal/pipelines.rs` builds `MTLRenderPipelineState`s from
+//! the same rows. No other construction site can spell this state, so the
+//! backends cannot drift: the workspace `clippy.toml` refuses
+//! `wgpu::Device::create_render_pipeline` outside [`build_wgpu`],
+//! `metal::pipelines::tests` fails a row Metal cannot express, and the
+//! Metal-vs-wgpu byte differentials in `metal::tests` fail a row the two
+//! backends draw differently.
 //!
 //! There is one row per pipeline. `build_glow_boost_pipeline` is one
 //! construction site for two rows (the HDR crown, `fs_hdr_glow` on
@@ -24,8 +22,7 @@
 //!
 //! Not held here: bind-group layouts, buffers, samplers and pipeline layouts
 //! (per-backend objects). Where those bind on the explicit-slot backends is the
-//! [`BindSpec`] column, checked against every hand-written twin (`.metal`
-//! today; `.glsl` and `.hlsl` as they land) both ways by `crate::shader_twins`.
+//! [`BindSpec`] column.
 
 /// Which shader module a pipeline's entry points live in: one WGSL const in
 /// `renderer.rs` and its `.metal` twin beside `crate::metal::shaders`.
@@ -46,9 +43,8 @@ pub(crate) enum ShaderLibrary {
 }
 
 impl ShaderLibrary {
-    /// The library's short name — the `.metal` file stem, and the key
-    /// `crate::metal::shaders::libraries` reports under.
-    #[cfg(test)]
+    /// The library's short name — the `.metal` file stem.
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Cell => "cell",
@@ -61,7 +57,7 @@ impl ShaderLibrary {
     }
 
     /// Every library, in declaration order.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) const ALL: [Self; 6] = [
         Self::Cell,
         Self::Blit,
@@ -102,18 +98,6 @@ impl Factor {
             Self::OneMinusSrc => wgpu::BlendFactor::OneMinusSrc,
         }
     }
-
-    /// A short stable name, for the table listing the golden test pins.
-    #[cfg(test)]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Zero => "Zero",
-            Self::One => "One",
-            Self::SrcAlpha => "SrcAlpha",
-            Self::OneMinusSrcAlpha => "OneMinusSrcAlpha",
-            Self::OneMinusSrc => "OneMinusSrc",
-        }
-    }
 }
 
 /// The blend equation. Every aterm pipeline adds; `Subtract`/`Min`/`Max` are
@@ -130,14 +114,6 @@ impl BlendOp {
     pub(crate) const fn wgpu(self) -> wgpu::BlendOperation {
         match self {
             Self::Add => wgpu::BlendOperation::Add,
-        }
-    }
-
-    /// A short stable name, for the golden listing.
-    #[cfg(test)]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Add => "Add",
         }
     }
 }
@@ -243,7 +219,7 @@ impl Blend {
 
     /// Whether this state is fixed-function REPLACE — i.e. `src*1 + dst*0` on
     /// both halves, which is arithmetically identical to no blending at all.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) const fn is_replace(self) -> bool {
         matches!(
             (
@@ -293,15 +269,6 @@ impl WriteMask {
         match self {
             Self::Color => wgpu::ColorWrites::COLOR,
             Self::All => wgpu::ColorWrites::ALL,
-        }
-    }
-
-    /// A short stable name, for the golden listing.
-    #[cfg(test)]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Color => "COLOR",
-            Self::All => "ALL",
         }
     }
 }
@@ -371,7 +338,7 @@ impl TargetFormats {
 
 /// The primitive topology. Every aterm draw is a triangle list except the
 /// four-vertex tray strip.
-#[cfg(any(wgpu_arm, test))]
+#[cfg(any(wgpu_arm, gl_arm, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Topology {
     /// `wgpu::PrimitiveTopology::TriangleList` — `wgpu`'s default.
@@ -380,7 +347,7 @@ pub(crate) enum Topology {
     TriangleStrip,
 }
 
-#[cfg(any(wgpu_arm, test))]
+#[cfg(any(wgpu_arm, gl_arm, test))]
 impl Topology {
     /// The `wgpu` spelling.
     #[cfg(wgpu_arm)]
@@ -388,15 +355,6 @@ impl Topology {
         match self {
             Self::TriangleList => wgpu::PrimitiveTopology::TriangleList,
             Self::TriangleStrip => wgpu::PrimitiveTopology::TriangleStrip,
-        }
-    }
-
-    /// A short stable name, for the golden listing.
-    #[cfg(test)]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::TriangleList => "TriangleList",
-            Self::TriangleStrip => "TriangleStrip",
         }
     }
 }
@@ -446,27 +404,12 @@ impl AttrFormat {
             Self::Uint32 => wgpu::VertexFormat::Uint32,
         }
     }
-
-    /// A short stable name, for the Metal vertex-format test's messages.
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::Uint16x4 => "Uint16x4",
-            Self::Unorm8x4 => "Unorm8x4",
-            Self::Uint8x4 => "Uint8x4",
-            Self::Float32x4 => "Float32x4",
-            Self::Uint32 => "Uint32",
-        }
-    }
 }
 
 /// A per-instance vertex buffer layout: stride and attributes. Every quad is
 /// one instance, so the step mode is always per-instance.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VertexLayoutSpec {
-    /// The instance struct's name, for the golden listing.
-    #[cfg(test)]
-    pub(crate) name: &'static str,
     /// `size_of` the instance struct, pinned to the Rust type by a `const`
     /// assert in `renderer.rs`.
     pub(crate) stride: u64,
@@ -496,8 +439,6 @@ pub(crate) enum VertexLayout {
 
 /// `BgInstance`: `[u16;4]` rect + `[u8;4]` colour.
 pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
-    #[cfg(test)]
-    name: "BgInstance",
     stride: 12,
     attrs: &[
         VertexAttr {
@@ -518,8 +459,6 @@ pub(crate) const BG_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 /// `aterm_render::glow_lerp`'s integer law per column and divides by 255
 /// itself, byte-exact with the CPU.
 pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
-    #[cfg(test)]
-    name: "GlowInstance",
     stride: 16,
     attrs: &[
         VertexAttr {
@@ -542,8 +481,6 @@ pub(crate) const GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 
 /// `GlyphInstance`: `f32x4` rect + `f32x4` uv + `[u8;4]` colour + `[u8;4]` aux.
 pub(crate) const GLYPH_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
-    #[cfg(test)]
-    name: "GlyphInstance",
     stride: 40,
     attrs: &[
         VertexAttr {
@@ -571,8 +508,6 @@ pub(crate) const GLYPH_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 
 /// `RainGlowInstance`: the bg pair plus the elliptical falloff basis.
 pub(crate) const RAIN_GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
-    #[cfg(test)]
-    name: "RainGlowInstance",
     stride: 20,
     attrs: &[
         VertexAttr {
@@ -596,8 +531,6 @@ pub(crate) const RAIN_GLOW_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 /// `FireInstance`: rect + geometry + churn phase + the four packed field bytes.
 /// The widest layout: four attributes over three distinct integer formats.
 pub(crate) const FIRE_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
-    #[cfg(test)]
-    name: "FireInstance",
     stride: 24,
     attrs: &[
         VertexAttr {
@@ -625,7 +558,7 @@ pub(crate) const FIRE_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 
 impl VertexLayout {
     /// The layout's stride + attributes, or `None` for a vertex-id-only pass.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) const fn spec(self) -> Option<VertexLayoutSpec> {
         match self {
             Self::None => None,
@@ -634,15 +567,6 @@ impl VertexLayout {
             Self::Glyph => Some(GLYPH_LAYOUT),
             Self::RainGlow => Some(RAIN_GLOW_LAYOUT),
             Self::Fire => Some(FIRE_LAYOUT),
-        }
-    }
-
-    /// A short stable name, for the golden listing.
-    #[cfg(test)]
-    pub(crate) const fn name(self) -> &'static str {
-        match self.spec() {
-            None => "-",
-            Some(s) => s.name,
         }
     }
 }
@@ -731,25 +655,20 @@ static FIRE_BUFFERS: [wgpu::VertexBufferLayout<'static>; 1] = [wgpu::VertexBuffe
 /// Where one row's resources bind on the explicit-slot backends (Metal today;
 /// D3D11's per-stage registers take the same numbers, and GL's units and block
 /// bindings the buffer and texture ones). `metal/blit.rs` and the encoder call
-/// sites take their `set*:atIndex:` indices from here, and `crate::shader_twins`
-/// checks every twin against it in both directions: each `.metal` entry point,
-/// and each `.glsl` / `.hlsl` library at module scope.
+/// sites take their `set*:atIndex:` indices from here.
 ///
 /// The instance stream is not here; it always binds at
 /// `metal::ffi::INSTANCE_STREAM_SLOT`.
 ///
-/// Cross-check with the WGSL twins
-/// (`renderer::tests::the_wgsl_binding_map_agrees_with_the_tables_bind_column`):
+/// Relation to the WGSL twins:
 ///
 /// * Uniform buffers keep their binding number as the `[[buffer]]` index (cell
 ///   and hdr_glow at 0; blit, bloom, shimmer, tray at 2).
 /// * Textures and samplers take per-type sequential slots in `(group, binding)`
 ///   order (the blit sampler at `@binding(1)` is `[[sampler(0)]]`).
-/// * The per-stage split is not visible from WGSL module scope, so that check
-///   compares the per-library union; the MSL twin scan checks each entry point.
 /// * wgpu's own internal MSL slots are not described here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", gl_arm))]
 pub(crate) struct BindSpec {
     /// The vertex-stage uniform `[[buffer(n)]]` index, or `None` for a
     /// `[[vertex_id]]`-only function (`vs_fs`, `vs_blit`). Cell and crown
@@ -766,7 +685,7 @@ pub(crate) struct BindSpec {
     pub(crate) fragment_buffers: &'static [u32],
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", gl_arm))]
 impl BindSpec {
     /// The flat cell rows (bg / cursor / glow / rain / fire): `Uniforms` at
     /// vertex `[[buffer(0)]]`, nothing in the fragment stage.
@@ -817,29 +736,6 @@ impl BindSpec {
         fragment_samplers: &[0],
         fragment_buffers: &[],
     };
-
-    /// One stable text form for the golden listing: `vu(n|-) ft(..|-)
-    /// fsamp(..|-) fb(..|-)`.
-    #[cfg(test)]
-    pub(crate) fn listing(&self) -> String {
-        fn slots(s: &[u32]) -> String {
-            if s.is_empty() {
-                "-".to_owned()
-            } else {
-                s.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
-            }
-        }
-        let vu = match self.vertex_uniform {
-            None => "-".to_owned(),
-            Some(n) => n.to_string(),
-        };
-        format!(
-            "vu({vu}) ft({}) fsamp({}) fb({})",
-            slots(self.fragment_textures),
-            slots(self.fragment_samplers),
-            slots(self.fragment_buffers),
-        )
-    }
 }
 
 /// One pipeline, completely. Every field is stated: nothing here is defaulted,
@@ -855,6 +751,13 @@ pub(crate) struct PipelineSpec {
     /// The fragment entry point, identical in the WGSL and the MSL twin.
     pub(crate) fs: &'static str,
     /// Which attachment this pipeline draws into.
+    #[cfg_attr(
+        all(gl_arm, not(wgpu_arm)),
+        expect(
+            dead_code,
+            reason = "GL programs are format-free; the wgpu and Metal pipelines key on it"
+        )
+    )]
     pub(crate) target: TargetRole,
     /// The blend state, or `None` for a pipeline `renderer.rs` builds with
     /// `blend: None` (the shimmer's REPLACE-by-omission).
@@ -865,10 +768,10 @@ pub(crate) struct PipelineSpec {
     pub(crate) vertex: VertexLayout,
     /// The primitive topology. wgpu builds the pipeline with it; Metal names the
     /// primitive at each draw, so only the tests check this column there.
-    #[cfg(any(wgpu_arm, test))]
+    #[cfg(any(wgpu_arm, gl_arm, test))]
     pub(crate) topology: Topology,
     /// Where the row's resources bind on the Metal side — see [`BindSpec`].
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) binds: BindSpec,
 }
 
@@ -876,7 +779,7 @@ impl PipelineSpec {
     /// The wgpu colour-target state: blend and write mask over the format the
     /// row's [`TargetRole`] resolves to.
     #[cfg(wgpu_arm)]
-    pub(crate) fn wgpu_color_target(&self, targets: TargetFormats) -> wgpu::ColorTargetState {
+    fn wgpu_color_target(&self, targets: TargetFormats) -> wgpu::ColorTargetState {
         wgpu::ColorTargetState {
             format: targets.resolve(self.target),
             blend: self.blend.map(Blend::wgpu),
@@ -886,7 +789,7 @@ impl PipelineSpec {
 
     /// The `wgpu` vertex-buffer list — `&[]` for a `[[vertex_id]]`-only pass.
     #[cfg(wgpu_arm)]
-    pub(crate) fn wgpu_vertex_buffers(&self) -> &'static [wgpu::VertexBufferLayout<'static>] {
+    fn wgpu_vertex_buffers(&self) -> &'static [wgpu::VertexBufferLayout<'static>] {
         match self.vertex {
             VertexLayout::None => &[],
             VertexLayout::Bg => &BG_BUFFERS,
@@ -900,41 +803,58 @@ impl PipelineSpec {
     /// The `wgpu` primitive state — the row's topology over `wgpu`'s defaults
     /// for everything else (no culling, CCW front face, fill mode).
     #[cfg(wgpu_arm)]
-    pub(crate) fn wgpu_primitive(&self) -> wgpu::PrimitiveState {
+    fn wgpu_primitive(&self) -> wgpu::PrimitiveState {
         wgpu::PrimitiveState {
             topology: self.topology.wgpu(),
             ..Default::default()
         }
     }
+}
 
-    /// One line of the golden listing — every field that decides a pixel, in a
-    /// stable textual form. See [`listing`].
-    #[cfg(test)]
-    pub(crate) fn listing(&self, name: &str) -> String {
-        let blend = match self.blend {
-            None => "none".to_owned(),
-            Some(b) => format!(
-                "rgb({} {} {}) a({} {} {})",
-                b.color.src.name(),
-                b.color.dst.name(),
-                b.color.op.name(),
-                b.alpha.src.name(),
-                b.alpha.dst.name(),
-                b.alpha.op.name(),
-            ),
-        };
-        format!(
-            "{name} lib={} vs={} fs={} target={:?} blend={blend} mask={} vertex={} topology={} binds={}",
-            self.library.name(),
-            self.vs,
-            self.fs,
-            self.target,
-            self.write_mask.name(),
-            self.vertex.name(),
-            self.topology.name(),
-            self.binds.listing(),
-        )
-    }
+/// THE ONE `wgpu` RENDER PIPELINE CONSTRUCTOR: build `spec`'s pipeline entirely
+/// from its pipeline-table row. Entry points, blend, write mask, vertex format
+/// and topology all come from `spec`, which the Metal backend also consumes; the
+/// caller supplies only the per-backend plumbing (the compiled module and the
+/// layout), and `targets` only resolves the row's [`TargetRole`] to a format.
+///
+/// The descriptor's parts are private to this module, and the workspace
+/// `clippy.toml` refuses `wgpu::Device::create_render_pipeline` everywhere but
+/// here, so a second spelling of a blend factor or write mask beside the table
+/// does not lint.
+#[cfg(wgpu_arm)]
+pub(crate) fn build_wgpu(
+    spec: &PipelineSpec,
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    targets: TargetFormats,
+) -> wgpu::RenderPipeline {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the pipeline table's own constructor: every row is built here"
+    )]
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(spec.label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(spec.vs),
+            compilation_options: Default::default(),
+            buffers: spec.wgpu_vertex_buffers(),
+        },
+        primitive: spec.wgpu_primitive(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(spec.fs),
+            compilation_options: Default::default(),
+            targets: &[Some(spec.wgpu_color_target(targets))],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    pipeline
 }
 
 /// Every render pipeline aterm builds, in [`Pipeline`] order.
@@ -952,9 +872,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::REPLACE),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Bg,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -967,9 +887,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_GLYPH_TEXT,
     },
     PipelineSpec {
@@ -982,9 +902,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     // --- the nine demand-built effect pipelines ----------------------------
@@ -997,9 +917,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Bg,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1015,9 +935,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::GLOW_OVER),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1029,9 +949,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::RainGlow,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1043,9 +963,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::RainGlow,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1057,9 +977,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fire,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1071,9 +991,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Fire,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_FLAT,
     },
     PipelineSpec {
@@ -1085,9 +1005,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     PipelineSpec {
@@ -1099,9 +1019,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ADDITIVE),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     PipelineSpec {
@@ -1113,9 +1033,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::Glyph,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CELL_ATLAS,
     },
     // --- the two lazily-built post passes over the offscreen ---------------
@@ -1129,9 +1049,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::POST_FS,
     },
     PipelineSpec {
@@ -1146,9 +1066,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // stays consistent with the rgb on a translucent present.
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::POST_FS,
     },
     // --- the glow-boost pair: one construction site, two pipelines ---------
@@ -1165,9 +1085,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // The crown reads the same `GlowInstance` stream the bloom extract
         // does, so a gradient quad ramps in the crown as it does on the glass.
         vertex: VertexLayout::Glow,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CROWN,
     },
     PipelineSpec {
@@ -1180,9 +1100,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::SCREEN),
         write_mask: WriteMask::Color,
         vertex: VertexLayout::Glow,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::CROWN,
     },
     // --- the two swapchain passes ------------------------------------------
@@ -1197,9 +1117,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         // untouched.
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleList,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::POST_FS,
     },
     PipelineSpec {
@@ -1212,9 +1132,9 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         blend: Some(Blend::ALPHA_BLENDING),
         write_mask: WriteMask::All,
         vertex: VertexLayout::None,
-        #[cfg(any(wgpu_arm, test))]
+        #[cfg(any(wgpu_arm, gl_arm, test))]
         topology: Topology::TriangleStrip,
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::TRAY,
     },
 ];
@@ -1256,6 +1176,10 @@ pub(crate) enum Pipeline {
     /// The EMBERFORGE heat-haze displacement.
     Shimmer = 13,
     /// The EDR aurora crown.
+    #[cfg_attr(
+        all(gl_arm, not(wgpu_arm), not(test)),
+        expect(dead_code, reason = "no f16 destination exists on GL")
+    )]
     HdrGlow = 14,
     /// The SDR aurora crown.
     SdrGlow = 15,
@@ -1266,7 +1190,7 @@ pub(crate) enum Pipeline {
 }
 
 /// Every [`Pipeline`], in row order — the single enumeration a sweep walks.
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", gl_arm)))]
 pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::Bg,
     Pipeline::Glyph,
@@ -1295,9 +1219,9 @@ impl Pipeline {
         &PIPELINES[self as usize]
     }
 
-    /// The row's stable name — the enum variant, snake-cased. Used by the
-    /// golden listing and by test failure messages.
-    #[cfg(test)]
+    /// The row's stable name — the enum variant, snake-cased, for test
+    /// failure messages.
+    #[cfg(all(test, any(target_os = "macos", gl_arm)))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Bg => "bg",
@@ -1318,228 +1242,6 @@ impl Pipeline {
             Self::SdrGlow => "sdr_glow",
             Self::Blit => "blit",
             Self::Tray => "tray",
-        }
-    }
-}
-
-/// Every distinct entry point `library` must export, in first-use order,
-/// derived from the table so the MSL roster cannot drift from what the
-/// renderer requests.
-#[cfg(test)]
-pub(crate) fn entry_points(library: ShaderLibrary) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for p in ALL_PIPELINES {
-        let spec = p.spec();
-        if spec.library != library {
-            continue;
-        }
-        for e in [spec.vs, spec.fs] {
-            if !out.contains(&e) {
-                out.push(e);
-            }
-        }
-    }
-    out
-}
-
-/// The whole table as one text block, one line per row, pinned by
-/// `tests::the_pipeline_table_is_what_it_says`.
-#[cfg(test)]
-pub(crate) fn listing() -> String {
-    let mut s = String::new();
-    for p in ALL_PIPELINES {
-        s.push_str(&p.spec().listing(p.name()));
-        s.push('\n');
-    }
-    s
-}
-
-/// The golden of [`listing`], `crates/aterm-gpu/pipeline-table.txt`, kept in
-/// its own file so a value change and its assertion cannot share a hunk. `#`
-/// comment lines and blank lines are stripped before comparison.
-#[cfg(test)]
-const GOLDEN: &str = include_str!("../pipeline-table.txt");
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every field of every row, pinned against the checked-in golden, so a
-    /// change to any pipeline value is a reviewed two-file diff. The golden
-    /// produces no behaviour, so it cannot disagree with the renderer.
-    #[test]
-    fn the_pipeline_table_is_what_it_says() {
-        let want: Vec<&str> = GOLDEN
-            .lines()
-            .map(str::trim_end)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect();
-        let got = listing();
-        let have: Vec<&str> = got.lines().collect();
-        assert_eq!(
-            have.len(),
-            PIPELINE_COUNT,
-            "the listing must have one line per row"
-        );
-        for (i, (w, h)) in want.iter().zip(have.iter()).enumerate() {
-            assert_eq!(
-                w,
-                h,
-                "pipeline-table.txt line {} disagrees with the table.\n\
-                 If the change was intended, update crates/aterm-gpu/pipeline-table.txt.",
-                i + 1
-            );
-        }
-        assert_eq!(
-            want.len(),
-            have.len(),
-            "pipeline-table.txt has {} rows, the table has {}",
-            want.len(),
-            have.len()
-        );
-    }
-
-    /// Enum discriminants are the indices into [`PIPELINES`], and
-    /// [`ALL_PIPELINES`] lists every one exactly once.
-    #[test]
-    fn the_row_index_is_the_enum_discriminant() {
-        assert_eq!(PIPELINES.len(), PIPELINE_COUNT);
-        assert_eq!(ALL_PIPELINES.len(), PIPELINE_COUNT);
-        for (i, p) in ALL_PIPELINES.into_iter().enumerate() {
-            assert_eq!(p as usize, i, "{} is at the wrong index", p.name());
-            assert_eq!(
-                std::ptr::from_ref(p.spec()),
-                std::ptr::from_ref(&PIPELINES[i])
-            );
-        }
-        let mut names: Vec<&str> = ALL_PIPELINES.into_iter().map(Pipeline::name).collect();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        assert_eq!(names.len(), before, "two rows share a name");
-    }
-
-    /// Each derived wgpu vertex-buffer layout carries its spec's stride,
-    /// attribute count, formats and offsets, stepping per instance.
-    #[test]
-    fn the_wgpu_vertex_layouts_are_the_tables_own() {
-        for p in ALL_PIPELINES {
-            let spec = p.spec();
-            let buffers = spec.wgpu_vertex_buffers();
-            match spec.vertex.spec() {
-                None => assert!(
-                    buffers.is_empty(),
-                    "{} draws from [[vertex_id]] but declares a vertex buffer",
-                    p.name()
-                ),
-                Some(v) => {
-                    assert_eq!(buffers.len(), 1, "{}", p.name());
-                    let b = &buffers[0];
-                    assert_eq!(b.array_stride, v.stride, "{} stride", p.name());
-                    assert_eq!(b.step_mode, wgpu::VertexStepMode::Instance, "{}", p.name());
-                    assert_eq!(b.attributes.len(), v.attrs.len(), "{}", p.name());
-                    for (a, n) in b.attributes.iter().zip(v.attrs) {
-                        assert_eq!(a.shader_location, n.location, "{}", p.name());
-                        assert_eq!(a.offset, n.offset, "{}", p.name());
-                        assert_eq!(a.format, n.format.wgpu(), "{}", p.name());
-                    }
-                    // An attribute may not start past the end of its instance.
-                    let last = v.attrs.last().expect("a layout has attributes");
-                    assert!(last.offset < v.stride, "{} overruns its stride", p.name());
-                }
-            }
-        }
-    }
-
-    /// A [`TargetRole::Present`] row needs the destination format and no other
-    /// row does.
-    #[test]
-    fn target_roles_resolve_from_the_context_not_the_call_site() {
-        let targets = TargetFormats {
-            offscreen_srgb: wgpu::TextureFormat::Rgba8UnormSrgb,
-            offscreen_unorm: wgpu::TextureFormat::Rgba8Unorm,
-            present: None,
-        };
-        let mut present_rows = 0;
-        for p in ALL_PIPELINES {
-            let role = p.spec().target;
-            if role == TargetRole::Present {
-                present_rows += 1;
-                assert_eq!(
-                    targets
-                        .with_present(wgpu::TextureFormat::Bgra8Unorm)
-                        .resolve(role),
-                    wgpu::TextureFormat::Bgra8Unorm,
-                    "{}",
-                    p.name()
-                );
-                continue;
-            }
-            let want = match role {
-                TargetRole::OffscreenSrgb => wgpu::TextureFormat::Rgba8UnormSrgb,
-                TargetRole::OffscreenUnorm => wgpu::TextureFormat::Rgba8Unorm,
-                TargetRole::Edr => wgpu::TextureFormat::Rgba16Float,
-                TargetRole::Present => unreachable!("handled above"),
-            };
-            assert_eq!(targets.resolve(role), want, "{}", p.name());
-        }
-        assert_eq!(
-            present_rows, 3,
-            "the swapchain rows are sdr_glow, blit and tray"
-        );
-    }
-
-    /// Rows naming the same entry point in the same library declare the same
-    /// bindings for that stage, since MSL declares each function's arguments
-    /// once.
-    #[test]
-    fn rows_sharing_an_entry_point_share_its_bindings() {
-        for a in ALL_PIPELINES {
-            for b in ALL_PIPELINES {
-                let (sa, sb) = (a.spec(), b.spec());
-                if sa.library != sb.library {
-                    continue;
-                }
-                if sa.vs == sb.vs {
-                    assert_eq!(
-                        sa.binds.vertex_uniform,
-                        sb.binds.vertex_uniform,
-                        "{} and {} share vs `{}` but disagree on its vertex uniform slot",
-                        a.name(),
-                        b.name(),
-                        sa.vs
-                    );
-                }
-                if sa.fs == sb.fs {
-                    assert_eq!(
-                        (
-                            sa.binds.fragment_textures,
-                            sa.binds.fragment_samplers,
-                            sa.binds.fragment_buffers
-                        ),
-                        (
-                            sb.binds.fragment_textures,
-                            sb.binds.fragment_samplers,
-                            sb.binds.fragment_buffers
-                        ),
-                        "{} and {} share fs `{}` but disagree on its fragment bindings",
-                        a.name(),
-                        b.name(),
-                        sa.fs
-                    );
-                }
-            }
-        }
-        // Every fragment texture here is sampled, so texture and sampler slots
-        // pair 1:1; a new shape must be a reviewed change.
-        for p in ALL_PIPELINES {
-            let b = p.spec().binds;
-            assert_eq!(
-                b.fragment_textures.len(),
-                b.fragment_samplers.len(),
-                "{}: every fragment texture slot pairs with a sampler slot",
-                p.name()
-            );
         }
     }
 }

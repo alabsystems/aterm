@@ -31,9 +31,9 @@
 // second kind is here.
 //
 // That line is what keeps `aterm-objc`'s "zero framework bindings" rule true
-// rather than merely restated, and it is why the fork's ratcheted
-// `third_party_loc` pays for ~200 lines of constants instead of ~700 lines of
-// constants plus prototypes.
+// rather than merely restated, and it is why the fork's third-party line
+// count pays for ~200 lines of constants instead of ~700 lines of constants
+// plus prototypes.
 //
 // # What this file was, before W8
 //

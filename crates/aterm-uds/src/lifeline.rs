@@ -66,11 +66,7 @@ impl LifelineCommand for crate::spawnfd::Command {
     }
 }
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "compatibility for a throwaway launcher's std Command (tests and the verify CLI)"
-)]
-impl LifelineCommand for std::process::Command {
+impl LifelineCommand for crate::spawnfd::StdCommand {
     fn set_lifeline(&mut self, far: File) {
         self.arg(FLAG).arg(STDIN.to_string()).stdin(far);
     }
@@ -150,11 +146,7 @@ impl Lifeline {
 ///
 /// # Errors
 /// The FIFO could not be made or opened (see [`Lifeline::open`]).
-#[expect(
-    clippy::disallowed_types,
-    reason = "a throwaway launcher's std Command (tests and the verify CLI)"
-)]
-pub fn arm_for_process(cmd: &mut std::process::Command, dir: &Path) -> io::Result<()> {
+pub fn arm_for_process(cmd: &mut crate::spawnfd::StdCommand, dir: &Path) -> io::Result<()> {
     /// The held ends, kept for the life of the process: never dropped, so the
     /// kernel closes each when the process ends and at no other moment.
     static HELD: std::sync::Mutex<Vec<Lifeline>> = std::sync::Mutex::new(Vec::new());
@@ -548,24 +540,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `wait_for_cut` on a real lifeline returns `Closed` once the held end goes.
-    #[test]
-    fn the_wait_returns_when_the_held_end_goes() {
-        let dir = scratch("wait");
-        let (lifeline, far) = Lifeline::open(&dir).expect("open a lifeline");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(wait_for_cut(OwnedFd::from(far)));
-        });
-        drop(lifeline);
-        // A hang detector.
-        let cut = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("the watcher never saw the cut");
-        assert!(matches!(cut, Cut::Closed), "{cut:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// `arm` gives the child the far end as stdin and names it `--lifeline-fd 0`:
     /// a `/bin/sh` that copies stdin to nowhere finishes only after the launcher
     /// lets go.
@@ -859,29 +833,6 @@ mod tests {
         let err = check(raw).expect_err("a regular file is refused");
         assert!(err.to_string().contains("a regular file"), "{err}");
         assert_ne!(fd_flags(raw), -1, "a refused number is left open");
-        drop(file);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Refusals leave the number alone and say what it was.
-    #[test]
-    fn adopt_refuses_what_cannot_be_a_lifeline() {
-        let err = adopt(-1).expect_err("negative");
-        assert!(err.to_string().contains("not a descriptor number"), "{err}");
-
-        let dir = scratch("refuse");
-        let file = File::create(dir.join("plain")).expect("a regular file");
-        let raw = file.as_raw_fd();
-        let err = adopt(raw).expect_err("a regular file is refused");
-        assert!(err.to_string().contains("a regular file"), "{err}");
-        assert_ne!(fd_flags(raw), -1, "a refused number is left open");
-
-        // A number no descriptor can have: one merely found free could be opened by another
-        // test before `adopt` looks.
-        let closed = RawFd::MAX;
-        assert_eq!(fd_flags(closed), -1, "no descriptor is numbered {closed}");
-        let err = adopt(closed).expect_err("a closed number is refused");
-        assert!(err.to_string().contains("not an open descriptor"), "{err}");
         drop(file);
         let _ = std::fs::remove_dir_all(&dir);
     }

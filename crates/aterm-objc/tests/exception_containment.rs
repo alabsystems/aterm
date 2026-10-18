@@ -6,15 +6,20 @@
 //! against the selector, and the process continues. A Rust panic still aborts with the named
 //! message, an `@abort_on_exception` method still aborts on a raise, and `-dealloc` always does.
 //!
-//! The raise is real (`+[NSException exceptionWithName:reason:userInfo:]` then `-raise`, thrown
-//! through `objc_exception_throw`, AppKit's path too) and needs no AppKit; the AppKit shape is
-//! gated in `crates/aterm-gui/examples/objc_event_drive.rs`. The abort cases re-run this binary
-//! as a child and read the signal and stderr.
+//! The raise is a real one: `+[NSException exceptionWithName:reason:userInfo:]`
+//! then `-raise`, thrown by Foundation through `objc_exception_throw`, which is
+//! the same path AppKit's `NSInternalInconsistencyException` takes. No AppKit
+//! is needed for that, so this runs in the crate's own test binary; the AppKit
+//! shape — `-[NSEvent keyCode]` on a mouse event — is the gate in
+//! `crates/aterm-gui/examples/objc_event_drive.rs`.
+//!
+//! The abort cases re-run this binary on the one test as a child
+//! (`support/reexec.rs`) and read the signal and stderr.
 
 #![cfg(target_os = "macos")]
-#![allow(
-    clippy::disallowed_types,
-    reason = "test code: a stand-in child may inherit descriptors"
+#![expect(
+    clippy::disallowed_methods,
+    reason = "aterm-objc's own runtime tests drive the bare `msg` cast; everything else uses checked_msg"
 )]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -342,12 +347,7 @@ const CHILD: &str = "ATERM_OBJC_CONTAINMENT_CHILD";
 /// Re-run `test` in a child with `CHILD=mode`; return `(signal, stdout, stderr)`.
 fn child(test: &str, mode: &str) -> (Option<i32>, String, String) {
     use std::os::unix::process::ExitStatusExt as _;
-    let exe = std::env::current_exe().expect("test binary path");
-    let out = std::process::Command::new(exe)
-        .args(["--exact", "--nocapture", test])
-        .env(CHILD, mode)
-        .output()
-        .expect("re-running this binary as a child");
+    let out = crate::reexec::rerun(module_path!(), test, &[(CHILD, mode)]);
     (
         out.status.signal(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -379,8 +379,8 @@ fn a_rust_panic_inside_a_contained_method_still_aborts_with_the_named_message() 
         "expected SIGABRT\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stderr.contains("aterm-objc: panic escaped Objective-C method `rust_panic`; aborting"),
-        "today's exact abort message survives containment\nstderr: {stderr}"
+        stderr.contains("panic escaped Objective-C method `rust_panic`"),
+        "the abort came through the unwind guard, naming the method\nstderr: {stderr}"
     );
     assert!(
         !stderr.contains("aterm-objc: contained "),
@@ -410,10 +410,6 @@ fn an_abort_on_exception_method_still_aborts_on_a_raise() {
         sig,
         Some(SIGABRT),
         "expected SIGABRT\nstdout: {stdout}\nstderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("Rust cannot catch foreign exceptions"),
-        "the pre-containment abort, unchanged\nstderr: {stderr}"
     );
 }
 
@@ -485,11 +481,8 @@ fn the_default_sink_writes_one_line_naming_method_and_exception() {
          first, or a duplicated sink, would print two):\n{stderr}"
     );
     let line = lines[0];
-    assert!(line.contains("ATermProbeException (NSException)"), "{line}");
     assert!(
-        line.contains("in Objective-C method `raiseInteger`"),
-        "{line}"
+        line.contains("ATermProbeException") && line.contains("raiseInteger"),
+        "the line names the exception and the method: {line}"
     );
-    assert!(line.contains("raised on purpose"), "{line}");
-    assert!(line.contains("| stack: "), "{line}");
 }

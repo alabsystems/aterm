@@ -14,9 +14,10 @@
 //!    it;
 //! 3. the submodule is checked out at exactly the gitlink commit, with no tracked modification
 //!    (untracked or ignored build output such as `target/` is not one);
-//! 4. cargo resolves `astream-{aead,broker,cap,digest,wire}` exactly once each, from
-//!    `vendor/astream/crates/<name>/Cargo.toml`, as path packages (a null `source`) licensed
-//!    Apache-2.0, and not as aterm workspace members;
+//! 4. every astream crate cargo resolves — every `astream-*` package and every package under
+//!    `vendor/astream`, read from the graph, never listed here — resolves exactly once, from
+//!    `vendor/astream/crates/<name>/Cargo.toml`, as a path package (a null `source`) licensed
+//!    Apache-2.0, and not as an aterm workspace member;
 //! 5. the root manifest's `[workspace] exclude` covers `vendor/astream`;
 //! 6. `crates/aterm-link` still reaches astream-broker and astream-cap there;
 //! 7. the pin did not move backward relative to the merge-base with `origin/main` (see
@@ -50,16 +51,16 @@ const BASE_NAME: &str = "origin/main";
 /// A commit-message line on this branch that declares a deliberate backward move, with its
 /// reason: `astream-pin-rollback: <why the older astream is needed>`.
 const ROLLBACK_TRAILER: &str = "astream-pin-rollback:";
-/// The astream crates aterm resolves. `astream-aead` only under aterm-link's
-/// off-by-default `sealed` feature, which is why [`metadata`] asks for every
-/// feature; `astream-digest` (the SHA-256 under astream-cap) in every build.
-const PACKAGES: [&str; 5] = [
-    "astream-aead",
-    "astream-broker",
-    "astream-cap",
-    "astream-digest",
-    "astream-wire",
-];
+/// What every astream crate's name starts with. The crates `[OB-1]` holds to
+/// the submodule are READ FROM THE GRAPH — every package so named, and every
+/// package whose manifest is under `vendor/astream` — not listed here: a list
+/// went stale twice in a day (astream-term for aterm-conformance's VT oracle,
+/// then astream-effects for aterm-agent's harness tape, which ships), and a
+/// crate missing from it was never checked for resolving from the pin, for
+/// its licence or for staying outside this workspace. [`metadata`] asks for
+/// every feature (astream-aead resolves only under aterm-link's `sealed`) and
+/// carries every member's dev edges (astream-term is a dev-dependency).
+const CRATE_PREFIX: &str = "astream-";
 const CONSUMER: &str = "crates/aterm-link/Cargo.toml";
 /// aterm-link's direct path dependencies into the submodule.
 const CONSUMER_DEPS: [&str; 2] = ["astream-broker", "astream-cap"];
@@ -82,6 +83,9 @@ pub(crate) struct Pin {
     pub(crate) commit: String,
     /// The URL `.gitmodules` declares for it.
     pub(crate) url: String,
+    /// Every astream crate cargo resolves from it, sorted: what `[OB-1]`
+    /// checked, read from the graph ([`CRATE_PREFIX`]).
+    pub(crate) crates: Vec<String>,
 }
 
 /// One index entry at or beneath `vendor/astream`, as `git ls-files -s`
@@ -462,9 +466,13 @@ fn validate(root: &Path, facts: &Facts) -> Result<Pin, String> {
     pin_did_not_move_back(&facts.motion, &commit)?;
     excluded(&facts.exclude)?;
     let metadata = facts.metadata.as_ref().map_err(Clone::clone)?;
-    resolved_from_submodule(root, metadata)?;
+    let crates = resolved_from_submodule(root, metadata)?;
     consumer_reaches_submodule(root, metadata)?;
-    Ok(Pin { commit, url })
+    Ok(Pin {
+        commit,
+        url,
+        crates,
+    })
 }
 
 /// (7) The pin did not go backward against `origin/main` at the merge-base.
@@ -672,11 +680,31 @@ fn packages_and_members(metadata: &Value) -> Result<(&Vec<Value>, &Vec<Value>), 
     Ok((packages, members))
 }
 
-/// (4) Each astream crate resolves once, from the submodule, as a path
-/// package outside this workspace.
-fn resolved_from_submodule(root: &Path, metadata: &Value) -> Result<(), String> {
+/// (4) Every astream crate the graph resolves — every package named
+/// [`CRATE_PREFIX`]`*`, and every package whose manifest is under the
+/// submodule — resolves once, from the submodule, as a path package outside
+/// this workspace: the crates checked, sorted.
+fn resolved_from_submodule(root: &Path, metadata: &Value) -> Result<Vec<String>, String> {
     let (packages, members) = packages_and_members(metadata)?;
-    for name in PACKAGES {
+    let under = root.join(SUBMODULE);
+    let mut names: Vec<&str> = packages
+        .iter()
+        .filter(|p| {
+            let named = p
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.starts_with(CRATE_PREFIX));
+            let inside = p
+                .get("manifest_path")
+                .and_then(Value::as_str)
+                .is_some_and(|m| Path::new(m).starts_with(&under));
+            named || inside
+        })
+        .filter_map(|p| p.get("name").and_then(Value::as_str))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    for &name in &names {
         let found: Vec<&Value> = packages
             .iter()
             .filter(|p| p.get("name").and_then(Value::as_str) == Some(name))
@@ -724,7 +752,7 @@ fn resolved_from_submodule(root: &Path, metadata: &Value) -> Result<(), String> 
             ));
         }
     }
-    Ok(())
+    Ok(names.into_iter().map(str::to_owned).collect())
 }
 
 /// (6) aterm-link, the member that is the reason the submodule exists, still
@@ -770,6 +798,18 @@ mod tests {
     use super::*;
     use aterm_json::json;
 
+    /// The astream crates the built tree below resolves: aterm's graph as this was
+    /// written. A fixture, not a roster — `validate` reads the crates from the metadata.
+    const FIXTURE: [&str; 7] = [
+        "astream-aead",
+        "astream-broker",
+        "astream-cap",
+        "astream-digest",
+        "astream-effects",
+        "astream-term",
+        "astream-wire",
+    ];
+
     /// A tree that holds every obligation, written out: the base every
     /// mutation below starts from, which must itself validate or the
     /// mutations prove nothing. `validate` reads nothing but its `Facts` (the
@@ -777,17 +817,16 @@ mod tests {
     /// same logic a captured one would — and leaves these controls green when
     /// THIS checkout legitimately fails OB-1: a submodule moved for an astream
     /// trial, or a public clone with no `.gitmodules`. Whether the live tree
-    /// holds OB-1 is attest's real-tree tests' question and the `forge`
-    /// check's, which run `capture` and `targo metadata` for real. The
-    /// metadata carries the fields `validate` reads, shaped as
-    /// `targo metadata --format-version 1` prints them.
+    /// holds OB-1 is the `forge` check's question, which runs `capture` and
+    /// `targo metadata` for real. The metadata carries the fields `validate`
+    /// reads, shaped as `targo metadata --format-version 1` prints them.
     fn valid() -> (PathBuf, Facts) {
         let root = PathBuf::from("/w");
         let pin = "1".repeat(40);
         let path = |p: &Path| p.to_str().unwrap().to_owned();
         let id = |dir: &Path| format!("path+file://{}#0.1.0", path(dir));
         let crate_dir = |name: &str| root.join(SUBMODULE).join("crates").join(name);
-        let mut packages: Vec<Value> = PACKAGES
+        let mut packages: Vec<Value> = FIXTURE
             .iter()
             .map(|name| {
                 let dir = crate_dir(name);
@@ -867,118 +906,300 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn a_missing_or_wrong_gitmodules_entry_is_refused() {
-        let (root, facts) = valid();
-        let mut missing = facts.clone();
-        missing.gitmodules.retain(|(k, _)| !k.ends_with(".path"));
-        rejects(&root, &missing, &[".gitmodules", "declares no submodule"]);
-        let mut absent = facts.clone();
-        absent.gitmodules.clear();
-        rejects(&root, &absent, &["declares no submodule"]);
-        let mut wrong = facts.clone();
-        for (k, v) in &mut wrong.gitmodules {
+    fn packages(facts: &mut Facts) -> &mut Vec<Value> {
+        facts
+            .metadata
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .get_mut("packages")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+    }
+
+    fn set_url(facts: &mut Facts, url: &str) {
+        for (k, v) in &mut facts.gitmodules {
             if k.ends_with(".url") {
-                *v = "https://github.com/someone-else/astream.git".into();
+                *v = url.to_string();
             }
         }
-        rejects(&root, &wrong, &["someone-else", "git submodule sync"]);
-        let mut twice = facts.clone();
-        twice
-            .gitmodules
-            .push(("submodule.other.path".into(), SUBMODULE.into()));
-        rejects(&root, &twice, &["2 times"]);
-        // Both spellings of the one URL are accepted.
+    }
+
+    /// One planted drift: a named edit to the valid base's facts.
+    type Plant = Box<dyn Fn(&mut Facts)>;
+
+    /// The valid base's facts validate, and each planted drift from the pinned
+    /// submodule is refused. One drift per case, so the refusal is the plant's.
+    #[test]
+    fn every_planted_drift_from_the_pinned_submodule_is_refused() {
+        let (root, facts) = valid();
+        let base = "0123456789012345678901234567890123456789".to_owned();
+        let mut refused: Vec<(String, Plant)> = vec![
+            (
+                "no .gitmodules".into(),
+                Box::new(|f: &mut Facts| f.gitmodules.clear()),
+            ),
+            (
+                "another URL".into(),
+                Box::new(|f: &mut Facts| set_url(f, "https://github.com/someone-else/astream.git")),
+            ),
+            (
+                "two entries at the path".into(),
+                Box::new(|f: &mut Facts| {
+                    f.gitmodules
+                        .push(("submodule.other.path".into(), SUBMODULE.into()));
+                }),
+            ),
+            (
+                "a tree, not a gitlink".into(),
+                Box::new(|f: &mut Facts| f.index[0].mode = "100644".into()),
+            ),
+            (
+                "a tracked file beneath the gitlink".into(),
+                Box::new(|f: &mut Facts| {
+                    f.index.push(IndexEntry {
+                        mode: "100644".into(),
+                        object: "0".repeat(40),
+                        stage: "0".into(),
+                        path: format!("{SUBMODULE}/crates/astream-cap/src/lib.rs"),
+                    });
+                }),
+            ),
+            (
+                "no index entry".into(),
+                Box::new(|f: &mut Facts| f.index.clear()),
+            ),
+            (
+                "a checkout off the gitlink".into(),
+                Box::new(|f: &mut Facts| {
+                    f.checkout = Checkout::At {
+                        head: "0".repeat(40),
+                        modified: Vec::new(),
+                    };
+                }),
+            ),
+            (
+                "an uninitialised submodule".into(),
+                Box::new(|f: &mut Facts| f.checkout = Checkout::Uninitialised("empty".into())),
+            ),
+            (
+                "a dirty checkout".into(),
+                Box::new(|f: &mut Facts| {
+                    if let Checkout::At { modified, .. } = &mut f.checkout {
+                        modified.push(" M crates/astream-cap/src/lib.rs".into());
+                    }
+                }),
+            ),
+            (
+                "an astream crate made a workspace member".into(),
+                Box::new(|f: &mut Facts| {
+                    let id = package(f, "astream-wire")["id"].clone();
+                    f.metadata
+                        .as_mut()
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap()
+                        .get_mut("workspace_members")
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap()
+                        .push(id);
+                }),
+            ),
+            (
+                "an astream crate from the registry".into(),
+                Box::new(|f: &mut Facts| {
+                    package(f, "astream-broker").insert(
+                        "source".into(),
+                        Value::String(
+                            "registry+https://github.com/rust-lang/crates.io-index".into(),
+                        ),
+                    );
+                }),
+            ),
+            (
+                "an astream crate under another license".into(),
+                Box::new(|f: &mut Facts| {
+                    package(f, "astream-aead")
+                        .insert("license".into(), Value::String("MIT".into()));
+                }),
+            ),
+            (
+                "an astream crate resolved twice".into(),
+                Box::new(|f: &mut Facts| {
+                    let copy = Value::Object(package(f, "astream-cap").clone());
+                    packages(f).push(copy);
+                }),
+            ),
+            (
+                "cargo metadata refused".into(),
+                Box::new(|f: &mut Facts| {
+                    f.metadata = Err("Cargo metadata refused: planted".into())
+                }),
+            ),
+            (
+                "no workspace exclude".into(),
+                Box::new(|f: &mut Facts| f.exclude.clear()),
+            ),
+            (
+                "only a sibling excluded".into(),
+                Box::new(|f: &mut Facts| {
+                    f.exclude = vec!["vendor/astream-other".into(), "vendor/ast".into()];
+                }),
+            ),
+            (
+                "aterm-link redirected away".into(),
+                Box::new(|f: &mut Facts| {
+                    let deps = package(f, "aterm-link")
+                        .get_mut("dependencies")
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap();
+                    for d in deps {
+                        if d["name"].as_str() == Some("astream-cap") {
+                            d.as_object_mut()
+                                .unwrap()
+                                .insert("path".into(), Value::String("/outside".into()));
+                        }
+                    }
+                }),
+            ),
+            (
+                "an undeclared backward pin".into(),
+                Box::new({
+                    let base = base.clone();
+                    move |f: &mut Facts| {
+                        f.motion = PinMotion::Backward {
+                            base: base.clone(),
+                            declared: None,
+                        };
+                    }
+                }),
+            ),
+            (
+                "a base the checkout never fetched".into(),
+                Box::new({
+                    let base = base.clone();
+                    move |f: &mut Facts| f.motion = PinMotion::BaseNotFetched { base: base.clone() }
+                }),
+            ),
+        ];
+        for name in FIXTURE {
+            refused.push((
+                format!("{name} redirected"),
+                Box::new(move |f: &mut Facts| {
+                    package(f, name).insert(
+                        "manifest_path".into(),
+                        Value::String("/outside/Cargo.toml".into()),
+                    );
+                }),
+            ));
+        }
+        for (name, plant) in &refused {
+            let mut planted = facts.clone();
+            plant(&mut planted);
+            assert!(validate(&root, &planted).is_err(), "{name} must be refused");
+        }
+
+        // What is NOT a drift: either spelling of the one URL, an ancestor
+        // exclude, a declared rollback, and every other pin motion.
+        let mut accepted: Vec<Facts> = Vec::new();
         for spelling in [URL.to_string(), format!("{URL}.git")] {
-            let mut ok = facts.clone();
-            for (k, v) in &mut ok.gitmodules {
-                if k.ends_with(".url") {
-                    v.clone_from(&spelling);
-                }
-            }
-            assert_eq!(validate(&root, &ok).unwrap().url, spelling);
+            let mut f = facts.clone();
+            set_url(&mut f, &spelling);
+            accepted.push(f);
+        }
+        let mut f = facts.clone();
+        f.exclude = vec!["vendor/".into()];
+        accepted.push(f);
+        for motion in [
+            PinMotion::Backward {
+                base,
+                declared: Some("astream 5021230 broke the sealed wire".into()),
+            },
+            PinMotion::Unchanged,
+            PinMotion::Forward,
+            PinMotion::Diverged,
+            PinMotion::Undecided("no origin/main".into()),
+        ] {
+            let mut f = facts.clone();
+            f.motion = motion;
+            accepted.push(f);
+        }
+        for f in &accepted {
+            assert!(validate(&root, f).is_ok(), "{f:?} must pass");
         }
     }
 
+    /// The crates checked are the graph's, not a list's: an astream crate no list names is
+    /// held to the pin like the rest — redirected to a sibling checkout or given another
+    /// licence, it is refused — and, resolved from the submodule, it is among the crates the
+    /// pin reports. So is a package under the submodule whatever its name, which stays out
+    /// of the workspace like every other.
     #[test]
-    fn a_non_gitlink_or_a_tracked_file_beneath_it_is_refused() {
+    fn an_astream_crate_no_list_names_is_held_to_the_submodule_too() {
         let (root, facts) = valid();
-        let mut tree = facts.clone();
-        tree.index[0].mode = "100644".into();
-        rejects(&root, &tree, &["mode 100644", "not as a gitlink"]);
-        let mut extra = facts.clone();
-        extra.index.push(IndexEntry {
-            mode: "100644".into(),
-            object: "0".repeat(40),
-            stage: "0".into(),
-            path: format!("{SUBMODULE}/crates/astream-cap/src/lib.rs"),
-        });
-        rejects(
-            &root,
-            &extra,
-            &["tracks 1 path(s) beneath", "git rm -r --cached"],
-        );
-        let mut none = facts.clone();
-        none.index.clear();
-        rejects(&root, &none, &["records nothing"]);
-    }
-
-    #[test]
-    fn a_checkout_off_the_gitlink_or_uninitialised_or_dirty_is_refused() {
-        let (root, facts) = valid();
-        let mut moved = facts.clone();
-        moved.checkout = Checkout::At {
-            head: "0".repeat(40),
-            modified: Vec::new(),
+        assert_eq!(validate(&root, &facts).unwrap().crates, FIXTURE);
+        let add = |facts: &mut Facts, name: &str, manifest: &Path| {
+            let id = format!("path+file://{}#0.1.0", manifest.parent().unwrap().display());
+            facts
+                .metadata
+                .as_mut()
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .get_mut("packages")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "id": id,
+                    "name": name,
+                    "source": null,
+                    "license": "Apache-2.0",
+                    "manifest_path": manifest.to_str().unwrap(),
+                    "dependencies": [],
+                }));
         };
-        rejects(
-            &root,
-            &moved,
-            &[
-                "git submodule update --init vendor/astream",
-                "commit the bump",
-            ],
-        );
-        let mut bare = facts.clone();
-        bare.checkout = Checkout::Uninitialised("empty".into());
-        rejects(
-            &root,
-            &bare,
-            &[
-                "not an initialised",
-                "git submodule update --init vendor/astream",
-            ],
-        );
-        let mut dirty = facts.clone();
-        let Checkout::At { modified, .. } = &mut dirty.checkout else {
-            panic!("the valid base is checked out")
+        let at_pin = |name: &str| {
+            root.join(SUBMODULE)
+                .join("crates")
+                .join(name)
+                .join("Cargo.toml")
         };
-        modified.push(" M crates/astream-cap/src/lib.rs".into());
+        let mut sibling = facts.clone();
+        let elsewhere = Path::new("/astream/crates/astream-next/Cargo.toml");
+        add(&mut sibling, "astream-next", elsewhere);
         rejects(
             &root,
-            &dirty,
-            &["1 tracked modification", "astream-cap/src/lib.rs"],
+            &sibling,
+            &["redirects `astream-next`", "/astream/crates/astream-next"],
         );
-    }
-
-    #[test]
-    fn a_package_redirected_made_a_member_or_given_a_registry_source_is_refused() {
-        let (root, facts) = valid();
-        for name in PACKAGES {
-            let mut redirected = facts.clone();
-            package(&mut redirected, name).insert(
-                "manifest_path".into(),
-                Value::String("/outside/Cargo.toml".into()),
-            );
-            rejects(
-                &root,
-                &redirected,
-                &[&format!("redirects `{name}`"), "/outside"],
-            );
-        }
-        let mut member = facts.clone();
-        let id = package(&mut member, "astream-wire")["id"].clone();
-        member
+        let mut licensed = facts.clone();
+        add(&mut licensed, "astream-next", &at_pin("astream-next"));
+        package(&mut licensed, "astream-next")
+            .insert("license".into(), Value::String("MIT".into()));
+        rejects(
+            &root,
+            &licensed,
+            &["`astream-next`", "declares license MIT"],
+        );
+        let mut pinned = facts;
+        add(&mut pinned, "astream-next", &at_pin("astream-next"));
+        add(&mut pinned, "asb", &at_pin("asb"));
+        let crates = validate(&root, &pinned)
+            .expect("both resolve from the pin")
+            .crates;
+        assert!(
+            ["asb", "astream-next"]
+                .iter()
+                .all(|n| crates.iter().any(|c| c == n)),
+            "{crates:?}"
+        );
+        let id = package(&mut pinned, "asb")["id"].clone();
+        pinned
             .metadata
             .as_mut()
             .unwrap()
@@ -989,122 +1210,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(id);
-        rejects(
-            &root,
-            &member,
-            &["`astream-wire` is an aterm workspace member"],
-        );
-        let mut registry = facts.clone();
-        package(&mut registry, "astream-broker").insert(
-            "source".into(),
-            Value::String("registry+https://github.com/rust-lang/crates.io-index".into()),
-        );
-        rejects(
-            &root,
-            &registry,
-            &["`astream-broker` from source registry+"],
-        );
-        let mut licensed = facts.clone();
-        package(&mut licensed, "astream-aead")
-            .insert("license".into(), Value::String("MIT".into()));
-        rejects(&root, &licensed, &["declares license MIT"]);
-        let mut doubled = facts.clone();
-        let copy = Value::Object(package(&mut doubled, "astream-cap").clone());
-        doubled
-            .metadata
-            .as_mut()
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .get_mut("packages")
-            .unwrap()
-            .as_array_mut()
-            .unwrap()
-            .push(copy);
-        rejects(&root, &doubled, &["resolves 2 `astream-cap` package(s)"]);
-        let mut refused = facts;
-        refused.metadata = Err("Cargo metadata refused: planted".into());
-        rejects(&root, &refused, &["planted"]);
-    }
-
-    #[test]
-    fn a_missing_exclude_is_refused_and_an_ancestor_exclude_covers_it() {
-        let (root, facts) = valid();
-        let mut none = facts.clone();
-        none.exclude.clear();
-        rejects(&root, &none, &["exclude", "vendor/astream"]);
-        let mut sibling = facts.clone();
-        sibling.exclude = vec!["vendor/astream-other".into(), "vendor/ast".into()];
-        rejects(&root, &sibling, &["exclude"]);
-        let mut ancestor = facts;
-        ancestor.exclude = vec!["vendor/".into()];
-        assert!(validate(&root, &ancestor).is_ok());
-    }
-
-    #[test]
-    fn aterm_link_redirected_away_from_the_submodule_is_refused() {
-        let (root, mut facts) = valid();
-        let deps = package(&mut facts, "aterm-link")
-            .get_mut("dependencies")
-            .unwrap()
-            .as_array_mut()
-            .unwrap();
-        for d in deps {
-            if d["name"].as_str() == Some("astream-cap") {
-                d.as_object_mut()
-                    .unwrap()
-                    .insert("path".into(), Value::String("/outside".into()));
-            }
-        }
-        rejects(&root, &facts, &["aterm-link redirects astream-cap"]);
-    }
-
-    #[test]
-    fn a_backward_pin_is_refused_unless_a_commit_on_the_branch_declares_a_rollback() {
-        let (root, mut facts) = valid();
-        let base = "0123456789012345678901234567890123456789".to_owned();
-        facts.motion = PinMotion::Backward {
-            base: base.clone(),
-            declared: None,
-        };
-        rejects(
-            &root,
-            &facts,
-            &[
-                "ANCESTOR",
-                &base,
-                "forward only",
-                "submodule.recurse",
-                ROLLBACK_TRAILER,
-            ],
-        );
-        facts.motion = PinMotion::Backward {
-            base,
-            declared: Some("astream 5021230 broke the sealed wire".into()),
-        };
-        assert!(
-            validate(&root, &facts).is_ok(),
-            "a declared rollback passes"
-        );
-        // A base the checkout never fetched cannot be bumped from either.
-        facts.motion = PinMotion::BaseNotFetched {
-            base: "0123456789012345678901234567890123456789".into(),
-        };
-        rejects(
-            &root,
-            &facts,
-            &["never fetched", "fetch origin", ROLLBACK_TRAILER],
-        );
-        // Everything else passes.
-        for other in [
-            PinMotion::Unchanged,
-            PinMotion::Forward,
-            PinMotion::Diverged,
-            PinMotion::Undecided("no origin/main".into()),
-        ] {
-            facts.motion = other.clone();
-            assert!(validate(&root, &facts).is_ok(), "{other:?} must pass");
-        }
+        rejects(&root, &pinned, &["`asb` is an aterm workspace member"]);
     }
 
     /// A throwaway superproject whose `vendor/astream` is a real repository,

@@ -510,13 +510,31 @@ impl fmt::Display for ShortId {
     }
 }
 
+/// The words of the actors a connection's class names (§2.5, phase 3A ruling
+/// R1): never a session's. An [`Actor::Sid`] holding one of them is not one
+/// ([`Actor::sid`] makes it [`Actor::Nobody`], and [`Actor::word`] prints such
+/// a value as `-`), so no record, carry line or fold snapshot ever turns a
+/// name someone chose into one of these actors when it is read back
+/// ([`Actor::from_word`] maps each word only to its own actor).
+pub const RESERVED_ACTOR_WORDS: &[&str] =
+    &["human", "ctl", "harness", "bridge", "aterm", "vendor", "-"];
+
+/// Whether `word` is one of [`RESERVED_ACTOR_WORDS`].
+#[must_use]
+pub fn is_reserved_actor_word(word: &str) -> bool {
+    RESERVED_ACTOR_WORDS.contains(&word)
+}
+
 /// Who a record is attributed to (§2.5). The server sets it from the
 /// connection, never from a parameter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Actor {
     /// The window's input path.
     Human,
-    /// Any other Owner client.
+    /// Any other Owner client: whoever presents the instance token — the
+    /// owner's own `aterm ctl`, and equally ANY process running inside an
+    /// aterm session (the supervised agent itself among them). Owner class,
+    /// but never proven to be the owner ([`Actor::is_proven`]).
     Ctl,
     /// The in-GUI harness.
     Harness,
@@ -533,7 +551,10 @@ pub enum Actor {
 }
 
 impl Actor {
-    /// The wire word (`human ctl harness bridge aterm vendor <sid> -`).
+    /// The wire word (`human ctl harness bridge aterm vendor <sid> -`). A
+    /// [`Actor::Sid`] whose text is a reserved word ([`RESERVED_ACTOR_WORDS`])
+    /// prints `-`: it was never that actor, and nothing that reads the word
+    /// back may take it for one.
     #[must_use]
     pub fn word(&self) -> &str {
         match self {
@@ -543,13 +564,27 @@ impl Actor {
             Actor::Bridge => "bridge",
             Actor::Aterm => "aterm",
             Actor::Vendor => "vendor",
+            Actor::Sid(sid) if is_reserved_actor_word(sid.as_str()) => "-",
             Actor::Sid(sid) => sid.as_str(),
             Actor::Nobody => "-",
         }
     }
 
-    /// The actor a wire word names: a known word, else a sid-shaped token,
-    /// else `-`.
+    /// A session as an actor: [`Actor::Sid`], or [`Actor::Nobody`] for a
+    /// reserved word ([`RESERVED_ACTOR_WORDS`]). The one way a host turns a
+    /// session's name into an actor.
+    #[must_use]
+    pub fn sid(id: ShortId) -> Actor {
+        if is_reserved_actor_word(id.as_str()) {
+            Actor::Nobody
+        } else {
+            Actor::Sid(id)
+        }
+    }
+
+    /// The actor a wire word names: a known word (each only its own actor),
+    /// else a sid-shaped token, else `-`. A reserved word never decodes to
+    /// [`Actor::Sid`].
     #[must_use]
     pub fn from_word(word: &str) -> Actor {
         match word {
@@ -560,15 +595,52 @@ impl Actor {
             "aterm" => Actor::Aterm,
             "vendor" => Actor::Vendor,
             "-" => Actor::Nobody,
-            other => ShortId::new(other).map_or(Actor::Nobody, Actor::Sid),
+            other => ShortId::new(other).map_or(Actor::Nobody, Actor::sid),
         }
     }
 
-    /// The owner, whose `clear` lifts any need: the human and an Owner
-    /// client.
+    /// The owner class: the person at the window and an Owner client
+    /// (`ctl`). Which of them may lift another author's need is
+    /// [`Actor::overrides`].
     #[must_use]
     pub const fn is_owner(&self) -> bool {
         matches!(self, Actor::Human | Actor::Ctl)
+    }
+
+    /// A claim's TRUSTED author (design §7.3, phase 3A ruling R13): the
+    /// harness or the owner class. Their newest verdict and label are kept
+    /// beside the newest of any author, so no other author displaces them,
+    /// and a label reaches `brief` and the clause only from one of them.
+    #[must_use]
+    pub const fn is_trusted(&self) -> bool {
+        matches!(self, Actor::Harness | Actor::Human | Actor::Ctl)
+    }
+
+    /// A PROVEN trusted author: one whose connection proves it distinct
+    /// from every process inside a session — the harness (an in-memory
+    /// token) and the person at the window. `ctl` is not one: the instance
+    /// token is every in-session client's, the supervised agent's included,
+    /// so the AI a harness judges writes as `ctl`. A proven author's newest
+    /// verdict and label are kept in a slot of their own, which no `ctl`
+    /// claim displaces, and only a proven author or the person lifts a need
+    /// one raised ([`Actor::overrides`]).
+    #[must_use]
+    pub const fn is_proven(&self) -> bool {
+        matches!(self, Actor::Harness | Actor::Human)
+    }
+
+    /// Whether a `clear` from `self` lifts a need `raiser` raised, beside
+    /// the raiser's own (THE CLEAR RULE's authority, `fold::clear_lifts`):
+    /// the person lifts any; an Owner client (`ctl`) lifts any but a proven
+    /// author's ([`Actor::is_proven`]), so the agent a harness supervises
+    /// cannot lift the harness's need; no other author lifts another's.
+    #[must_use]
+    pub fn overrides(&self, raiser: &Actor) -> bool {
+        match self {
+            Actor::Human => true,
+            Actor::Ctl => !raiser.is_proven(),
+            _ => false,
+        }
     }
 }
 
@@ -577,7 +649,10 @@ impl Actor {
 // ---------------------------------------------------------------------------
 
 /// The approval box kinds: `aterm_phase::PromptKind::name()`'s words, and
-/// Bash with the read-only verdict `prompt_detail` writes (§3.3).
+/// Bash with the read-only verdict `prompt_detail` writes (§3.3), and the
+/// words of kinds the reader no longer names, kept so an older log still
+/// decodes (`rate-nudge`, `model-pick`, `goal-resume`: Codex's boxes, whose
+/// reader was retired on 2026-10-16).
 pub const BOX_WORDS: &[&str] = &[
     "bash",
     "bash:read-only",
@@ -604,9 +679,11 @@ pub const BOX_WORDS: &[&str] = &[
     "read-outside-setting",
     "usage-limit",
     "model-switch",
+    "autocompact-offer",
     "rate-nudge",
     "model-pick",
     "goal-resume",
+    "mcp-server",
     "other",
 ];
 
@@ -689,9 +766,11 @@ pub const NEED_WORDS: &[&str] = &[
     "approval:read-outside-setting",
     "approval:usage-limit",
     "approval:model-switch",
+    "approval:autocompact-offer",
     "approval:rate-nudge",
     "approval:model-pick",
     "approval:goal-resume",
+    "approval:mcp-server",
     "approval:other",
     "question",
     "wall:usage-session",
@@ -762,7 +841,9 @@ pub const WORD_WORDS: &[&str] = &[
 ];
 
 /// Why records were lost (`gap why=`).
-pub const WHY_WORDS: &[&str] = &["handoff", "crash", "pruned", "evicted", "reset", "unknown"];
+pub const WHY_WORDS: &[&str] = &[
+    "handoff", "crash", "pruned", "evicted", "reset", "unread", "dropped", "unknown",
+];
 
 /// The input verbs an `input` mark names.
 pub const VERB_WORDS: &[&str] = &["send", "key", "paste", "feed", "turn", "unknown"];

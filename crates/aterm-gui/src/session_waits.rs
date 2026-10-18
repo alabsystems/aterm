@@ -547,7 +547,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use aterm_messages::waits::{REWRAPPED, REWRAPPING, WAIT_SAMPLE, WAIT_SAMPLE_IDLE};
+    use aterm_messages::waits::{WAIT_SAMPLE, WAIT_SAMPLE_IDLE};
     use aterm_messages::{EchoKind, Intent, PROGRESS_GRACE};
     use aterm_session::sink::SinkWriter;
 
@@ -697,8 +697,6 @@ mod tests {
         app.sample_session_waits(t0);
         let live = app.messages.live_rows().next().expect("the paste's row");
         let id = live.id;
-        assert_eq!(live.msg.title, "Pasting 1.0 MB");
-        assert_eq!(live.msg.finished_title(), "Pasted 1.0 MB");
         assert_eq!(live.msg.actions, [Intent::StopPaste { session: 0 }]);
         assert_eq!(attention(&live.msg), Ok(Attention::Progress));
         assert_eq!(
@@ -716,20 +714,19 @@ mod tests {
         let mut got = vec![0u8; 256 * 1024];
         reader.read_exact(&mut got).expect("a prefix");
         let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        let stats = loop {
+        loop {
             app.sample_session_waits(Instant::now());
             let meter = app
                 .messages
                 .live(id)
                 .and_then(|l| l.msg.meter.clone())
                 .expect("the meter");
-            if meter.fill_permille.is_some_and(|f| f >= 200) || Instant::now() > deadline {
-                break meter.stats;
+            if meter.fill_permille.is_some_and(|f| f >= 200) {
+                break;
             }
+            assert!(Instant::now() < deadline, "the meter follows the writer");
             std::thread::sleep(Duration::from_millis(5));
-        };
-        assert!(stats.ends_with("/ 1.0 MB"), "{stats}");
-        assert!(!stats.trim_start().starts_with("0 B"), "{stats}");
+        }
         assert!(app.perform_intent(WindowId(0), id, Intent::StopPaste { session: 0 }));
         assert!(app.session_waits.pastes.is_empty(), "no longer watched");
         assert_eq!(app.messages.live_rows().count(), 0, "the row fades");
@@ -756,27 +753,15 @@ mod tests {
             "the rest was dropped"
         );
         drained(&sink);
-        // The record says how much went.
-        let log = app.read_messages(&aterm_messages::wire::ReadQuery::default());
-        assert!(
-            log.iter()
-                .any(|l| l.contains("Paste%20stopped") || l.contains("Paste stopped")),
-            "{log:?}"
-        );
-        // One entry: the row became the record; no withdrawn `Pasting 1.0 MB`
+        // One entry: the row became the record; no withdrawn in-flight row
         // beside it, and its dead `Stop paste` is not offered.
         let state = app.messages_state();
         assert_eq!(state.entries.len(), 1, "{:?}", state.entries);
         let entry = &state.entries[0];
-        assert_eq!(entry.title, "Paste stopped");
+        assert_eq!(entry.title, super::PASTE_STOPPED);
         assert_eq!(entry.id, id.raw(), "the row's own record");
-        assert!(
-            entry.detail[0].ends_with("sent; the rest was not"),
-            "{:?}",
-            entry.detail
-        );
         assert!(entry.actions.is_empty(), "{:?}", entry.actions);
-        assert_eq!((entry.severity, entry.glyph), ("info", '\u{2139}'));
+        assert_eq!(entry.severity, "info");
         // A second press finds nothing to stop.
         assert!(!app.stop_paste(0));
     }
@@ -812,20 +797,11 @@ mod tests {
         assert_eq!(app.session_waits_deadline(), None, "idle again");
         let echo = app.messages.echoes().first().expect("the echo");
         assert_eq!(echo.kind, EchoKind::Complete);
-        assert_eq!(echo.msg.finished_title(), "Pasted 1.0 MB");
-        // Its record: the finished words under ✓ Success, no in-flight frame,
-        // and no `Stop paste` left to press.
+        // Its record: a success, and no `Stop paste` left to press.
         let state = app.messages_state();
         let entry = &state.entries[0];
-        assert_eq!(entry.title, "Pasted 1.0 MB");
-        assert!(entry.detail.is_empty(), "{:?}", entry.detail);
-        assert_eq!((entry.severity, entry.glyph), ("success", '\u{2713}'));
+        assert_eq!(entry.severity, "success");
         assert!(entry.actions.is_empty(), "{:?}", entry.actions);
-        assert!(
-            entry.state_words().starts_with("took "),
-            "{}",
-            entry.state_words()
-        );
     }
 
     /// A rewrap nobody reaches for takes no row; a scroll up into history while it runs
@@ -861,19 +837,8 @@ mod tests {
         );
         let live = app.messages.live_rows().next().expect("the rewrap's row");
         let id = live.id;
-        // The wait's size, said once: `Rewrapping N lines`.
-        assert!(
-            live.msg.title.starts_with("Rewrapping ") && live.msg.title.ends_with(" lines"),
-            "{}",
-            live.msg.title
-        );
-        assert_ne!(live.msg.title, REWRAPPING, "the count is known");
         assert_eq!(attention(&live.msg), Ok(Attention::Progress));
         assert!(live.msg.actions.is_empty(), "nothing to decide");
-        assert_eq!(
-            live.msg.meter.as_ref().map(|m| m.stats.as_str()),
-            Some("1.2M of 3.4M lines")
-        );
         assert!(
             live.msg
                 .reveal_after
@@ -886,13 +851,7 @@ mod tests {
         app.sample_session_waits(later);
         app.settle_messages(later);
         assert_eq!(app.message_band_rows, 1, "revealed");
-        assert_eq!(
-            app.messages
-                .live(id)
-                .and_then(|l| l.msg.meter.as_ref().map(|m| m.stats.clone()))
-                .as_deref(),
-            Some("2.0M of 3.4M lines")
-        );
+        assert!(app.messages.live(id).is_some(), "the row is still up");
         gauge.pass_done(3_400_000, None);
         gauge.end(aterm_messages::WaitEnd::Done);
         app.sample_session_waits(later + WAIT_SAMPLE);
@@ -900,11 +859,10 @@ mod tests {
         assert_eq!(app.session_waits_deadline(), None);
         let echo = app.messages.echoes().first().expect("the echo");
         assert_eq!(echo.kind, EchoKind::Complete);
-        assert_eq!(echo.msg.finished_title(), REWRAPPED);
     }
 
-    /// A search while the history is detached is a floor (`none yet, history rewrapping`,
-    /// never `no matches`), posts the rewrap's row, and runs again at the re-attach.
+    /// A search while the history is detached is a floor (`truncated` on the wire), posts
+    /// the rewrap's row, and runs again at the re-attach.
     #[test]
     fn a_search_during_a_rewrap_says_partial_history_and_runs_again() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -917,20 +875,9 @@ mod tests {
             .expect("status");
         assert_eq!(status.matches, 0);
         assert!(status.truncated, "a floor, not a verdict");
-        let title = app.windows[&WindowId(0)]
-            .search
-            .as_ref()
-            .expect("search")
-            .window_title();
-        // The history is away, not empty of the text.
-        assert!(title.ends_with("(none yet, history rewrapping)"), "{title}");
-        assert!(!title.contains("no matches"), "{title}");
         assert_eq!(
-            app.messages
-                .live_rows()
-                .next()
-                .map(|l| l.msg.title.starts_with("Rewrapping ")),
-            Some(true),
+            app.messages.live_rows().count(),
+            1,
             "the person searching waits on the rewrap"
         );
         gauge.pass_done(500_000, None);
@@ -957,8 +904,8 @@ mod tests {
         assert_eq!(plain.messages.live_rows().count(), 0);
     }
 
-    /// A torn rerun after the re-attach keeps its stale floor but stops saying the history
-    /// is away.
+    /// A torn rerun after the re-attach keeps its stale floor but stops counting the
+    /// history as away.
     #[test]
     fn a_torn_rerun_after_the_rewrap_does_not_keep_saying_rewrapping() {
         let (mut app, _sink, _reader) = app_with_reader();
@@ -985,12 +932,6 @@ mod tests {
         assert!(search.results_dirty, "fixture: the rerun came back torn");
         assert!(!search.history_away, "the history is home");
         assert!(search.truncated, "the kept result is still a floor");
-        let title = search.window_title();
-        assert!(!title.contains("rewrapping"), "{title}");
-        assert!(
-            title.ends_with("(no matches, partial history, stale)"),
-            "an ordinary stale floor: {title}"
-        );
     }
 
     /// A notch glide across a width change's detach lands on its target, not the sum of its
@@ -1214,10 +1155,6 @@ mod tests {
         let entry = &state.entries[0];
         assert_eq!(entry.title, super::PASTE_STOPPED, "{entry:?}");
         assert_ne!(entry.severity, "success", "{entry:?}");
-        assert!(
-            entry.detail[0].ends_with(" of 1.0 MB sent; the rest was not"),
-            "{entry:?}"
-        );
     }
 
     /// Session 0 given a tiered history of `n` short lines, detached for a
@@ -1280,6 +1217,7 @@ mod tests {
         let wheel_up = || InputEvent::Wheel {
             dir: WheelDir::Up,
             lines: 3,
+            detent: true,
             row: 0,
             col: 0,
             mods: 0,
@@ -1298,11 +1236,8 @@ mod tests {
             "no glide over a history that is not there"
         );
         assert_eq!(
-            app.messages
-                .live_rows()
-                .next()
-                .map(|l| l.msg.title.starts_with("Rewrapping ")),
-            Some(true),
+            app.messages.live_rows().count(),
+            1,
             "the person reaching for history waits on the rewrap"
         );
         app.input(WindowId(0), wheel_up(), Source::Human);

@@ -12,12 +12,9 @@
 //! beyond the `core::ffi` primitives, and `libc-oracle/conformance`'s `cell_zero`
 //! pins that surface wherever it is compiled.
 
-use serde::Serialize;
-
 /// The operating-system family of a declaration cell; its hand-written bodies are
 /// per family, so the two architectures of one family must carry the same text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Os {
     Darwin,
     GnuLinux,
@@ -118,53 +115,5 @@ impl Cell {
                 self.arch
             ),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_host_finds_its_cell_and_nothing_else() {
-        let cell = for_host("aarch64-apple-darwin").expect("the Apple silicon cell");
-        assert_eq!(
-            (cell.key, cell.os, cell.source),
-            ("mac", Os::Darwin, "darwin_aarch64.rs")
-        );
-        assert_eq!(
-            for_host("x86_64-unknown-linux-gnu").map(|c| c.key),
-            Some("linux")
-        );
-        assert_eq!(for_host("x86_64-pc-windows-msvc"), None);
-        assert_eq!(for_host("wasm32-unknown-unknown"), None);
-        assert_eq!(for_host(""), None);
-    }
-
-    #[test]
-    fn each_family_pairs_its_first_cell_with_the_other() {
-        let pairs: Vec<_> = sibling_pairs()
-            .into_iter()
-            .map(|(os, left, right)| (os, left.source, right.source))
-            .collect();
-        assert_eq!(
-            pairs,
-            [
-                (Os::Darwin, "darwin_aarch64.rs", "darwin_x86_64.rs"),
-                (Os::GnuLinux, "linux_gnu_x86_64.rs", "linux_gnu_aarch64.rs"),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_cells_cfg_names_its_os_and_arch() {
-        assert_eq!(
-            CELLS[0].cfg(),
-            r#"all(target_os = "macos", target_arch = "aarch64")"#
-        );
-        assert_eq!(
-            CELLS[3].cfg(),
-            r#"all(target_os = "linux", target_env = "gnu", target_arch = "aarch64")"#
-        );
     }
 }

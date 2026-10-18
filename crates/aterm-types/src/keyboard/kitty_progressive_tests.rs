@@ -7,46 +7,6 @@
 
 use super::*;
 
-// Flag presence
-
-#[test]
-fn mode_new_kitty_flags_default_off() {
-    let mode = KeyboardMode::empty();
-    assert!(!mode.contains(KeyboardMode::REPORT_ALTERNATE_KEYS));
-    assert!(!mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC));
-    assert!(!mode.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT));
-}
-
-#[test]
-fn mode_new_kitty_flags_independent() {
-    let alt = KeyboardMode::REPORT_ALTERNATE_KEYS;
-    assert!(alt.contains(KeyboardMode::REPORT_ALTERNATE_KEYS));
-    assert!(!alt.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC));
-    assert!(!alt.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT));
-
-    let all = KeyboardMode::REPORT_ALL_KEYS_AS_ESC;
-    assert!(!all.contains(KeyboardMode::REPORT_ALTERNATE_KEYS));
-    assert!(all.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC));
-
-    let text = KeyboardMode::REPORT_ASSOCIATED_TEXT;
-    assert!(text.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT));
-    assert!(!text.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC));
-}
-
-#[test]
-fn mode_all_kitty_flags_combinable() {
-    let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES
-        | KeyboardMode::REPORT_EVENT_TYPES
-        | KeyboardMode::REPORT_ALTERNATE_KEYS
-        | KeyboardMode::REPORT_ALL_KEYS_AS_ESC
-        | KeyboardMode::REPORT_ASSOCIATED_TEXT;
-    assert!(mode.contains(KeyboardMode::DISAMBIGUATE_ESC_CODES));
-    assert!(mode.contains(KeyboardMode::REPORT_EVENT_TYPES));
-    assert!(mode.contains(KeyboardMode::REPORT_ALTERNATE_KEYS));
-    assert!(mode.contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC));
-    assert!(mode.contains(KeyboardMode::REPORT_ASSOCIATED_TEXT));
-}
-
 // REPORT_ALL_KEYS_AS_ESC: forces the CSI-u path
 
 #[test]

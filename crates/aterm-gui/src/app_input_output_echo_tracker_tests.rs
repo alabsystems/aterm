@@ -62,7 +62,7 @@ fn require_model_transition(
     after: &aterm_spec::interp::State,
 ) {
     let (ok, evidence) = aterm_spec::verify::validate_transition_tiered(
-        &aterm_spec::derive::output_echo_receipt_publication_model(),
+        &aterm_models_effects::output_echo_receipt_publication_model(),
         &[],
         before,
         after,
@@ -138,8 +138,9 @@ fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
 }
 
 /// The delivery register: a ticketed write publishes its receipt when the sink
-/// accepts the bytes, a failed write none. Each read hands receipts over once, by
-/// serial, in completion order; a read with no baseline gets the newest serial.
+/// accepts the bytes, a failed write a FAILED receipt and no delivery. Each read
+/// hands receipts over once, by serial, in completion order; a read with no
+/// baseline gets the newest serial.
 #[cfg(unix)]
 #[test]
 fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
@@ -260,8 +261,10 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
     plain.finish(r, &sink);
     assert_eq!(tracker.deliveries_after(&sink, Some(3), now).latest, 3);
 
-    // A failed write (a dead sink) publishes no receipt: a swallowed queued
-    // key stays revoked, a swallowed paste arms nothing.
+    // A failed write (a dead sink) is no delivery: a swallowed queued key
+    // stays revoked, a swallowed paste arms nothing. It is a FAILED receipt
+    // instead, which takes back what its dispatch banked
+    // (`revoke_failed_delivery`).
     let dead = SinkWriter::new(-1);
     let failed = tracker.begin_ticketed(OutputEchoInput::Echoable, Some(ticket(8)));
     let r = input::seam_egress_receipt(
@@ -272,11 +275,31 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
         input::EgressMode::Interactive,
     );
     failed.finish(r, &dead);
-    assert_eq!(
-        tracker.deliveries_after(&sink, Some(3), now).latest,
-        3,
+    let batch = tracker.deliveries_after(&sink, Some(3), now);
+    assert!(
+        batch.items.iter().all(Option::is_none),
         "a write that did not land is not a delivery"
     );
+    assert_eq!(
+        batch.failed.iter().flatten().copied().collect::<Vec<_>>(),
+        vec![ticket(8)],
+        "…it is the one failed receipt"
+    );
+    assert_eq!(batch.latest, 4, "read once, like any receipt");
+    let again = tracker.deliveries_after(&sink, Some(batch.latest), now);
+    assert!(again.failed.iter().all(Option::is_none), "and only once");
+    // An un-ticketed failed write (an inline key, revoked at its dispatch)
+    // publishes nothing at all.
+    let plain = tracker.begin_event(&ev);
+    let r = input::seam_egress_receipt(
+        &term,
+        &crate::mode_mirror_of(&term),
+        &dead,
+        &ev,
+        input::EgressMode::Interactive,
+    );
+    plain.finish(r, &dead);
+    assert_eq!(tracker.deliveries_after(&sink, Some(4), now).latest, 4);
     unsafe {
         libc::close(pipe[0]);
         libc::close(pipe[1]);
@@ -605,7 +628,7 @@ fn accepted_order_rejects_an_older_completion_after_enter() {
     let initial = model_state(&tracker, echo_order, boundary_order, 0, false, false, None);
     assert_eq!(
         initial,
-        aterm_spec::derive::output_echo_receipt_publication_model().init_state()
+        aterm_models_effects::output_echo_receipt_publication_model().init_state()
     );
     let echo_accepted = model_state(&tracker, echo_order, boundary_order, 1, false, false, None);
     require_model_transition("AcceptOlderEcho", &initial, &echo_accepted);
@@ -641,7 +664,7 @@ fn accepted_order_rejects_an_older_completion_after_enter() {
     overwritten.insert("older_done", 1);
     overwritten.insert("published_order", 1);
     overwritten.insert("accepted_shadow", 1);
-    let model = aterm_spec::derive::output_echo_receipt_publication_model();
+    let model = aterm_models_effects::output_echo_receipt_publication_model();
     let (healthy_admits, _) = aterm_spec::verify::validate_transition_tiered(
         &model,
         &[],

@@ -216,51 +216,6 @@ fn winits_choice_of_display_decides_whether_a_start_is_counted() {
     );
 }
 
-/// THE START THE BOOT APPLY LEAVES IS COUNTED ONCE THE DISPLAY OPENS (the review of
-/// #82). A windowed launch whose display cannot be vouched for before it opens — an
-/// `ssh -X` forward, which sshd accepts whatever stands behind it — was never
-/// counted, so a build whose window crashes under X forwarding was never rolled
-/// back from the window lane, and the next release took it as its rollback target.
-/// The count is made the moment the event loop has opened the display, before
-/// anything else of the window runs, and only for a launch the boot apply left it
-/// to (a Linux-only lane, so pinned here by its source).
-#[test]
-fn the_start_left_by_the_boot_apply_is_counted_once_the_display_opens() {
-    let src = include_str!("lib.rs");
-    assert!(src.contains(
-        "        Ok(el) => {\n            \
-         crate::metrics::stamp_claim(crate::metrics::ClaimStamp::EventLoopBuilt);\n            \
-         // The display opened: a Linux window start the boot apply could not\n            \
-         // vouch for is counted now (round eight of the update audit, #82).\n            \
-         count_linux_window_start_once_open();\n            \
-         el\n        }"
-    ));
-    let lane = &src[src
-        .find("fn linux_launch_without_a_window(headless: bool) -> bool {")
-        .expect("the boot apply's lane")..];
-    let lane = &lane[..lane.find("\n}\n").expect("its end")];
-    // The executable path is read at the boot apply's point, before the display
-    // query, and never first by the late count: a sibling's replacement in between
-    // would leave the window's update lane refusing `<path> (deleted)`.
-    let captured = lane
-        .find("aterm_update::linux_capture_executable();")
-        .expect("the lane reads the executable path at the boot point");
-    assert!(captured < lane.find("a_display_server_answers()").expect("the query"));
-    assert!(lane.contains(
-        "            LinuxTrialStart::WindowOnceOpen => {\n                \
-         LINUX_WINDOW_START_ONCE_OPEN.store(true, std::sync::atomic::Ordering::Release);\n                \
-         true\n            }"
-    ));
-    let count = &src[src
-        .find("fn count_linux_window_start_once_open() {")
-        .expect("the count once open")..];
-    let count = &count[..count.find("\n}\n").expect("its end")];
-    assert!(count.contains(
-        "    if LINUX_WINDOW_START_ONCE_OPEN.load(std::sync::atomic::Ordering::Acquire) {\n        \
-         match aterm_update::linux_window_opened("
-    ));
-}
-
 /// How `DISPLAY` names its server, as libxcb parses it: an empty host or `unix` is
 /// the local server's socket; any other host is over the network, which no launch
 /// can vouch for (`ssh -X`'s `localhost:10.0`); a path is that socket.

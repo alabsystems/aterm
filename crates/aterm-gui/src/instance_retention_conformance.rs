@@ -10,7 +10,8 @@
 
 #![cfg(test)]
 
-use aterm_spec::derive::{Model, exact_instance_retention_model};
+use aterm_models_misc::exact_instance_retention_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use aterm_spec::verify::validate_transition_tiered;
 use std::collections::BTreeSet;
@@ -66,25 +67,25 @@ fn assert_invariants(model: &Model, state: &State, context: &str) {
 // sweeper produces those facts and `Decide` consumes them. Keep that boundary
 // explicit rather than attaching a refinement to a function that does not own
 // the transition.
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ExactInstanceRetention",
     action = "SelectHeld",
     reason = "environment observation: advisory-lock contention supplies Held; the exhaustive \
               Tier-1 matrix projects that real decision input and validates its consumption"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ExactInstanceRetention",
     action = "SelectFree",
     reason = "environment observation: successful advisory-lock acquisition supplies Free; the \
               exhaustive Tier-1 matrix projects that real decision input and validates it"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ExactInstanceRetention",
     action = "SelectMalformed",
     reason = "environment observation: link/type/I/O failures supply Invalid; the exhaustive \
               Tier-1 matrix projects that fail-closed decision input and validates it"
 )]
-#[aterm_spec::spec_unmodeled(
+#[aterm_spec_anchor::spec_unmodeled(
     machine = "ExactInstanceRetention",
     action = "ObservePidAlive",
     reason = "environment observation: the OS liveness probe supplies this compatibility fact \

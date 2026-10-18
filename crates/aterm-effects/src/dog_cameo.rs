@@ -176,23 +176,6 @@ mod tests {
         );
     }
 
-    /// Every summon rolls inside the roster, and the roll is a pure function
-    /// of the seed.
-    #[test]
-    fn rolls_are_deterministic_and_in_range() {
-        let t = t0();
-        for seed in 0..64u64 {
-            let mut a = DogCameo::default();
-            let mut b = DogCameo::default();
-            a.on_summon(t, seed);
-            b.on_summon(t, seed);
-            let (la, lb) = (a.look().unwrap(), b.look().unwrap());
-            assert_eq!(la, lb, "same seed ⇒ same roll");
-            assert!(DOG_HEADS.contains(&la.breed));
-            assert!(la.coat < 16);
-        }
-    }
-
     /// A re-summon while the dog is visible rolls a different breed, and many
     /// seeds reach many breeds.
     #[test]

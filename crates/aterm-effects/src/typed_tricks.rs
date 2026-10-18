@@ -705,16 +705,16 @@ impl TrickListener {
     /// and comes back poisoned; an unseen or clean one starts fresh and pure. A
     /// live tentative fire is left to the host's own expiry.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "RekeyClean",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "RekeyDirty",
             project = "conformance_trick_listener::project"
@@ -797,32 +797,32 @@ impl TrickListener {
     /// `None` unless [`submit_needs_lexicon`](Self::submit_needs_lexicon) says
     /// otherwise.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "SubmitQuiet",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "SubmitFinal",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "SubmitConfirm",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "SubmitRevoke",
             project = "conformance_trick_listener::project"
@@ -863,8 +863,8 @@ impl TrickListener {
     /// `sitxyz`), Enter at a no-echo prompt. Starts a fresh pure line and
     /// revokes a live tentative fire.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "Reset",
             project = "conformance_trick_listener::project"
@@ -939,48 +939,48 @@ impl TrickListener {
     /// editor takes at least one. The count can only err high, so zero still
     /// proves the line empty.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EraseSome",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EraseToken",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EraseBlind",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EraseLast",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "Restore",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "RestoreRevoke",
             project = "conformance_trick_listener::project"
@@ -1032,8 +1032,8 @@ impl TrickListener {
 
     /// One character of the line.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "Ignored",
             project = "conformance_trick_listener::project"
@@ -1096,16 +1096,16 @@ impl TrickListener {
 
     /// A word character (or an interior joiner) goes onto the open token.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "Letter",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "LetterGlued",
             project = "conformance_trick_listener::project"
@@ -1138,8 +1138,8 @@ impl TrickListener {
 
     /// Whitespace, a stop or a fullwidth stop arrived.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "MarkQuiet",
             project = "conformance_trick_listener::project"
@@ -1187,26 +1187,34 @@ impl TrickListener {
 
     /// THE BOUNDARY: the only place the vocabulary is consulted.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EdgeQuiet",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EdgeName",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "MarkName",
+            project = "conformance_trick_listener::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "TrickListenerPurity",
+            action = "EdgeGlued",
             project = "conformance_trick_listener::project"
         )
     )]
@@ -1333,8 +1341,8 @@ impl TrickListener {
 
     /// An open edge with no open token: whatever a stop parked is due.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EdgeConfirm",
             project = "conformance_trick_listener::project"
@@ -1346,16 +1354,16 @@ impl TrickListener {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EdgeFire",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EdgeNameFires",
             project = "conformance_trick_listener::project"
@@ -1399,18 +1407,26 @@ impl TrickListener {
     /// The line is not pet talk. Nothing on it fires from here on, and a live
     /// tentative fire is withdrawn.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "MarkImpure",
             project = "conformance_trick_listener::project"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "EdgeUnknown",
+            project = "conformance_trick_listener::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "TrickListenerPurity",
+            action = "EdgeGluedUnknown",
             project = "conformance_trick_listener::project"
         )
     )]
@@ -1423,8 +1439,8 @@ impl TrickListener {
     }
 
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "TrickListenerPurity",
             action = "Lose",
             project = "conformance_trick_listener::project"
@@ -1492,13 +1508,6 @@ impl TrickListener {
             event,
             submit_pet_only,
         }
-    }
-
-    /// Bytes of heap the listener holds (the fold scratch — everything else is
-    /// inline). Steady-state typing must not move it.
-    #[cfg(test)]
-    fn heap_capacity(&self) -> usize {
-        self.scratch.capacity()
     }
 }
 
@@ -2321,15 +2330,6 @@ cjk   = true
     }
 
     #[test]
-    fn a_plain_fire_clears_the_held_address_word() {
-        let mut rig = Rig::new();
-        rig.run("hey␣sit␣");
-        assert_eq!(rig.seen, [fire(Trick::Sit, "sit", 0, false)]);
-        rig.run("kitty␣");
-        assert_eq!(rig.fires(), [Trick::Sit], "`hey` was dropped, not fired");
-    }
-
-    #[test]
     fn a_name_confirms_the_tentative_fire_and_drops_a_later_held_word() {
         let mut rig = Rig::new();
         rig.run("sit␣");
@@ -2357,30 +2357,6 @@ cjk   = true
             ]
         );
         assert_eq!(rig.listener.tentative(), Some(Trick::Jump));
-    }
-
-    #[test]
-    fn the_phrase_gap_is_measured_boundary_to_boundary_and_is_inclusive() {
-        let lexicon = TrickLexicon::from_source(VOCAB, &["en"]).expect("the fixture parses");
-        for (gap, fires) in [(PHRASE_GAP, 1), (PHRASE_GAP + Duration::from_millis(1), 2)] {
-            let mut listener = TrickListener::new();
-            let t0 = Instant::now();
-            let mut fired = 0;
-            for c in "sit".chars() {
-                let _ = listener.note_char(t0, c, None);
-            }
-            fired += usize::from(listener.note_char(t0, ' ', Some(&lexicon)).event.is_some());
-            for c in "jump".chars() {
-                let _ = listener.note_char(t0, c, None);
-            }
-            fired += usize::from(
-                listener
-                    .note_char(t0 + gap, ' ', Some(&lexicon))
-                    .event
-                    .is_some(),
-            );
-            assert_eq!(fired, fires, "{gap:?}");
-        }
     }
 
     #[test]
@@ -2664,16 +2640,6 @@ cjk   = true
         let mut rig = Rig::new();
         rig.run("site\u{301}⌫␣");
         assert_eq!(rig.seen, [fire(Trick::Sit, "sit", 0, false)]);
-    }
-
-    #[test]
-    fn a_paste_poisons() {
-        // The host answers a paste with `note_break`: after pasting `echo `
-        // the listener would otherwise still call the line empty and pure.
-        let mut rig = Rig::new();
-        rig.brk();
-        rig.run("sleep␣⏎");
-        assert!(rig.seen.is_empty());
     }
 
     #[test]
@@ -3366,6 +3332,9 @@ cjk   = true
         }
     }
 
+    /// The owner's examples, each two-word phrase said once, and `good night
+    /// kitty` as one final sleep (never the praise), against the shipped
+    /// English word lists rather than the fixture vocabulary.
     #[test]
     fn the_shipped_english_answers_the_owners_examples() {
         let mut rig = Rig::shipped_english();
@@ -3380,10 +3349,6 @@ cjk   = true
         let mut rig = Rig::shipped_english();
         rig.run("sit␣tight␣");
         assert_eq!(rig.seen, [fire(Trick::Sit, "sit", 0, false), Seen::Revoke]);
-    }
-
-    #[test]
-    fn the_shipped_english_says_each_two_word_phrase_once() {
         for line in ["sit␣down␣", "roll␣over␣", "jump␣up␣", "wake␣up␣"] {
             let first = line.split('␣').next().expect("a first word");
             let mut rig = Rig::shipped_english();
@@ -3396,12 +3361,6 @@ cjk   = true
             );
             assert!(rig.listener.is_pure(), "{line:?}");
         }
-    }
-
-    #[test]
-    fn the_shipped_english_hears_good_night_kitty_as_one_final_sleep() {
-        // Whether `night` is plain or an address word, `good night kitty` is
-        // one final sleep, never the praise.
         let mut rig = Rig::shipped_english();
         rig.run("good␣night␣kitty␣");
         assert_eq!(rig.fires(), [Trick::Sleep], "{:?}", rig.seen);
@@ -4040,39 +3999,6 @@ cjk   = true
                 && emptied >= 20,
             "{fires} fires, {fires_after_an_edit} after an edit, {commit_fires} in a commit, \
              {glued_fires} glued, {emptied} lines emptied"
-        );
-    }
-
-    #[test]
-    fn the_heap_the_listener_holds_is_stable_once_warm() {
-        let mut rig = Rig::new();
-        assert_eq!(
-            rig.listener.heap_capacity(),
-            0,
-            "nothing until a token closes"
-        );
-        // Warm-up: the widest token the window can hold — TOKEN_CHARS
-        // four-byte letters — sizes the fold scratch once and for all.
-        let widest = "𝐚".repeat(TOKEN_CHARS);
-        rig.run(&widest).run("␣⏎");
-        let warm = rig.listener.heap_capacity();
-        assert!(warm >= widest.len());
-        let mut dice = Dice(0xC0FF_EE00_D15E_A5E5);
-        random_walk(&mut rig, &mut dice, 6_000);
-        for line in ORDINARY_LINES {
-            rig.run(line).run("⏎");
-        }
-        rig.ime("ねこ、おすわり！");
-        // The glued reading: a hit either way round, and a miss that walks
-        // every cut of a full window.
-        rig.ime("猫咪坐下！坐下猫咪！");
-        rig.ime(&"猫".repeat(TOKEN_CHARS));
-        rig.run("␣⏎");
-        rig.run(&"ß".repeat(TOKEN_CHARS)).run("␣⏎");
-        assert_eq!(
-            rig.listener.heap_capacity(),
-            warm,
-            "steady state allocates nothing"
         );
     }
 }

@@ -100,7 +100,7 @@
 //! let _ = Horizon(Duration::ZERO);
 //! ```
 
-use crate::model::{Hold, Intent, UpgradeWord};
+use crate::model::{Hold, Intent};
 use crate::text::clip;
 use crate::{Duration, HOLD_ASK, HOLD_GESTURE, HOLD_STAGED_MANUAL, HOLD_WARN, KEY_CAP};
 
@@ -343,26 +343,10 @@ impl Mover {
         Self(Intent::OpenConfigEditor { line })
     }
 
-    /// Install the staged update.
-    #[must_use]
-    pub fn apply_update(build: u64) -> Self {
-        Self(Intent::ApplyUpdate { build })
-    }
-
     /// Open a new window (the GPU-lost remedy).
     #[must_use]
     pub fn new_window() -> Self {
         Self(Intent::NewWindow)
-    }
-
-    /// The owner's `Upgrade now` for the agent in `tab`, moving it to `to`.
-    #[must_use]
-    pub fn upgrade_now(tab: &str, to: &str) -> Self {
-        Self(Intent::AgentUpgrade {
-            tab: tab.to_string(),
-            to: to.to_string(),
-            word: UpgradeWord::Now,
-        })
     }
 
     /// The intent the capsule carries.

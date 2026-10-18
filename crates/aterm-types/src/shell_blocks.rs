@@ -89,6 +89,31 @@ pub struct OutputBlock {
     /// When collapsed, only the prompt+command is visible; output is hidden.
     /// This is purely metadata - the UI layer uses this to control rendering.
     pub collapsed: bool,
+    /// A full clear of the main screen (ED 2, or ED 0 from home: `clear`,
+    /// Ctrl-L) blanked rows this block reads its text from after its command
+    /// finished: a prompt had archived it, or its D had come and the next
+    /// prompt not yet.
+    ///
+    /// Whatever was written on those rows since is not its own (the next
+    /// command's, or the shell's before its next prompt), so its row text is
+    /// gone as surely as evicted history: `aterm-core` reads it as
+    /// `BlockText::Evicted`. The block itself (its id, state and exit code)
+    /// stays. An archived block keeps its rows; one whose next prompt has not
+    /// come yet moves the rows the clear blanked to the cleared screen's top
+    /// row, so the next prompt's row (its end) is never above its start.
+    pub text_cleared: bool,
+    /// This block's command rows were lost while it was being built, and they
+    /// were a non-empty range then: a full clear of the main screen blanked
+    /// some of them while its command ran (`clear; make`, a program that
+    /// clears the screen it writes to), or a scrollback erase (ED 3, Cmd-K)
+    /// took some of them before its command finished.
+    ///
+    /// `aterm-core` then moves the rows it lost onto what is left (the cleared
+    /// screen's top row, or the oldest row the erase kept), where its command
+    /// goes on writing; its output reads from there. Its command line is not
+    /// among its rows any more, so `aterm-core` reads its command as
+    /// `BlockText::Evicted` unless OSC 633;E named it.
+    pub command_text_cleared: bool,
     /// Timestamp when prompt was received (milliseconds since Unix epoch).
     ///
     /// Captured when the block is created (OSC 133;A). Used by AI agents
@@ -131,6 +156,8 @@ impl OutputBlock {
             working_directory: None,
             commandline: None,
             collapsed: false,
+            text_cleared: false,
+            command_text_cleared: false,
             prompt_time_ms: current_time_ms(),
             command_input_start_time_ms: None,
             command_exec_start_time_ms: None,

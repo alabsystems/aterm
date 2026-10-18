@@ -3,7 +3,7 @@
 
 //! Where a Claude Code agent's own settings live, and the two things the
 //! supervisor reads from them: the `env` its Bash tool gets
-//! ([`WorkerEnv::settings_env`]) and what may send a tool call to a person
+//! ([`WorkerEnv::git_settings_env`]) and what may send a tool call to a person
 //! ([`owner_asks`]): its ask rules and its PreToolUse hooks.
 //!
 //! **The chain** ([`sources`]), in Claude Code's order: the managed file and
@@ -30,7 +30,7 @@
 //! profile, which [`managed_preferences`] reports unparsed.
 //!
 //! **Its readers** all take the chain through [`parse`] and keep no list of
-//! their own: the approval lane ([`owner_asks`], [`WorkerEnv::settings_env`]),
+//! their own: the approval lane ([`owner_asks`], [`WorkerEnv::git_settings_env`]),
 //! the API route and stored login (`crate::harness::netwatch::RouteFacts`,
 //! gathered by aterm-gui's `harness_netprobe` from [`sources_under`] and
 //! [`managed_preferences`]), and the upgrade's model half

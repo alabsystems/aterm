@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
-use aterm_spec::derive::atpkg_vendor_pending_check_model;
+use aterm_models_atpkg::atpkg_vendor_pending_check_model;
 use aterm_spec::wait::{MUST_HAPPEN, within};
 use atpkg::activate::atomic_symlink;
 use atpkg::flow::{VendorFetchError, VendorGet};

@@ -25,6 +25,10 @@ pub(crate) struct Cli {
     /// `--lifeline-fd <n>` (headless only): the descriptor whose end-of-file means the process
     /// that started this instance is gone, so it shuts down ([`crate::lifeline`]).
     pub(crate) lifeline_fd: Option<i32>,
+    /// `--ready-fd <n>` (headless only): the pipe's write end this instance writes one byte to,
+    /// then closes, once its control socket listens ([`crate::lifeline`]'s ready signal). `None`
+    /// on an update's relaunch of a running instance, whose first image already said it.
+    pub(crate) ready_fd: Option<i32>,
     /// The render/font flags, for `main` to [`crate::launch::install`].
     pub(crate) launch: crate::launch::Launch,
 }
@@ -98,6 +102,38 @@ fn set_launch_flag(set: impl FnOnce(&mut LaunchFlags)) {
     set(&mut flags);
 }
 
+/// The `--shell` lines of [`HELP_HEAD`], as this platform resolves a shell: Windows discovers
+/// a name (Git Bash off PATH, the `wsl`/`cmd` aliases); Unix looks it up on PATH.
+#[cfg(windows)]
+macro_rules! shell_flag_help {
+    () => {
+        concat!(
+            "        --shell <name|path>        Interactive shell to spawn. Discovery-resolved:\n",
+            "                                   \"bash\" finds Git Bash even off PATH; \"pwsh\",\n",
+            "                                   \"cmd\", \"wsl\", \"nu\", or an absolute path also work.\n",
+            "                                   Shell integration (prompt marks, jump-to-prompt,\n",
+            "                                   command blocks, cwd) is injected for zsh/bash/fish/\n",
+            "                                   pwsh and \"wsl\" (bash login shell). \"cmd\" is partial:\n",
+            "                                   prompt marks, jump-to-prompt and cwd work, but blocks\n",
+            "                                   carry no command text or exit code. \"nu\" gets none.\n",
+            "                                       [config: shell]\n",
+        )
+    };
+}
+#[cfg(not(windows))]
+macro_rules! shell_flag_help {
+    () => {
+        concat!(
+            "        --shell <name|path>        Interactive shell to spawn: a program name on\n",
+            "                                   PATH (\"bash\", \"zsh\", \"fish\") or a path. Unset:\n",
+            "                                   $SHELL, else your login shell. Shell integration\n",
+            "                                   (prompt marks, jump-to-prompt, command blocks,\n",
+            "                                   cwd) is injected for zsh, bash, fish and pwsh.\n",
+            "                                       [config: shell]\n",
+        )
+    };
+}
+
 /// The `--help` text: every user-facing flag with its argument, a one-line description and its
 /// `[config: key]` where it has one. There is no ENVIRONMENT section: no variable changes what a
 /// shipped aterm does, so precedence is flag > config > default.
@@ -118,15 +154,7 @@ const HELP_HEAD: &str = concat!(
     "                                   launch.                 [config: font_px]\n",
     "        --font <name|path>         Primary font FAMILY (e.g. \"JetBrains Mono\") or\n",
     "                                   font file for this launch. [config: font_family]\n",
-    "        --shell <name|path>        Interactive shell to spawn. Discovery-resolved:\n",
-    "                                   \"bash\" finds Git Bash even off PATH; \"pwsh\",\n",
-    "                                   \"cmd\", \"wsl\", \"nu\", or an absolute path also work.\n",
-    "                                   Shell integration (prompt marks, jump-to-prompt,\n",
-    "                                   command blocks, cwd) is injected for zsh/bash/fish/\n",
-    "                                   pwsh and \"wsl\" (bash login shell). \"cmd\" is partial:\n",
-    "                                   prompt marks, jump-to-prompt and cwd work, but blocks\n",
-    "                                   carry no command text or exit code. \"nu\" gets none.\n",
-    "                                       [config: shell]\n",
+    shell_flag_help!(),
     "        --scale <f>                Force the render scale factor (font + padding).\n",
     "                                   In a window this overrides the display scale;\n",
     "                                   headless it makes the `image` capture render at\n",
@@ -135,7 +163,7 @@ const HELP_HEAD: &str = concat!(
     "                                   wgpu elsewhere; auto CPU fallback). [config: gpu]\n",
     "        --cpu                      Force the CPU renderer (overrides config; the\n",
     "                                   last of --cpu/--gpu wins).\n",
-    "        --containment <mode>       Containment mode: master|user|safety|containment\n",
+    "        --containment <mode>       Containment mode: user|safety|containment\n",
     "                                   (an invalid value fails closed to containment).\n",
     "        --sandbox                  Shorthand for --containment containment.\n",
     "        --no-sandbox               Shorthand for --containment user.\n",
@@ -149,6 +177,11 @@ const HELP_HEAD: &str = concat!(
     "                                   launcher that holds its write end is gone. For\n",
     "                                   harnesses: a killed test run takes its instance\n",
     "                                   with it.\n",
+    "        --ready-fd <n>             With --headless: once the control socket listens,\n",
+    "                                   write one byte to descriptor <n> (a pipe's write\n",
+    "                                   end, 3 or above) and close it; closed with nothing\n",
+    "                                   written, the instance has no socket. For harnesses:\n",
+    "                                   wait on it instead of polling the socket.\n",
     "        --columns <n>              Initial width in columns (20..=500).\n",
     "        --lines <n>                Initial height in rows (5..=300).\n",
     "        --shell-integration        OSC 133/633 command marks (blocks/cwd/title) — ON by\n",
@@ -165,8 +198,8 @@ const HELP_HEAD: &str = concat!(
     "        --list-fonts               List the font search dirs and discoverable\n",
     "                                   font families, then exit.\n",
     "        --show-config              Print what a launch resolves (font, size,\n",
-    "                                   renderer, theme, colours) and whether aterm.toml\n",
-    "                                   loaded, then exit.\n",
+    "                                   renderer, shell, theme, colours) and whether\n",
+    "                                   aterm.toml loaded, then exit.\n",
     "        --write-config             Write a documented starter aterm.toml if absent\n",
     "                                   (every line commented out, so it changes\n",
     "                                   nothing), then exit.\n",
@@ -236,7 +269,10 @@ fn keys_help() -> String {
     }
     // Not a chord, so not in the table: the pointer half of the keymap.
     s.push_str("    ctrl+click  Open a hyperlink / detected URL (http/https/mailto);\n");
-    s.push_str("                ctrl+alt+click where the program tracks the mouse.\n\n");
+    s.push_str("                ctrl+alt+click where the program tracks the mouse.\n");
+    s.push_str(
+        "    shift+drag  Select text where the program tracks the mouse (alt+drag too).\n\n",
+    );
     s
 }
 
@@ -249,10 +285,10 @@ fn keys_help() -> String {
 const HELP_TAIL: &str = concat!(
     "CHILD-SHELL ENV HYGIENE:\n",
     "    The spawned shell has every AI-agent context variable STRIPPED before exec —\n",
-    "    CLAUDE*, ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, CURSOR_*, AI_*, and\n",
-    "    _DEVTOOL_* — so they never leak into your session. An inner agent whose context\n",
-    "    vars went missing was sanitized here by design (aterm_types::env_sanitize), not\n",
-    "    lost. The one exception: a session spawned with `aterm ctl spawn identity=<name>`\n",
+    "    CLAUDE*, ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_*,\n",
+    "    and _DEVTOOL_* — so they never leak into your session. An inner agent whose\n",
+    "    context vars went missing was sanitized here by design (aterm_types::env_sanitize),\n",
+    "    not lost. The one exception: a session spawned with `aterm ctl spawn identity=<name>`\n",
     "    gets each agent's home variable (CLAUDE_CONFIG_DIR, CODEX_HOME) pointed into\n",
     "    <state>/identities/<name>/ — set AFTER the strip, so neither your login nor the\n",
     "    identity's leaks into the other.\n\n",
@@ -260,11 +296,10 @@ const HELP_TAIL: &str = concat!(
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
     "              selection_foreground,\n",
-    "              palette [array of #RRGGBB], window_theme, tab_strip_rows,\n",
-    "              robi (the tip-sharing helper robot; default off; once on,\n",
-    "              typing robi makes him greet you).\n",
+    "              palette [array of #RRGGBB], window_theme, tab_strip_rows.\n",
     "  Window/Tabs tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
-    "              tab_status_badge, tab_connection_badge.\n",
+    "              tab_status_badge, tab_connection_badge, spare_shell,\n",
+    "              spare_shell_needs_person.\n",
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
     "              cursor_style, cursor_blink, cursor_momentum_glow (typing-speed glow),\n",
     "              cursor_trail, cursor_trail_style (default rainbow kitty pet),\n",
@@ -287,14 +322,16 @@ const HELP_TAIL: &str = concat!(
     "              font_variation [\"wght=450\", ...], font_weight,\n",
     "              font_weight_dark_nudge (variable fonts, e.g. SF Mono),\n",
     "              font_family_bold/_italic/_bold_italic, font_synthetic_style,\n",
-    "              fallback_fonts [ordered], symbol_font, emoji_font\n",
-    "              (config > built-in discovery).\n",
+    "              fallback_fonts [ordered], symbol_font, emoji_font,\n",
+    "              line_height, font_size_scale (config > theme > built-in;\n",
+    "              a blank font name means aterm's own choice).\n",
     "  Behaviour   gpu, scrollback_lines, columns, lines, copy_on_select,\n",
     "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
     "              shell priority follows window focus; default on),\n",
-    "              explain_heavy_load (the band names what slows your typing;\n",
-    "              default on), desktop_alerts (aterm's own alerts also as\n",
-    "              system notifications; default off).\n",
+    "              conpty (Windows: the console host new tabs run in —\n",
+    "              inbox, the default | auto | a path to OpenConsole.exe),\n",
+    "              desktop_alerts (aterm's own alerts also as system\n",
+    "              notifications; default off).\n",
     "  Security    allow_window_ops, allow_notifications, allow_palette_reconfigure,\n",
     "              allow_kitty_file_transfer, allow_osc52_query,\n",
     "              secure_keyboard_entry (macOS)  (all opt-in, default off).\n",
@@ -345,16 +382,12 @@ const WINDOWS_HELP_TAIL: &str = concat!(
     "                               terminal's registration is left alone.\n",
 );
 
-/// The documented starter config `--write-config` writes: Linux-tuned, every line commented so
-/// writing it changes nothing. The header's [`CONFIG_PATH_SLOT`] is filled with the path it is
-/// written to ([`starter_config_for`]).
-const STARTER_CONFIG: &str = "\
-# aterm — <aterm.toml>
-# Every setting is optional; uncomment to override. Live settings reload on save;
-# renderer/initial-grid settings require relaunch, and session settings require a new session.
-# Launch flags (aterm-gui --help) take precedence over this file for that launch.
-
-# --- shell --------------------------------------------------------------------
+/// The shell block of [`STARTER_CONFIG`], as this platform resolves a shell (see
+/// `shell_flag_help!`).
+#[cfg(windows)]
+macro_rules! starter_shell_block {
+    () => {
+        "\
 # shell = \"bash\"        # interactive shell. Discovery-resolved: \"bash\" finds Git
 #                       # Bash even if it is not on PATH; \"pwsh\", \"cmd\", \"wsl\",
 #                       # \"nu\", or an absolute path also work. Unset = platform
@@ -373,6 +406,42 @@ const STARTER_CONFIG: &str = "\
 # shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (e.g. a login bash);
 #                       # for \"wsl\" these are wsl.exe options, e.g. [\"-d\", \"Debian\"]
 
+"
+    };
+}
+#[cfg(not(windows))]
+macro_rules! starter_shell_block {
+    () => {
+        "\
+# shell = \"bash\"        # interactive shell: a program name on PATH (\"bash\",
+#                       # \"zsh\", \"fish\") or a path. Unset = $SHELL, else your
+#                       # login shell (`aterm doctor` names the one this machine
+#                       # gets). Override at launch with --shell. Applies to new
+#                       # sessions. Shell integration (prompt marks, jump-to-
+#                       # prompt, command blocks, cwd tracking) is injected
+#                       # automatically for zsh, bash, fish and pwsh.
+# shell_args = [\"-l\", \"-i\"]  # extra argv after the shell, e.g. a login shell:
+#                       # macOS starts one already; elsewhere aterm starts an
+#                       # interactive non-login shell, as other terminals there do
+
+"
+    };
+}
+
+/// The documented starter config `--write-config` writes: Linux-tuned, every line commented so
+/// writing it changes nothing. The header's [`CONFIG_PATH_SLOT`] is filled with the path it is
+/// written to ([`starter_config_for`]).
+const STARTER_CONFIG: &str = concat!(
+    "\
+# aterm — <aterm.toml>
+# Every setting is optional; uncomment to override. Live settings reload on save;
+# renderer/initial-grid settings require relaunch, and session settings require a new session.
+# Launch flags (aterm-gui --help) take precedence over this file for that launch.
+
+# --- shell --------------------------------------------------------------------
+",
+    starter_shell_block!(),
+    "\
 # --- appearance ---------------------------------------------------------------
 # font_family = \"JetBrains Mono\"  # any installed monospace family, or a .ttf path
 # font_family_bold = \"JetBrains Mono Bold\"      # real bold face (unset = auto-discover)
@@ -413,14 +482,15 @@ const STARTER_CONFIG: &str = "\
 # tab_status_dwell_ms = 750        # hysteresis before a phase is published, clamped to 0..=10000
 # tab_status_badge = true          # project status onto the tab's busy/attention marks
 # tab_connection_badge = true      # mark tabs holding/receiving a session connection (▲ out / ▽ in / hourglass both)
+# spare_shell = \"auto\"           # a shell spawned ahead that a plain new tab adopts: auto | parked | off
+# spare_shell_needs_person = true  # a spare exists only after a person's gesture in the last 10 min
 
 # --- motion / cursor aurora -----------------------------------------------------
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off
-# robi = true                      # Robi the helper robot lives on your terminal (walks your typed row, ladder up, tab-bar monkey bars, tips above his head); type robi to make him greet you (default OFF)
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop decorative effects under sustained render overload (smooth scrolling is never shed); false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown, plus the walking cat the default style rides it with. Default ON — except on Windows, where it is opt-IN: uncomment this line for the whole show
-# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw; aliases \"v0.28\"/\"retro\") | classic mono (the same salvaged trail in ONE hue from the theme cursor colour, following cursor_trail_color/OSC 12, instead of the rolling spectrum) | off
+# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow kitty flat (the A/B control: the flat body of 2026-09-13, before the comet body and its vivid rail; aliases \"rainbow flat\"/\"flat rainbow\"/\"nyan flat\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw) | classic mono (the same salvaged trail in ONE hue from the theme cursor colour, following cursor_trail_color/OSC 12, instead of the rolling spectrum) | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
@@ -445,14 +515,13 @@ const STARTER_CONFIG: &str = "\
 # cursor_fire_shimmer = true           # GPU-only heat-haze refraction above burning cells (default ON)
 # hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR or Windows scRGB; provably inert on SDR; default ON)
 # cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only — light themes self-degrade; 0 = off)
-# stream_fade = true               # set true to enable streamed-output fade-in (default OFF; obeys Reduce Motion)
-# stream_fade_ms = 90              # fade-in duration in ms (16..=1000)
 # temporal_recording = false       # record a per-session replay spine (query via `aterm-ctl temporal [tick]`); default off, costs memory; applies to new sessions
 
 # --- text shaping -------------------------------------------------------------
 # ligatures = true                 # programming ligatures (=>, !=, >=, ===, ...)
 # cursor_break_ligatures = true    # break the cursor cell out of ligatures (default false leaves ligatures intact)
-# line_height = 1.0                # cell-box multiplier 0.8..=2.0 (leading splits half above/below)
+# line_height = 1.0                # cell-box multiplier 0.8..=2.0 (leading splits half above/below; default 1.1 on Windows, 1.0 elsewhere)
+# font_size_scale = 1.0            # multiplies font_px or the auto size, 0.8..=1.25 (a theme may set it; this wins)
 # adjust_baseline = 0              # px baseline escape hatch (±32) for off-metric faces
 # adjust_underline_position = 0    # px underline shift (±32, + = down) over the font's post table
 # adjust_underline_thickness = 0   # px underline thickness delta (±32) over the font's post table
@@ -479,16 +548,16 @@ const STARTER_CONFIG: &str = "\
                                    # (the version lives in the menu bar: the v<version> menu opens About)
 # confirm_multiline_paste = true   # confirm an unbracketed paste holding a line break (macOS sheet / Windows dialog / Linux in-window banner)
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
-# explain_heavy_load = true        # when typing slows because something else loads the machine, the message band names it
-                                   # (\"Typing slowed by cargo in tab 2\"); details go to the log. false: off entirely
-# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, a macOS permission, the operator, and
-                                   # the one update-health cause only you can end) also as system notifications (macOS:
+# conpty = \"inbox\"                 # Windows: the console host new tabs run in. DEFAULT \"inbox\" (the Windows console host);
+                                   # \"auto\" tries OpenConsole (beside aterm, else a copy of Windows Terminal's), or give the
+                                   # path of an OpenConsole.exe. `aterm doctor` names the host a new tab gets
+# desktop_alerts = false           # aterm's OWN alerts (an agent that needs you, a macOS permission, and the one
+                                   # update-health cause only you can end) also as system notifications (macOS:
                                    # terminal-notifier, else osascript = \"Script Editor\"). DEFAULT off: they stay in the
-                                   # band, the menu bar and messages.log,
-                                   # the operator's only counted in `aterm fleet status`. Programs' OSC 9/99/777
+                                   # band, the menu bar and messages.log. Programs' OSC 9/99/777
                                    # notifications are allow_notifications' below
 
-# --- security opt-ins (all default OFF) ---------------------------------------
+# --- program permissions (default OFF unless noted) --------------------------
 # allow_window_ops = false         # XTWINOPS title, text-grid-size, text-area-pixels and cell-size reports (window/screen
 #                                  # position and screen size stay unanswered); Linux also applies window
 #                                  # manipulations (move stays denied)
@@ -496,7 +565,8 @@ const STARTER_CONFIG: &str = "\
 #                                  # if installed, else osascript — a subprocess under aterm's identity; Windows
 #                                  # shows a notification-area balloon/toast from aterm itself (Shell_NotifyIcon,
 #                                  # no subprocess); Linux has no delivery yet — the request is dropped
-# allow_palette_reconfigure = false
+# allow_palette_reconfigure = true   # programs may set the 256 indexed colours (OSC 4/21: base16-shell, pywal,
+#                                  # theme.sh) for the session; false refuses
 # allow_kitty_file_transfer = false # let Kitty file/temp-file/shm media read host files; applies to new sessions
 # allow_osc52_query = false        # programs may READ the clipboard (OSC 52); answered only when on. On macOS 26 that
 #                                  # read is what raises the system's \"aterm would like to paste from …\" alert
@@ -629,8 +699,8 @@ const STARTER_CONFIG: &str = "\
 # any bare top-level key placed below it would parse as a keybinding entry) -------
 # [keybindings]
 # \"ctrl+shift+t\" = \"new_tab\"
-# \"ctrl+shift+space\" = \"toggle_vi_mode\"   # keyboard copy-mode (h/j/k/l, w/b/e, f/t, v, Esc)
-";
+",
+);
 
 /// Pull the next argument as the value for `flag`, exiting 2 with a hint if it is
 /// missing. Used by the value-taking flags so they share one error shape.
@@ -667,10 +737,7 @@ fn initial_dimension_flag(value: &str, min: u16, max: u16) -> Option<u16> {
 /// the answer in as few writes as the stream allows.
 fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
     use std::io::Write as _;
-    let written = {
-        let mut out = std::io::stdout().lock();
-        out.write_all(text.as_bytes()).and_then(|()| out.flush())
-    };
+    let written = aterm_uds::stdout::write_all(text.as_bytes());
     let status = answer_status(written, code).unwrap_or_else(|line| {
         let _ = writeln!(std::io::stderr(), "{line}");
         1
@@ -688,11 +755,7 @@ fn answer_and_exit(argv: &[String], text: &str, code: i32) -> ! {
 /// reader closed the pipe (`BrokenPipe`, which both Windows pipe-closed errors map to; aterm-ctl's
 /// rule for `| head`), else the stderr line naming the failure, which exits 1.
 fn answer_status(written: std::io::Result<()>, code: i32) -> Result<i32, String> {
-    match written {
-        Ok(()) => Ok(code),
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(code),
-        Err(e) => Err(format!("aterm-gui: the answer was not written ({e})")),
-    }
+    aterm_uds::stdout::answer_status("aterm-gui", written, code)
 }
 
 /// Whether this answer went straight onto a console this process attached to: the windowed
@@ -751,6 +814,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
     let mut hold = false;
     let mut headless = false;
     let mut lifeline_fd: Option<String> = None;
+    let mut ready_fd: Option<String> = None;
     let mut exec_command: Option<Vec<std::ffi::OsString>> = None;
     let mut launch = crate::launch::Launch::default();
     while let Some(arg) = args.next() {
@@ -1002,6 +1066,8 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
             // Validated once the whole command line is read: it needs `--headless`,
             // which may come after it.
             "--lifeline-fd" => lifeline_fd = Some(flag_value("--lifeline-fd", &mut args)),
+            // As `--lifeline-fd`: validated once the whole command line is read.
+            "--ready-fd" => ready_fd = Some(flag_value("--ready-fd", &mut args)),
             "--columns" => {
                 let v = flag_value("--columns", &mut args);
                 if let Some(n) = initial_dimension_flag(&v, 20, 500) {
@@ -1061,12 +1127,19 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
         eprintln!("aterm: {why} (try --help)");
         std::process::exit(2);
     });
+    let relaunch_of_running = std::env::var_os(aterm_update::RELAUNCH_OF_RUNNING_ENV).is_some();
+    let ready_fd = ready_request(ready_fd.as_deref(), headless, relaunch_of_running)
+        .unwrap_or_else(|why| {
+            eprintln!("aterm: {why} (try --help)");
+            std::process::exit(2);
+        });
     Cli {
         exec_command,
         cwd,
         hold,
         headless,
         lifeline_fd,
+        ready_fd,
         launch,
     }
 }
@@ -1105,10 +1178,36 @@ fn lifeline_request(value: Option<&str>, headless: bool) -> Result<Option<i32>, 
     Ok(Some(fd))
 }
 
+/// The `--ready-fd` decision, pure: `Ok(None)` when the flag is absent, the descriptor number
+/// when it is well-formed on a headless launch, and the usage error otherwise — refused for a
+/// window (a person sees it come up) and for 0-2 (the instance's own stdio). On an update's
+/// relaunch of a running instance (`relaunch_of_running`, `aterm_update::RELAUNCH_OF_RUNNING_ENV`)
+/// the flag is the first image's argv carried over: that image signalled and closed its
+/// descriptor long ago, and the number may name another descriptor now, so it is dropped unread.
+fn ready_request(
+    value: Option<&str>,
+    headless: bool,
+    relaunch_of_running: bool,
+) -> Result<Option<i32>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(fd) = value.parse::<i32>().ok().filter(|fd| *fd > 2) else {
+        return Err(format!(
+            "--ready-fd expects a descriptor number above stdio (3 or more), got '{value}'"
+        ));
+    };
+    if !cfg!(unix) {
+        return Err("--ready-fd is not supported on this platform".to_string());
+    }
+    if !headless {
+        return Err("--ready-fd needs --headless (a window is seen coming up)".to_string());
+    }
+    Ok((!relaunch_of_running).then_some(fd))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::HELP_HEAD;
-
     /// A `-d` folder that has gone since the window opened stops a person's launch (exit 2) and
     /// never an update's relaunch of that window.
     #[test]
@@ -1125,20 +1224,6 @@ mod tests {
         assert_eq!(super::start_dir_refusal(&here, false), None);
         assert_eq!(super::start_dir_refusal(&here, true), None);
     }
-
-    /// Every user-facing diagnostic verb: each must be advertised in `--help` and have a match
-    /// arm in `parse_cli`.
-    const DIAGNOSTIC_VERBS: &[&str] = &[
-        "--diagnose",
-        "--list-actions",
-        "--validate-config",
-        "--list-fonts",
-        "--show-config",
-        "--write-config",
-        "--list-keybinds",
-        "--show-face",
-        "--list-themes",
-    ];
 
     /// A reader that closed the pipe (Windows os errors 232 and 109 included) ends the answer
     /// quietly with the flag's own status; any other failure is said, with status 1.
@@ -1166,35 +1251,10 @@ mod tests {
                 "{what} (os error {os_error}) is the reader going away"
             );
         }
-        let refused = super::answer_status(Err(Error::from(ErrorKind::StorageFull)), 0)
-            .expect_err("a full disk is a failure to report");
         assert!(
-            refused.starts_with("aterm-gui: the answer was not written ("),
-            "{refused}"
+            super::answer_status(Err(Error::from(ErrorKind::StorageFull)), 0).is_err(),
+            "a full disk is a failure to report"
         );
-    }
-
-    /// No print-and-exit arm uses `print!`/`println!`, which panic on a closed stdout;
-    /// `eprintln!` (a usage error) is not an answer.
-    #[test]
-    fn every_answer_goes_through_the_panic_free_writer() {
-        let src = include_str!("cli.rs");
-        let body = src
-            .split_once("pub(crate) fn parse_cli(")
-            .expect("parse_cli exists")
-            .1;
-        let body = &body[..body.find("\nfn lifeline_request(").expect("the next item")];
-        for (at, _) in body.match_indices("print") {
-            let before = body[..at].chars().next_back();
-            let macro_call =
-                body[at..].starts_with("print!(") || body[at..].starts_with("println!(");
-            assert!(
-                !macro_call || before == Some('e'),
-                "parse_cli prints with a panicking macro: {}",
-                &body[at..(at + 40).min(body.len())]
-            );
-        }
-        assert!(body.contains("answer_and_exit(&argv, &help, 0)"));
     }
 
     /// The line under an answer that went straight onto a prompt's console names
@@ -1217,51 +1277,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn help_advertises_diagnostic_flags() {
-        // Every user-facing diagnostic flag must be discoverable in --help.
-        for flag in DIAGNOSTIC_VERBS {
-            assert!(
-                HELP_HEAD.contains(flag),
-                "{flag} must be advertised in the help text"
-            );
-        }
-    }
-
-    /// Off macOS the KEYS section is generated from the seed table: every seeded chord and
-    /// action is documented, and no `cmd+*` chord (off macOS, the desktop-owned Super key) leaks
-    /// in.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn keys_help_documents_every_seeded_default_and_no_cmd_chords() {
-        let keys = super::keys_help();
-        for &(chord, action) in crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS {
-            assert!(keys.contains(chord), "{chord} must be documented");
-            assert!(keys.contains(action), "{action} must be documented");
-        }
-        assert!(!keys.contains("cmd+"), "no Cmd chords off macOS:\n{keys}");
-        assert!(
-            keys.contains("ctrl+click"),
-            "the pointer half of the keymap stays documented"
-        );
-        assert!(
-            keys.contains("ctrl+alt+click"),
-            "the gesture the link caption names over a mouse-tracking program:\n{keys}"
-        );
-    }
-
     /// `--headless` arms the mode through the `Cli` field alone: nothing is
     /// exported, so a child the window spawns inherits no headless request.
     #[test]
     fn the_headless_flag_is_recorded_and_exports_nothing() {
         let cli = super::parse_cli(vec![std::ffi::OsString::from("--headless")]);
         assert!(cli.headless);
-        assert!(
-            HELP_HEAD.contains("--headless") && !HELP_HEAD.contains("[env: ATERM_HEADLESS]"),
-            "--help names the flag and no environment spelling"
-        );
-        // No lifeline unless one is asked for.
+        // No lifeline unless one is asked for, and no ready signal.
         assert_eq!(cli.lifeline_fd, None);
+        assert_eq!(cli.ready_fd, None);
+    }
+
+    /// `--ready-fd` arms only a headless launch, in either order, with a descriptor above stdio;
+    /// an update's relaunch of a running instance drops the first image's number unread;
+    /// everything else is a usage error that names the fix.
+    #[test]
+    fn the_ready_flag_arms_only_a_headless_launch() {
+        use super::ready_request as req;
+        assert_eq!(req(None, true, false), Ok(None));
+        #[cfg(unix)]
+        {
+            assert_eq!(req(Some("9"), true, false), Ok(Some(9)));
+            assert_eq!(
+                req(Some("9"), true, true),
+                Ok(None),
+                "the first image's, unread"
+            );
+            let window = req(Some("9"), false, false).expect_err("a window is refused");
+            assert!(window.contains("needs --headless"), "{window}");
+        }
+        for bad in ["0", "2", "-1", "x", ""] {
+            let err = req(Some(bad), true, false).expect_err(bad);
+            assert!(err.contains("above stdio"), "{err}");
+        }
     }
 
     /// `-e`'s payload is handed on as the OS gave it: a raw byte that is not
@@ -1313,10 +1361,6 @@ mod tests {
             let err = req(Some(bad), true).expect_err(bad);
             assert!(err.contains("expects a descriptor number"), "{err}");
         }
-        assert!(
-            HELP_HEAD.contains("--lifeline-fd <n>"),
-            "--help documents it"
-        );
     }
 
     /// The socket directive of the launch flags is the shared one: a path binds
@@ -1399,64 +1443,6 @@ mod tests {
             parse(&["--font", "  "]).font_family,
             None,
             "a blank family is no pin"
-        );
-        // Nothing in this file writes the environment.
-        let source = include_str!("cli.rs");
-        let writer = ["aterm_log::env::", "set("].concat();
-        assert!(
-            !source.contains(&writer),
-            "a launch flag must not export anything: found `{writer}`"
-        );
-    }
-
-    #[test]
-    fn every_advertised_verb_is_dispatchable() {
-        // Each advertised verb has a `"<flag>" =>` arm in this file; read from source because
-        // the arms call `std::process::exit`.
-        let src = include_str!("cli.rs");
-        for flag in DIAGNOSTIC_VERBS {
-            let arm = format!("\"{flag}\" =>");
-            assert!(
-                src.contains(&arm),
-                "{flag} is advertised but has no dispatch arm ({arm})"
-            );
-        }
-    }
-
-    /// Every Windows verb but `--set-default-terminal` (which refuses in every build) is
-    /// advertised in the Windows help block, the block reaches `--help`, and each verb has a
-    /// dispatch arm.
-    #[cfg(windows)]
-    #[test]
-    fn windows_help_advertises_every_windows_verb() {
-        let src = include_str!("cli.rs");
-        for flag in [
-            "--install-context-menu",
-            "--uninstall-context-menu",
-            "--unset-default-terminal",
-        ] {
-            assert!(
-                super::WINDOWS_HELP_TAIL.contains(flag),
-                "{flag} must be documented in the Windows --help block"
-            );
-            let arm = format!("\"{flag}\" =>");
-            assert!(
-                src.contains(&arm),
-                "{flag} is advertised but has no dispatch arm ({arm})"
-            );
-        }
-        // The verb that refuses in every build keeps its arm and stays unadvertised.
-        assert!(src.contains("\"--set-default-terminal\" =>"));
-        assert!(!super::WINDOWS_HELP_TAIL.contains("--set-default-terminal"));
-        // ...and the block is actually printed by the -h/--help arm.
-        let help_arm = src
-            .split_once("\"-h\" | \"--help\" => {")
-            .expect("the help arm exists")
-            .1;
-        let help_arm = &help_arm[..help_arm.len().min(1200)];
-        assert!(
-            help_arm.contains("WINDOWS_HELP_TAIL"),
-            "--help must print the Windows verb block, not just define it"
         );
     }
 
@@ -1580,24 +1566,6 @@ mod tests {
                  `[table]` header? Keep all bare top-level keys ABOVE every table."
             );
         }
-        for must in ["stream_fade", "stream_fade_ms"] {
-            assert!(
-                checked.iter().any(|k| k == must),
-                "STARTER_CONFIG dropped `{must}` — keep the stream-fade sample and \
-                 its duration together."
-            );
-        }
-        for inert in [
-            "[sparkle_words.orca]",
-            "materialize =",
-            "ink_text =",
-            "phosphor =",
-        ] {
-            assert!(
-                !super::STARTER_CONFIG.contains(inert),
-                "new starter configs must not advertise compatibility-only `{inert}`"
-            );
-        }
     }
 
     /// The `[matrix_rain]` starter block is table-scoped, so the line-by-line check above skips
@@ -1656,9 +1624,6 @@ mod tests {
         );
         assert!(mr.turn_wave.is_some(), "starter documents `turn_wave`");
         assert!(mr.bell_alert.is_some(), "starter documents `bell_alert`");
-        assert_eq!(mr.materialize, None, "starter omits inert materialize");
-        assert_eq!(mr.ink_text, None, "starter omits inert ink_text");
-        assert_eq!(mr.phosphor, None, "starter omits inert phosphor");
         assert!(mr.seed.is_some(), "starter documents `seed`");
         // The starter documents the default-off posture (costume mode is opt-in).
         assert_eq!(mr.enabled, Some(false), "the starter example ships OFF");

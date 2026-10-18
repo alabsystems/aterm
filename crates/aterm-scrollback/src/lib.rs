@@ -5,12 +5,10 @@
 // Trust: opt into the `trust` tool-attribute namespace ONLY under a trustc
 // verification build (`cfg(trust_verify)`, injected by `trustc -Z trust-verify`).
 // A normal stable build sees neither the feature gate nor the attributes, so this
-// is a no-op there; under Trust it enables `#[trust::backing]` / `#[trust::single_writer]`
-// on the mmap types so the compiler PROVES their HIGH-2 spatial bounds and
-// temporal (truncation) safety.
+// is a no-op there; under Trust it enables the `#[trust::...]` attributes
+// (`trust::skip` on the paths the verifier does not model).
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
-#![cfg_attr(not(trust_verify), allow(unexpected_cfgs))]
 // F11-4 (#7941): production unwrap() is forbidden; tests opt out uniformly at the
 // crate root so a missing per-module allow can't silently slip past clippy.
 #![warn(clippy::unwrap_used)]
@@ -24,7 +22,7 @@
 //!
 //! - **Hot tier**: Recent lines in RAM (uncompressed, instant access)
 //! - **Warm tier**: Older lines in RAM (LZ4 compressed, ~10x compression)
-//! - **Cold tier**: Oldest lines (LZ4 compressed, in-memory or disk-backed)
+//! - **Cold tier**: Oldest lines (LZ4 compressed, in memory)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
@@ -40,7 +38,7 @@
 //! │                         ↓ Age out                          │
 //! │  COLD TIER - Oldest history                                 │
 //! │  ┌─────────────────────────────────────────────────────┐   │
-//! │  │ Scrollback: in-memory  /  DiskBacked: mmap          │   │
+//! │  │ LZ4 compressed pages, in memory                     │   │
 //! │  └─────────────────────────────────────────────────────┘   │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
@@ -49,15 +47,10 @@
 //!
 //! - [`Scrollback`]: In-memory cold tier with budget-aware cold eviction.
 //!   Memory budget covers hot + warm + cold compressed pages.
-//! - [`DiskBackedScrollback`]: Disk-backed cold tier via memory-mapped file.
-//!   Enables unlimited history with disk offloading; hot+warm RAM is bounded,
-//!   while cold tier keeps an in-memory index + cache for fast lookups.
 //!
 //! ## Memory Targets (Total, All Tiers)
 //!
 //! These are typical total memory usage figures including cold tier.
-//! For [`DiskBackedScrollback`], hot+warm RAM usage is bounded by budget; cold tier
-//! stores bulk data on disk while keeping a small in-memory index + cache.
 //!
 //! | Lines | Typical Memory |
 //! |-------|----------------|
@@ -97,36 +90,20 @@
 //!   themselves by `src/tests/` and `cold_tier_tests.rs`.
 //! - Exhaustive sweeps: the watermark thresholds over every budget up to
 //!   100,000 (`thresholds_are_bounded_for_every_budget`), the LZ4 decoder's
-//!   claim law over every small input (`lz4::tests`), and, with `disk-tier`,
-//!   the disk page lookup and front truncation over every small layout.
+//!   claim law over every small input (`lz4::tests`).
 
 #![warn(missing_docs)]
 
 mod access;
 mod codec;
 mod cold_tier;
-// Disk-backed cold tier (mmap/libc/std::fs). Opt-in per §2.7; default build is
-// a headless hot(RAM)+warm(LZ4) scrollback with no platform dependencies.
-#[cfg(feature = "disk-tier")]
-mod disk;
-#[cfg(feature = "disk-tier")]
-mod disk_backed;
-#[cfg(feature = "disk-tier")]
-mod disk_format;
 mod error;
 mod hot_tier;
 mod iter;
 mod line;
 mod log_shim;
-#[cfg(any(fuzzing, feature = "fuzz"))]
-pub mod lz4;
-#[cfg(not(any(fuzzing, feature = "fuzz")))]
 pub(crate) mod lz4;
-// Thin libc mmap wrapper — only compiled for the disk-backed cold tier.
-#[cfg(feature = "disk-tier")]
-pub mod mmap;
 mod scrollback_accounting;
-mod search_content;
 mod storage;
 mod tier;
 mod tier_capabilities;
@@ -141,12 +118,6 @@ pub(crate) use codec::{
 };
 pub use codec::{DEFAULT_LINE_LIMIT, DEFAULT_MEMORY_BUDGET};
 pub(crate) use cold_tier::ColdTier;
-#[cfg(feature = "disk-tier")]
-pub(crate) use disk::DiskColdTier;
-#[cfg(feature = "disk-tier")]
-pub use disk_backed::{DiskBackedScrollback, DiskBackedScrollbackConfig};
-#[cfg(feature = "disk-tier")]
-pub(crate) use disk_format::DiskColdConfig;
 pub use error::ScrollbackError;
 pub(crate) use hot_tier::HotTier;
 pub use iter::{DenseScrollbackIter, ScrollbackIter};
@@ -155,6 +126,7 @@ pub use line::{AttrRunCursor, CellAttrs, HyperlinkSpan, ImageSpan, Line, Underli
 pub use line::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, max_linked_record_bytes, serialize_lines,
+    serialize_lines_bounded,
 };
 pub use storage::ScrollbackStorage;
 pub(crate) use tier::WarmTier;
@@ -417,8 +389,6 @@ impl Scrollback {
     ///
     /// For [`Scrollback`], cold tier is in-memory and participates in budget
     /// enforcement via FIFO eviction of the oldest cold pages.
-    /// For disk-backed cold storage, use `DiskBackedScrollback::cold_memory_used`
-    /// for cache/metadata memory and `DiskBackedScrollback::cold_disk_used` for disk usage.
     #[must_use]
     pub fn cold_memory_used(&self) -> usize {
         self.cold.compressed_size()
@@ -516,10 +486,8 @@ impl Default for Scrollback {
 /// How many of `lines` carry an inline-image span — i.e. how many FOOTPRINT
 /// ROWS lose their picture when this batch is compressed.
 ///
-/// The ONE seam both tiered stores count the image retention horizon through
-/// ([`Scrollback`] and `DiskBackedScrollback` each compress hot lines in their
-/// own `promote_hot_to_warm`), so the two counters cannot come to mean
-/// different things. Counts LINES, not spans: a row covered by two placements
+/// The one seam the tiered store counts the image retention horizon through
+/// (from [`Scrollback`]'s `promote_hot_to_warm`). Counts LINES, not spans: a row covered by two placements
 /// side by side is still one row of history that lost its pictures, and the
 /// sibling loss counters ([`Scrollback::pressure_evicted_lines`]) are line
 /// counts too.
@@ -544,21 +512,9 @@ pub(crate) fn count_image_rows(lines: &[Line]) -> u64 {
 #[cfg(test)]
 mod tests;
 
-// Never-panic fuzz of the decode surfaces (was tests/fuzz_decode.rs, which only
-// compiled under `cfg(any(fuzzing, feature = "fuzz"))` and so ran in no test
-// run). Runs in every lib test build; `fuzz` only deepens it.
+// Never-panic fuzz of the decode surfaces; runs in every lib test build.
 #[cfg(test)]
 mod decode_fuzz_tests;
-
-// Tests for disk-backed scrollback.
-#[cfg(all(test, feature = "disk-tier"))]
-#[path = "disk_backed_tests.rs"]
-mod disk_backed_tests;
-
-// Regression tests for #5928: cold tier reload data integrity.
-#[cfg(all(test, feature = "disk-tier"))]
-#[path = "disk_backed_reload_tests.rs"]
-mod disk_backed_reload_tests;
 
 // Incremental memory-tracking regression tests.
 #[cfg(test)]

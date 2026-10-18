@@ -13,7 +13,29 @@
 //!   window (better batching) without a synthetic user key.
 //! * **Unkeyed ephemeral** → `hash(msg_id)` (spread freely).
 
-use crate::hash::fnv1a_64;
+use crate::hash::{fnv1a_64, fnv1a_64_update, FNV1A_64_INIT};
+
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+#[path = "partition_island.rs"]
+mod partition_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::partition_modulus_clamp;
+#[cfg(clean_islands)]
+pub use partition_island::partition_modulus_clamp;
+
+contract_fn! {
+    /// Whether assigned `partition` is strictly below the nonzero `modulus` (`partition < modulus`).
+    ///
+    /// Verified against `Astream.Wire.TlaPartitionRouter.partition_in_bounds_isl` by
+    /// `clean-kernel-defeq`.
+    pub fn partition_in_bounds(partition: u64, modulus: u64) -> bool
+    clauses [ensures result == (partition < modulus)]
+    {
+        partition < modulus
+    }
+}
 
 /// Width of the sticky time bucket for unkeyed durable messages, in ms.
 /// A tunable knob; coarse enough to batch, fine enough to rebalance.
@@ -25,8 +47,8 @@ pub fn time_bucket(timestamp_ms: u64) -> u64 {
 }
 
 /// What determines a message's partition. Borrowed, so this stays allocation-
-/// free for the common keyed/ephemeral cases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// free for all three routing variants.
+#[derive(Debug, Clone, Copy, Eq)]
 pub enum PartitionKey<'a> {
     /// An explicit routing key.
     Keyed(&'a [u8]),
@@ -40,8 +62,35 @@ pub enum PartitionKey<'a> {
     UnkeyedEphemeral { msg_id: u128 },
 }
 
-/// Assign a partition in `0..num_partitions.max(1)`. Deterministic and always
-/// in bounds (the `.max(1)` guard means `num_partitions == 0` maps to 1).
+impl PartialEq for PartitionKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Keyed(a), Self::Keyed(b)) => *a == *b,
+            (
+                Self::UnkeyedDurable {
+                    topic: t1,
+                    origin: o1,
+                    time_bucket: b1,
+                },
+                Self::UnkeyedDurable {
+                    topic: t2,
+                    origin: o2,
+                    time_bucket: b2,
+                },
+            ) => *t1 == *t2 && *o1 == *o2 && *b1 == *b2,
+            (Self::UnkeyedEphemeral { msg_id: a }, Self::UnkeyedEphemeral { msg_id: b }) => {
+                *a == *b
+            }
+            (Self::Keyed(_), _)
+            | (Self::UnkeyedDurable { .. }, _)
+            | (Self::UnkeyedEphemeral { .. }, _) => false,
+        }
+    }
+}
+
+/// Assign a partition in `0..num_partitions.max(1)`. Deterministic, allocation-free,
+/// and always in bounds (the `.max(1)` guard — matching [`partition_modulus_clamp`]
+/// with `floor = 1` — means `num_partitions == 0` maps to 1).
 pub fn assign_partition(key: PartitionKey<'_>, num_partitions: u32) -> u32 {
     let n = num_partitions.max(1) as u64;
     let h = match key {
@@ -55,13 +104,12 @@ pub fn assign_partition(key: PartitionKey<'_>, num_partitions: u32) -> u32 {
             // field itself contains the byte we might otherwise use as a
             // separator. A bare separator is forgeable: ("a\x1fb","c") and
             // ("a","b\x1fc") collide under it. Length prefixes cannot collide.
-            let mut buf = Vec::with_capacity(topic.len() + origin.len() + 24);
-            buf.extend_from_slice(&(topic.len() as u64).to_le_bytes());
-            buf.extend_from_slice(topic.as_bytes());
-            buf.extend_from_slice(&(origin.len() as u64).to_le_bytes());
-            buf.extend_from_slice(origin.as_bytes());
-            buf.extend_from_slice(&time_bucket.to_le_bytes());
-            fnv1a_64(&buf)
+            // Streamed directly through FNV-1a with zero heap allocation.
+            let h = fnv1a_64_update(FNV1A_64_INIT, &(topic.len() as u64).to_le_bytes());
+            let h = fnv1a_64_update(h, topic.as_bytes());
+            let h = fnv1a_64_update(h, &(origin.len() as u64).to_le_bytes());
+            let h = fnv1a_64_update(h, origin.as_bytes());
+            fnv1a_64_update(h, &time_bucket.to_le_bytes())
         }
         PartitionKey::UnkeyedEphemeral { msg_id } => fnv1a_64(&msg_id.to_le_bytes()),
     };
@@ -88,10 +136,12 @@ mod tests {
             PartitionKey::UnkeyedEphemeral { msg_id: u128::MAX },
         ];
         for n in [0u32, 1, 2, 7, 1024, u32::MAX - 1, u32::MAX] {
+            let modulus = partition_modulus_clamp(n as u64, 1);
+            assert_eq!(modulus, n.max(1) as u64);
             for key in keys {
                 let p = assign_partition(key, n);
                 assert!(
-                    p < n.max(1),
+                    partition_in_bounds(p as u64, modulus),
                     "partition {p} out of bounds for n={n}, key={key:?}"
                 );
             }

@@ -209,7 +209,7 @@ fn stage_sibling_temp_with_mode(path: &str, bytes: &[u8], mode: u32) -> std::io:
             Err(e) => return Err(e),
         }
     };
-    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    let written = f.write_all(bytes).and_then(|()| aterm_durable::durable(&f));
     drop(f);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
@@ -262,7 +262,22 @@ pub fn sync_parent(path: &str) -> std::io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::File::open(parent)?.sync_all()
+    aterm_durable::durable(&std::fs::File::open(parent)?)
+}
+
+/// [`sync_parent`], only ORDERED ([`aterm_durable::ordered`]): the entry change lands before
+/// any later write on the device, nothing is durable on return. For a step that only its
+/// next step depends on (a roster transaction's redo log before its commit, a retirement
+/// after its pair), never for a name that published authority depends on.
+///
+/// # Errors
+/// The parent could not be opened, or the flush's own error.
+pub fn sync_parent_ordered(path: &str) -> std::io::Result<()> {
+    let parent = std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    aterm_durable::ordered(&std::fs::File::open(parent)?)
 }
 
 /// Create every missing directory above `path`, so a write to it cannot fail with ENOENT.

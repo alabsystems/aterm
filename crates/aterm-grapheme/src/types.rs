@@ -21,39 +21,6 @@ pub struct Grapheme<'a> {
     pub has_combining: bool,
 }
 
-#[cfg(test)]
-impl Grapheme<'_> {
-    /// Check if this grapheme is a single ASCII character.
-    ///
-    /// REQUIRES: `self.text` is valid UTF-8 (`&str` invariant).
-    /// ENSURES: returns `true` iff `self.text` has length 1 and its byte is `< 128`.
-    #[inline]
-    #[must_use]
-    pub fn is_ascii(&self) -> bool {
-        self.text.len() == 1 && self.text.as_bytes()[0] < 128
-    }
-
-    /// Check if this grapheme is whitespace.
-    ///
-    /// REQUIRES: `self.text` is valid UTF-8 (`&str` invariant).
-    /// ENSURES: returns `true` iff every codepoint in `self.text` satisfies `char::is_whitespace()`.
-    #[inline]
-    #[must_use]
-    pub fn is_whitespace(&self) -> bool {
-        self.text.chars().all(char::is_whitespace)
-    }
-
-    /// Check if this grapheme is a control character.
-    ///
-    /// REQUIRES: `self.text` is valid UTF-8 (`&str` invariant).
-    /// ENSURES: returns `true` iff at least one codepoint in `self.text` satisfies `char::is_control()`.
-    #[inline]
-    #[must_use]
-    pub fn is_control(&self) -> bool {
-        self.text.chars().any(char::is_control)
-    }
-}
-
 /// Aggregate information about graphemes in a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GraphemeInfo {
@@ -71,26 +38,4 @@ pub struct GraphemeInfo {
     pub has_combining: bool,
     /// Whether any grapheme is wide (2 cells).
     pub has_wide: bool,
-}
-
-/// Classify the type of a grapheme for rendering decisions.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GraphemeType {
-    /// Simple ASCII character
-    Ascii,
-    /// CJK or other wide character (2 cells)
-    Wide,
-    /// Emoji (typically 2 cells)
-    Emoji,
-    /// ZWJ sequence (emoji joined by Zero Width Joiner)
-    ZwjSequence,
-    /// Flag emoji (regional indicator pair)
-    Flag,
-    /// Character with combining marks
-    Combining,
-    /// Control character (0 width)
-    Control,
-    /// Other Unicode character
-    Other,
 }

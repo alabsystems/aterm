@@ -53,7 +53,6 @@ fn the_output_to_redraw_request_span_is_booked_once_per_burst() {
         None,
         "a second wake for the same burst is not a second request"
     );
-    std::thread::sleep(Duration::from_millis(2));
     stamp_ms_ago(3);
     assert!(
         app.note_output_redraw_request(session).is_some(),
@@ -89,7 +88,6 @@ fn the_ime_clock_times_preedit_to_commit_and_counts_cancels() {
         Some(started),
         "a growing composition keeps its start"
     );
-    std::thread::sleep(Duration::from_millis(3));
     app.on_ime_preedit(wid, String::new(), None);
     assert_eq!(
         app.windows[&wid].ime_compose,

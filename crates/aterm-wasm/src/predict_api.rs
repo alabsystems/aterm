@@ -38,8 +38,57 @@
 //! Shared with `aterm-gpu-web`, which mounts this file by `#[path]`;
 //! [`WebTerminal`](crate::WebTerminal) is each crate's own terminal type.
 
-use aterm_predict::PredictMode;
+use aterm_core::terminal::{RenderCell, Terminal};
+use aterm_predict::{KeySample, PredictMode, Seen};
 use aterm_time::Instant;
+
+/// The predictor's resident row buffers on a web terminal: one extracted row
+/// (cells, emoji clusters, combining marks) that the reconcile's observe reads
+/// from, and the cursor row a run's first keypress hands the predictor.
+#[derive(Default)]
+pub(crate) struct PredRows {
+    cells: Vec<RenderCell>,
+    clusters: Vec<(usize, Box<str>)>,
+    combining: Vec<(usize, Box<[char]>)>,
+    /// Whether the row in `cells` is drawn in logical order at single width.
+    logical: bool,
+    key: Vec<Seen>,
+}
+
+impl PredRows {
+    /// Refill the extracted row from visible row `row` of `term`: the frame's
+    /// own extraction of it (`Terminal::logical_row_into`).
+    fn read(&mut self, term: &Terminal, row: u16) {
+        self.logical = term.logical_row_into(
+            usize::from(row),
+            &mut self.cells,
+            &mut self.clusters,
+            &mut self.combining,
+        );
+    }
+
+    /// Column `col` of the extracted row as the predictor reads it: its glyph,
+    /// OPAQUE on either half of a wide glyph, on a cluster or combining marks, and
+    /// anywhere on a row drawn at DEC double size; a column past a trimmed row is
+    /// the implicit blank. The press's row and the reconcile's observe both read
+    /// through here, so the tail guard compares like with like (aterm-gui's
+    /// `predict_seen` is the native twin).
+    fn seen(&self, col: usize) -> Seen {
+        let Some(cell) = self.cells.get(col) else {
+            return Seen::Blank;
+        };
+        let marked = self.clusters.iter().any(|(at, _)| *at == col)
+            || self.combining.iter().any(|(at, _)| *at == col);
+        let opaque = !self.logical
+            || cell.wide
+            || self
+                .cells
+                .get(col.saturating_add(1))
+                .is_some_and(|next| next.wide)
+            || marked;
+        Seen::of_cell(cell.ch, opaque)
+    }
+}
 
 /// The JS-visible surface. Each crate expands it onto its own terminal
 /// type, under its own export attribute, with `web_terminal_impl!`: the
@@ -69,18 +118,48 @@ macro_rules! bind {
             /// Register a printable character the host just wrote to the PTY (the
             /// keydown seam — call beside `encode_key`). The guess anchors at the
             /// engine's live cursor, extends pending type-ahead, and never crosses the
-            /// right margin. Returns whether a guess is now TRACKED — display is a
-            /// separate gate (see [`predict_overlay`](Self::predict_overlay)).
+            /// right margin. A run's first glyph also hands the predictor the cursor
+            /// row, which its tail guard compares the run's echoes with. Returns
+            /// whether a guess is now TRACKED — display is a separate gate (see
+            /// [`predict_overlay`](Self::predict_overlay)).
             pub fn predict_char(&mut self, ch: char) -> bool {
                 if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
-                    self.predict.reset();
+                    // Not guessed, but sent: the app may leave the alternate screen
+                    // before it reads the key and the shell echo it, so its echo is
+                    // owed (the native no-echo gate does the same).
+                    self.predict.note_unmodelled_input(Instant::now());
                     return false;
                 }
                 let cur = self.term.cursor();
                 let cols = self.term.grid().cols();
                 let coords = self.term.content_scroll_state().coordinate_generation();
-                self.predict
-                    .predict_char(ch, (cur.row, cur.col), coords, cols, Instant::now())
+                let rows = &mut self.pred_row_scratch;
+                // The cursor row, read as the reconcile reads it, only where it is
+                // one: `logical_row_into` reads the VIEW, so with the page scrolled
+                // back it is a history row, which the tail guard would take for the
+                // line the cursor is on (and a history row showing the same command
+                // after the insert passed a mid-line echo for an append). With no
+                // row the run proves only over a blank tail. Nor in `Off`, where
+                // nothing is guessed and the row would be read for nothing.
+                let has_row = self.predict.mode() != PredictMode::Off
+                    && self.term.grid().display_offset() == 0
+                    && self.predict.wants_key_row();
+                if has_row {
+                    rows.read(&self.term, cur.row);
+                    let mut key = std::mem::take(&mut rows.key);
+                    key.clear();
+                    key.extend((0..usize::from(cols)).map(|c| rows.seen(c)));
+                    rows.key = key;
+                }
+                // `rows = 0`: no row below to wrap into, so the margin declines
+                // (the height-blind `predict_char`).
+                let sample = KeySample {
+                    cursor: (cur.row, cur.col),
+                    coords,
+                    grid: (cols, 0),
+                    row: has_row.then_some(rows.key.as_slice()),
+                };
+                self.predict.predict_glyph(ch, &sample, Instant::now())
             }
 
             /// Register a Backspace: cancels our OWN trailing guess only (erasing
@@ -88,7 +167,8 @@ macro_rules! bind {
             /// the confirmation epoch). Returns whether a guess was cancelled.
             pub fn predict_backspace(&mut self) -> bool {
                 if self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo() {
-                    self.predict.reset();
+                    // Sent all the same, and owed (see `predict_char`).
+                    self.predict.note_unmodelled_input(Instant::now());
                     return false;
                 }
                 self.predict.predict_backspace(Instant::now())
@@ -102,7 +182,7 @@ macro_rules! bind {
             /// the proven row. The line's own unechoed tail keeps painting until its echo
             /// (the native `note_line_submit` seam). Cheap.
             pub fn predict_line_submit(&mut self) {
-                self.predict.note_line_submit();
+                self.predict.note_line_submit(Instant::now());
             }
 
             /// Register any OTHER key the host did not hand to
@@ -118,7 +198,7 @@ macro_rules! bind {
             pub fn predict_unmodelled_input(&mut self) {
                 // ICF barrier (see `predict_reset`): keep this export's body distinct.
                 std::hint::black_box(2u8);
-                self.predict.note_unmodelled_input();
+                self.predict.note_unmodelled_input(Instant::now());
             }
 
             /// Reconcile pending guesses against the grid — call after `process()`
@@ -144,30 +224,28 @@ macro_rules! bind {
                 let no_echo =
                     self.term.is_alternate_screen() || self.term.kitty_suppresses_predictive_echo();
                 // `reconcile` probes once per retired guess plus the head, and the
-                // predictor is a same-row model — so the allocating `render_row` would
-                // rebuild the identical row (fresh Vec + full colour/decoration resolve
-                // over every column) N times per call to read N single chars. Memoize
-                // by row into the resident scratch and refill it in place with
-                // `render_row_into`, which IS `render_row`'s one code path (and clears
-                // `out` itself), so observations are unchanged. This is the fix
-                // aterm-gui already carries; the wasm binding never received it.
+                // predictor is a same-row model (its tail guard reads the rest of the
+                // row) — so extracting the row per probe would rebuild the identical
+                // row (fresh Vec + full colour/decoration resolve over every column) N
+                // times per call. Memoize by row into the resident scratch, refilled
+                // in place with the frame's own row extraction
+                // (`Terminal::logical_row_into`), so observations are unchanged. This
+                // is the fix aterm-gui already carries.
                 let mut scratch = std::mem::take(&mut self.pred_row_scratch);
                 let mut cached: Option<u16> = None;
                 // Rows that moved under the guesses (output scrolled the screen) retire
                 // them and their epoch inside the predictor.
                 let coords = self.term.content_scroll_state().coordinate_generation();
                 let (term, predict) = (&self.term, &mut self.predict);
-                predict.reconcile(Some((cur.row, cur.col)), coords, no_echo, now, |r, c| {
+                predict.reconcile_seen(Some((cur.row, cur.col)), coords, no_echo, now, |r, c| {
                     if cached != Some(r) {
-                        term.render_row_into(r as usize, &mut scratch);
+                        scratch.read(term, r);
                         cached = Some(r);
                     }
-                    // The native observe: the cell's glyph, with blank/space mapped to
-                    // None (a typed space confirms by cursor advance instead).
-                    scratch
-                        .get(c as usize)
-                        .map(|cell| cell.ch)
-                        .filter(|ch| *ch != ' ')
+                    // The native observe: the cell's glyph (a blank or space is
+                    // `Blank`, and a typed space confirms by cursor advance
+                    // instead), opaque where its glyph does not describe it.
+                    scratch.seen(usize::from(c))
                 });
                 self.pred_row_scratch = scratch;
             }
@@ -240,18 +318,15 @@ web_terminal_impl!(bind);
 mod tests {
     use crate::WebTerminal;
 
-    /// Build a terminal, or skip when the environment has no system font (the
-    /// same posture as the other binding tests).
-    fn terminal() -> Option<WebTerminal> {
-        WebTerminal::new_from_system(4, 20, 16.0)
+    /// A terminal on the system font, or COULD NOT RUN where the host has
+    /// none (the same posture as the other binding tests).
+    fn terminal() -> WebTerminal {
+        crate::system_font_terminal(4, 20, 16.0)
     }
 
     #[test]
     fn off_by_default_and_unknown_modes_fail_safe() {
-        let Some(mut t) = terminal() else {
-            eprintln!("no system font; skipping export smoke");
-            return;
-        };
+        let mut t = terminal();
         assert!(!t.predict_char('a'), "default off ⇒ inert");
         t.set_predictive_echo("nonsense");
         assert!(!t.predict_char('a'), "unknown mode parses to off");
@@ -260,9 +335,7 @@ mod tests {
 
     #[test]
     fn always_tracks_paints_and_retires_through_the_export() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("always");
         assert!(t.predict_char('a'));
         assert_eq!(t.predict_overlay(), vec![0, 0, u32::from('a')]);
@@ -277,9 +350,7 @@ mod tests {
 
     #[test]
     fn adaptive_tracks_but_never_shows_an_unconfirmed_line() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("adaptive");
         assert!(t.predict_char('a'), "tracked, awaiting the echo");
         assert!(
@@ -290,9 +361,7 @@ mod tests {
 
     #[test]
     fn adaptive_confirmed_echo_retires_the_prediction() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("adaptive");
         assert!(t.predict_char('a'));
         assert!(t.predict_next_deadline_ms().is_some());
@@ -306,9 +375,7 @@ mod tests {
 
     #[test]
     fn codex_report_event_types_suppresses_arm_reconcile_and_display() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("always");
 
         // Reconciliation gate: a guess armed before Codex negotiates its observed
@@ -339,9 +406,7 @@ mod tests {
         // non-echoing prompt on the SAME physical row (a terminal scrolled to
         // the bottom reuses its last row across logical lines) must not
         // inherit the previous command's confirmation and flash a secret.
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("adaptive");
         assert!(t.predict_char('a'));
         t.process(b"a");
@@ -356,10 +421,16 @@ mod tests {
             t.predict_overlay().is_empty(),
             "a fast link paints nothing, before or after the submit"
         );
-        assert!(t.predict_char('s'), "the password keystroke is tracked…");
+        // 'b' is still in flight, so the live cursor stands on it: the keystroke
+        // typed behind the submit has no cell until the terminator's echo decides
+        // one, and is not even armed (`aterm-predict`'s one-guess-per-cell rule).
+        assert!(
+            !t.predict_char('s'),
+            "the password keystroke behind a submitted line in flight is declined…"
+        );
         assert!(
             t.predict_overlay().is_empty(),
-            "…but never displayed on the unconfirmed new line (no leak)"
+            "…and never displayed on the unconfirmed new line (no leak)"
         );
     }
 
@@ -368,9 +439,7 @@ mod tests {
         // The two boundary exports differ in what they do to the pixels already
         // painted: a terminator keeps the line's unechoed tail, any other key
         // (Ctrl+W, Ctrl+H) may have erased it and retires it.
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("always");
         assert!(t.predict_char('a'));
         t.predict_line_submit();
@@ -389,9 +458,7 @@ mod tests {
 
     #[test]
     fn divergence_and_alt_screen_flush() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("always");
         t.predict_char('a');
         t.process(b"*"); // the program echoed a DIFFERENT glyph (masked input)
@@ -406,9 +473,7 @@ mod tests {
 
     #[test]
     fn backspace_cancels_and_disable_is_fully_inert() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("always");
         t.predict_char('a');
         t.predict_char('b');
@@ -423,9 +488,7 @@ mod tests {
 
     #[test]
     fn scrolled_back_viewport_paints_no_ghosts() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         for i in 0..12 {
             t.process(format!("line {i}\r\n").as_bytes());
         }
@@ -444,11 +507,58 @@ mod tests {
         );
     }
 
+    /// A run's first press hands the predictor the cursor row, the tail guard's
+    /// reference: a right prompt the echo leaves in place proves the line. Read
+    /// as nothing (no row), the right prompt would be text that appeared beside
+    /// the echo, and the line would prove nothing.
+    #[test]
+    fn a_run_s_first_press_hands_the_predictor_its_row() {
+        let mut t = terminal();
+        t.set_predictive_echo("always");
+        // `$ ` and a right prompt at columns 15..18, the cursor after the prompt.
+        t.process(b"$ \x1b[16G<r>\x1b[1;3H");
+        assert!(t.predict_char('a'));
+        t.process(b"a");
+        t.predict_reconcile();
+        assert!(t.predict_overlay().is_empty(), "retired by its echo");
+        let events = t.predict.events_for_test();
+        assert_eq!(
+            events.decorated_proofs, 1,
+            "proved over the right prompt: {events:?}"
+        );
+        assert_eq!(events.tail_refusals, 0, "{events:?}");
+    }
+
+    /// A press with the page scrolled back hands no row: the view's row at the
+    /// cursor's index is history, not the line the cursor is on. Here the history
+    /// row is the same prompt line, which, taken for the cursor row, proved the
+    /// echo over a right prompt it never compared; with no row the line proves
+    /// only over a blank tail, and the right prompt beside the echo refuses it.
+    #[test]
+    fn a_press_while_scrolled_back_hands_no_row() {
+        let mut t = terminal();
+        for _ in 0..5 {
+            t.process(b"$ \x1b[16G<r>\r\n");
+        }
+        t.process(b"$ \x1b[16G<r>\x1b[3G");
+        t.set_predictive_echo("always");
+        t.scroll_lines(1);
+        assert!(t.predict_char('a'));
+        t.scroll_to_bottom();
+        t.process(b"a");
+        t.predict_reconcile();
+        assert!(t.predict_overlay().is_empty(), "retired by its echo");
+        let events = t.predict.events_for_test();
+        assert_eq!(
+            events.decorated_proofs, 0,
+            "no history row compared: {events:?}"
+        );
+        assert_eq!(events.tail_refusals, 1, "{events:?}");
+    }
+
     #[test]
     fn resize_drops_inflight_guesses() {
-        let Some(mut t) = terminal() else {
-            return;
-        };
+        let mut t = terminal();
         t.set_predictive_echo("always");
         t.predict_char('a');
         t.resize(10, 40);

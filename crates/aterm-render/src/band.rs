@@ -87,8 +87,8 @@ pub const fn band_icon(icon: Icon) -> BandIcon {
 }
 
 /// The rail band's height on a `cell_h`-pixel row: about an eighth of it, never under two
-/// pixels, in the row's lowest pixels. A level's rail is at most this; the renderer fits
-/// it, words lifted clear, into the room the face leaves ([`RowRaster::clear_rail`]).
+/// pixels, in the row's lowest pixels, where a bar's glint sits under its words'
+/// descenders (ruling 242).
 #[must_use]
 fn rail_px(cell_h: usize) -> usize {
     ((cell_h + 4) / 8).max(2)
@@ -124,7 +124,7 @@ pub fn on_frame(r: &RowRaster, row: u16, lo: usize, frame_w: usize, cell_h: usiz
         row,
         ground,
         rail_h,
-        clear_rail: r.clear_rail && rail_h > 0,
+        clear_rail: false,
         rail,
         own: r.own.clone(),
         rings: r
@@ -244,10 +244,11 @@ pub fn seal_stack(rows: &mut [Vec<RenderCell>], inks: &BandInks, forced: bool) {
     seal_band_bottom(last, inks.label);
 }
 
-/// A rail (the strain gauge) runs in its row's lowest pixels, where the closing seam runs
-/// on the last row: where the rail is lit it is the row's lower edge, so the seam gives
-/// way cell by cell (a cell at least half lit). `cells` are the composed rows, `rasters`
-/// keyed by row, `cols` cells of `cell_w` px starting `pad` px into the frame.
+/// A rail (a bar's glint drawn low, ruling 242) runs in its row's lowest pixels, where the
+/// closing seam runs on the last row: where the rail is lit it is the row's lower edge, so
+/// the seam gives way cell by cell (a cell at least half lit). `cells` are the composed
+/// rows, `rasters` keyed by row, `cols` cells of `cell_w` px starting `pad` px into the
+/// frame.
 fn give_seam_to_rails(
     cells: &mut [Vec<RenderCell>],
     rasters: &[ChromeRaster],
@@ -299,19 +300,23 @@ pub const RAIL_SEAM_MIN_CELL_H: usize = 18;
 /// `2 − foot`, never more than `head`).
 ///
 /// The cell height alone is a proxy measured with the macOS default face. It fails for
-/// Cascadia Mono PL (the Windows default), whose hinted `$` and capitals reach the cell's
-/// top row: of the cells the proxy admits, 14 px (18 px cell) and 18 px (23 px cell)
-/// measure `(0, 1)`, and without the measure their descenders end on the rail's own row.
-/// JetBrains Mono has at least a pixel each of head and foot room at 12 to 40 px.
+/// Cascadia Mono PL (the Windows default until 2026-10-16), whose hinted `$` and capitals
+/// reach the cell's top row: of the cells the proxy admits, 14 px (18 px cell) and 18 px
+/// (23 px cell) measure `(0, 1)`. It fails for Iosevka Term Semibold, the Windows default
+/// since then, at 14 px on the 1.1 line a Windows window draws (19 px cell, `(0, 1)`); its
+/// default 17 px's 23 px cell is `(2, 2)`. Without the measure their descenders end on the
+/// rail's own row. JetBrains Mono has at least a pixel each of head and foot room at 12 to
+/// 40 px.
 #[must_use]
 pub fn seam_can_rail(cell_h: usize, room: Option<(usize, usize)>) -> bool {
     cell_h >= RAIL_SEAM_MIN_CELL_H && room.is_none_or(|(head, foot)| head + foot >= 2)
 }
 
 /// Whether a native host measures the face's room ([`BandFrame::room`]): Windows only, as
-/// its default Cascadia Mono PL is the face the cell-height proxy fails for
-/// ([`seam_can_rail`]). macOS's default face is the one the proxy was measured with, and
-/// Linux's JetBrains Mono has the room at every size measured. Web hosts never measure.
+/// neither its default Iosevka Term Semibold nor Cascadia Mono PL (the default before it)
+/// holds the cell-height proxy ([`seam_can_rail`]). macOS's default face is the one the
+/// proxy was measured with, and Linux's JetBrains Mono has the room at every size measured.
+/// Web hosts never measure.
 pub const NATIVE_HOST_MEASURES_ROOM: bool = cfg!(windows);
 
 /// The [`BandFrame::room`] a native host composes with: `measure`'s `(head, foot)`
@@ -323,7 +328,7 @@ pub fn native_host_room(measure: impl FnOnce() -> (usize, usize)) -> Option<(usi
 
 /// Whether the composed stack's seams are drawn as rails: the cell and face can pay for
 /// them ([`seam_can_rail`]) and no composed row's raster already owns the row's foot (a
-/// strain rail, an outlined capsule, or `own` columns, under which the rail would leave
+/// glint rail, an outlined capsule, or `own` columns, under which the rail would leave
 /// holes). One seam style per stack, never per row.
 fn seam_rails_the_stack(
     rasters: &[ChromeRaster],

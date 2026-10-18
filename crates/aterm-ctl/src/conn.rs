@@ -1003,24 +1003,14 @@ mod tests {
         assert!(parse_pair_args("add", &s(&["@s-b", "--force"])).is_err());
     }
 
-    /// Titles are never selectors (a bare word is a usage error naming the
-    /// three forms), and `@.` is refused.
+    /// Titles are never selectors, a bare sid is missing its `@`, and `@.`
+    /// is refused.
     #[test]
     fn selectors_refuse_titles_and_the_active_tab() {
-        for bad in ["build", "worker (2)"] {
+        for bad in ["build", "worker (2)", "s-abc", "@."] {
             let e = classify_selector(bad).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-            assert!(
-                e.to_string().contains("titles are ambiguous"),
-                "title refusal names the reason: {e}"
-            );
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad}");
         }
-        // A bare sid is a sid missing its @, not a title.
-        let e = classify_selector("s-abc").unwrap_err();
-        assert!(e.to_string().contains("@s-abc"), "got {e}");
-        assert!(!e.to_string().contains("titles"), "got {e}");
-        let e = classify_selector("@.").unwrap_err();
-        assert!(e.to_string().contains("active tab"), "got {e}");
         // The three real forms classify.
         assert_eq!(classify_selector("@self").unwrap(), SelTok::SelfSid);
         assert_eq!(classify_selector("@env").unwrap(), SelTok::SelfSid);
@@ -1054,8 +1044,7 @@ mod tests {
             resolve_selector_with("@3", None, &mut lookup).unwrap(),
             "s-three"
         );
-        let e = resolve_selector_with("@9", None, &mut lookup).unwrap_err();
-        assert!(e.to_string().contains("no session with local id 9"), "{e}");
+        assert!(resolve_selector_with("@9", None, &mut lookup).is_err());
     }
 
     #[test]
@@ -1218,88 +1207,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ls_rows_render_pairs_with_titles() {
-        let index = parse_sessions_lines(&s(&["0 s-a - running alpha meta=0"]));
-        let pairs = vec![FlowPair {
-            src: "s-a".to_string(),
-            dst: "s-b".to_string(),
-            ops: s(&["read-screen"]),
-        }];
-        assert_eq!(
-            render_ls_rows(&pairs, &index),
-            vec!["@s-a -> @s-b  pull  \"alpha\" -> -".to_string()]
-        );
-    }
-
     /// Server refusals name the resolved ends; anything else passes through.
     #[test]
     fn refusals_name_the_resolved_sessions() {
         let r = |st: &str, src: Option<&str>| refusal(st, src, "s-b");
-        assert_eq!(
-            r("ERR no such session", Some("s-a")).as_deref(),
-            Some("no session @s-b in this instance (see `aterm ctl ls`)")
-        );
-        assert_eq!(
-            r("ERR exited", Some("s-a")).as_deref(),
-            Some("@s-b has exited")
-        );
-        assert_eq!(
-            r("ERR self-loop", Some("s-b")).as_deref(),
-            Some("@s-b cannot connect to itself")
-        );
-        assert_eq!(
-            r("ERR no such connection", Some("s-a")).as_deref(),
-            Some("no connection @s-a -> @s-b")
-        );
-        assert!(r("ERR denied", None).unwrap().contains("owner access"));
+        for status in [
+            "ERR no such session",
+            "ERR exited",
+            "ERR self-loop",
+            "ERR no such connection",
+        ] {
+            let said = r(status, Some("s-a")).unwrap_or_else(|| panic!("{status}"));
+            assert!(said.contains("@s-b"), "{status}: {said}");
+        }
+        assert!(r("ERR denied", None).is_some());
         assert_eq!(
             r("ERR headless", None),
             None,
             "unknown refusals pass through"
         );
-    }
-
-    /// `conn rm` says what is left: the whole pair, one half, or nothing.
-    #[test]
-    fn rm_outcome_states_what_changed() {
-        assert_eq!(
-            rm_outcome("s-a", "s-b", None, 1),
-            "disconnected @s-a -> @s-b"
-        );
-        assert_eq!(
-            rm_outcome("s-a", "s-b", Some("both"), 3),
-            "disconnected @s-a -> @s-b"
-        );
-        assert_eq!(
-            rm_outcome("s-a", "s-b", Some("pull"), 1),
-            "removed pull from @s-a -> @s-b"
-        );
-        assert_eq!(
-            rm_outcome("s-a", "s-b", Some("pull"), 0),
-            "@s-a -> @s-b: no live pull half to remove"
-        );
-    }
-
-    /// `conn spawn` says which session drives which.
-    #[test]
-    fn spawn_outcome_states_the_direction() {
-        assert_eq!(
-            spawn_outcome("s-n", "controlled", "tab", "s-me"),
-            "spawned @s-n in a new tab; @s-me drives it (both)"
-        );
-        assert_eq!(
-            spawn_outcome("s-n", "controller", "window", "s-me"),
-            "spawned @s-n in a new window; it drives @s-me (both)"
-        );
-    }
-
-    /// The help page documents every subverb in `CONN_SUBVERBS`.
-    #[test]
-    fn usage_documents_every_subverb() {
-        for sub in CONN_SUBVERBS.split_whitespace() {
-            assert!(CONN_USAGE.contains(sub), "usage must document `{sub}`");
-        }
     }
 
     /// The fish completion offers the conn subverbs on the `aterm

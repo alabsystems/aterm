@@ -1,0 +1,318 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use crate::harness::codex_rollout::{is_rollout_of, is_thread_id, thread_created_ms};
+
+fn v(s: &str) -> Version {
+    Version::parse(s).expect("a version")
+}
+
+fn argv(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| (*w).to_string()).collect()
+}
+
+const T1: &str = "01a0dc36-1dc1-7ee2-be91-11bc323e377c";
+const T2: &str = "01a0dc3a-5c71-7143-bcee-58def0a15dfd";
+
+/// The atpkg store's codex 0.157.1 manifest, verbatim.
+const PACKAGE_0_157_1: &str = r#"{
+  "layoutVersion": 1,
+  "version": "0.157.1",
+  "target": "aarch64-apple-darwin",
+  "variant": "codex",
+  "entrypoint": "bin/codex",
+  "resourcesDir": "codex-resources",
+  "pathDir": "codex-path"
+}"#;
+
+#[test]
+fn the_measured_manifest_parses_and_a_changed_layout_refuses() {
+    let (version, entry) = parse_package(PACKAGE_0_157_1).expect("the store's manifest");
+    assert_eq!(version, v("0.157.1"));
+    assert_eq!(entry, PathBuf::from("bin/codex"));
+    for bad in [
+        PACKAGE_0_157_1.replace("\"layoutVersion\": 1", "\"layoutVersion\": 2"),
+        PACKAGE_0_157_1.replace("0.157.1", "0.157.1-alpha"),
+        PACKAGE_0_157_1.replace("bin/codex", "/abs/codex"),
+        PACKAGE_0_157_1.replace("bin/codex", "../codex"),
+        "not json".to_string(),
+    ] {
+        assert_eq!(parse_package(&bad), None, "{bad}");
+    }
+}
+
+/// AN ALAB BUILD IS KNOWN BY ITS PACKAGE, NOT ITS VERSION: codex-alab's
+/// package carries the publication scheme's pre-release version
+/// (`X.Y.0-dev.<n>+g<sha>`), which [`Version::parse`] refuses on purpose. The
+/// proven self-claim's image fact ([`alab_bytes`]) must still see an ALab build
+/// there (measured 2026-10-16: no claim was ever proven from a real package),
+/// while [`package_version`], the only reader that orders builds, still answers
+/// nothing for it.
+#[test]
+fn an_alab_package_with_a_pre_release_version_is_alab_bytes() {
+    let d = crate::supervise::ScratchDir::new("codex", "alab-pre-release");
+    let root = d.join("codex/0.164.0-dev.12365+g124c29509");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "").expect("exe");
+    let manifest = PACKAGE_0_157_1.replace("0.157.1", "0.164.0-dev.12365+g124c29509");
+    std::fs::write(root.join(PACKAGE_JSON), &manifest).expect("manifest");
+    assert_eq!(
+        package_entrypoint(&manifest),
+        Some(PathBuf::from("bin/codex"))
+    );
+    assert_eq!(parse_package(&manifest), None, "no order is guessed");
+    // Negative control: without ALab's marker it is no ALab build.
+    assert!(!alab_bytes(&exe));
+    std::fs::write(root.join(ALAB_BUILD_JSON), "{}").expect("marker");
+    assert!(
+        alab_bytes(&exe),
+        "the package and its marker say ALab built it"
+    );
+    assert_eq!(package_version(&exe), None);
+    // A changed layout or an entrypoint outside the root still refuses.
+    for bad in [
+        manifest.replace("\"layoutVersion\": 1", "\"layoutVersion\": 2"),
+        manifest.replace("bin/codex", "/abs/codex"),
+        manifest.replace("bin/codex", "../codex"),
+    ] {
+        assert_eq!(package_entrypoint(&bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it() {
+    let d = crate::supervise::ScratchDir::new("codex", "pkg");
+    let root = d.join("store/codex/1000000000157000001");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    // An executable that would hang if run: the reader must never exec it, and
+    // a one-minute hang detector tells the two apart.
+    let exe = root.join("bin/codex");
+    std::fs::write(&exe, "#!/bin/sh\nsleep 600\n").expect("exe");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    std::fs::write(root.join(PACKAGE_JSON), PACKAGE_0_157_1).expect("manifest");
+    let started = std::time::Instant::now();
+    assert_eq!(package_version(&exe), Some(v("0.157.1")));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+    // Negative control: a manifest whose entrypoint names another binary does
+    // not answer for this one (a stray `codex-package.json` in a parent).
+    let other = d.join("elsewhere/bin");
+    std::fs::create_dir_all(&other).expect("other");
+    std::fs::write(other.join("codex"), "x").expect("exe");
+    std::fs::write(
+        d.join("elsewhere").join(PACKAGE_JSON),
+        PACKAGE_0_157_1.replace("bin/codex", "bin/not-codex"),
+    )
+    .expect("manifest");
+    assert_eq!(package_version(&other.join("codex")), None);
+    // `codex --version`'s own words are no version (its first word).
+    assert_eq!(Version::parse("codex-cli"), None);
+}
+
+/// The Codex lane carries the model and only carries it: whatever model the launch named, in any
+/// spelling (`-m x`, `-mx`, `--model=x`), rides the relaunch verbatim with every other kept flag;
+/// a launch that named none gets none.
+#[test]
+fn the_rewrite_resumes_the_thread_with_every_kept_flag() {
+    let a = argv(&[
+        "/store/codex/bin/codex",
+        "--no-daemon",
+        "-m",
+        "gpt-6-astra",
+        "-c",
+        "model_reasoning_effort=\"high\"",
+        "--config=sandbox_mode=\"read-only\"",
+        "-mgpt-x",
+        "--add-dir",
+        "-",
+        "--model=gpt-5.4-mini",
+        "fix the bug",
+    ]);
+    assert_eq!(
+        rewrite_argv(&a, Some(T1)).expect("carried"),
+        argv(&[
+            "resume",
+            "--no-daemon",
+            "-m",
+            "gpt-6-astra",
+            "-c",
+            "model_reasoning_effort=\"high\"",
+            "--config=sandbox_mode=\"read-only\"",
+            "-mgpt-x",
+            "--add-dir",
+            "-",
+            "--model=gpt-5.4-mini",
+            T1,
+        ])
+    );
+    // A session that was itself a resume, or a fork: the old id, `--last`,
+    // `--all` and the first prompt go; the thread the exit names comes back
+    // — and a launch that named no model gets none.
+    for a in [
+        argv(&["codex", "resume", T2, "--no-daemon"]),
+        argv(&["codex", "resume", "--last", "--no-daemon"]),
+        argv(&["codex", "--no-daemon", "fork", T2, "carry on"]),
+        argv(&[
+            "codex",
+            "--no-daemon",
+            "-i",
+            "a.png",
+            "b.png",
+            "look at these",
+        ]),
+    ] {
+        assert_eq!(
+            rewrite_argv(&a, Some(T1)).expect("carried"),
+            argv(&["resume", "--no-daemon", T1]),
+            "{a:?}"
+        );
+    }
+    // No thread (a session with no conversation yet): the flags alone.
+    assert_eq!(
+        rewrite_argv(&argv(&["codex", "-s", "read-only", "hi"]), None).expect("carried"),
+        argv(&["-s", "read-only"])
+    );
+    // `--` ends the options: what follows is the prompt, dropped.
+    assert_eq!(
+        rewrite_argv(&argv(&["codex", "--search", "--", "--no-daemon"]), Some(T1))
+            .expect("carried"),
+        argv(&["resume", "--search", T1])
+    );
+}
+
+#[test]
+fn an_unknown_or_unresumable_launch_is_refused_not_guessed() {
+    for (a, why) in [
+        (
+            argv(&["codex", "--full-auto"]),
+            ArgvRefusal::UnknownFlag("--full-auto".into()),
+        ),
+        (
+            argv(&["codex", "-x"]),
+            ArgvRefusal::UnknownFlag("-x".into()),
+        ),
+        (
+            argv(&["codex", "--no-daemon=1"]),
+            ArgvRefusal::UnknownFlag("--no-daemon=1".into()),
+        ),
+        (
+            argv(&["codex", "exec", "hi"]),
+            ArgvRefusal::NotResumable("exec".into()),
+        ),
+        (
+            argv(&["codex", "--remote", "ws://h:1"]),
+            ArgvRefusal::NotResumable("--remote".into()),
+        ),
+        (
+            argv(&["codex", "--worktree"]),
+            ArgvRefusal::NotResumable("--worktree".into()),
+        ),
+        (
+            argv(&["codex", "app-server", "--listen", "unix://"]),
+            ArgvRefusal::NotResumable("app-server".into()),
+        ),
+    ] {
+        assert_eq!(rewrite_argv(&a, Some(T1)), Err(why), "{a:?}");
+    }
+}
+
+#[test]
+fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
+    for tui in [
+        argv(&["/store/bin/codex"]),
+        argv(&["codex", "--no-daemon", "-m", "x"]),
+        argv(&["codex", "resume", T1]),
+        argv(&["codex", "-c", "exec=1", "fork"]),
+        argv(&["codex", "fix the bug"]),
+    ] {
+        assert!(is_tui_argv(&tui), "{tui:?}");
+    }
+    // Every process of the daemon is named `codex` too.
+    for not in [
+        argv(&[
+            "/c/packages/app-server-daemon/releases/0.157.0-aarch64-apple-darwin/bin/codex",
+            "app-server",
+            "--listen",
+            "unix://",
+            "--managed-daemon",
+        ]),
+        argv(&["codex", "app-server", "daemon", "pid-update-loop"]),
+        argv(&["codex", "exec", "hi"]),
+        argv(&["codex", "-m", "x", "agents"]),
+    ] {
+        assert!(!is_tui_argv(&not), "{not:?}");
+    }
+}
+
+#[test]
+fn a_thread_id_is_a_hyphenated_uuid_and_nothing_else() {
+    assert!(is_thread_id(T1));
+    for bad in [
+        "",
+        "01a0dc36",
+        "01a0dc36-1dc1-7ee2-be91-11bc323e377",
+        "01a0dc36-1dc1-7ee2-be91-11bc323e377cX",
+        "01a0dc36-1dc1-7ee2-be91-11bc323e377g",
+        "01a0dc36 1dc1-7ee2-be91-11bc323e377c",
+        "; rm -rf /",
+    ] {
+        assert!(!is_thread_id(bad), "{bad:?}");
+    }
+    assert_eq!(lock_thread(&format!("{T1}.lock")), Some(T1));
+    assert_eq!(lock_thread(".coordination.lock"), None);
+    assert!(is_rollout_of(
+        &format!("rollout-2026-09-25T22-35-29-{T1}.jsonl"),
+        T1
+    ));
+    assert!(!is_rollout_of(
+        &format!("rollout-2026-09-25T22-35-29-{T1}.jsonl.zst"),
+        T1
+    ));
+    assert!(!is_rollout_of(
+        &format!("rollout-2026-09-25T22-35-29-{T2}.jsonl"),
+        T1
+    ));
+}
+
+/// The relaunch-on-exit readers: the thread a TUI's argv resumes and a thread id's creation
+/// instant (UUIDv7). Negative controls: a plain launch, `resume --last`, a picker and a `fork`
+/// name no thread; a non-v7 id has no instant.
+#[test]
+fn the_relaunch_on_exit_reads_a_thread_and_its_instant() {
+    let argv = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let t = "01a0e4bd-2b37-75a0-939c-43fb6f1a5dfb";
+    assert_eq!(
+        resumed_thread(&argv(&["codex", "--no-alt-screen", "resume", t])),
+        Some(t.to_string())
+    );
+    assert_eq!(
+        resumed_thread(&argv(&["codex", "-m", "o4", "resume", "--no-daemon", t])),
+        Some(t.to_string())
+    );
+    for a in [
+        &["codex"][..],
+        &["codex", "resume", "--last"][..],
+        &["codex", "resume"][..],
+        &["codex", "fork", t][..],
+        &["codex", "say hello"][..],
+    ] {
+        assert_eq!(resumed_thread(&argv(a)), None, "{a:?}");
+    }
+    // The thread a TUI began at 21:19:57.751Z.
+    assert_eq!(thread_created_ms(t), Some(1_790_543_997_751));
+    assert_eq!(
+        thread_created_ms("01a0e4bd-2b37-45a0-939c-43fb6f1a5dfb"),
+        None,
+        "v4"
+    );
+    assert_eq!(thread_created_ms("not-a-thread"), None);
+}

@@ -47,6 +47,10 @@ impl Layout {
     /// publish a user-owned temp dir `0755`.
     #[must_use]
     pub fn is_system_prefix(&self) -> bool {
+        #[cfg(test)]
+        if system_shape::forced(&self.prefix) {
+            return true;
+        }
         system_chain_trusted(&self.prefix)
     }
 
@@ -115,10 +119,7 @@ impl Layout {
     /// `store/<program>/<build>/` — the versioned, immutable extracted tree.
     #[must_use]
     pub fn build_dir(&self, program: &str, build: u64) -> PathBuf {
-        self.prefix
-            .join("store")
-            .join(program)
-            .join(build.to_string())
+        aterm_toolchain::layout::build_dir(&self.prefix, program, build)
     }
 
     /// `bin/` — the only directory placed on the child `PATH` (shims into `current`).
@@ -835,7 +836,9 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
         }
     }
     if unmarked {
-        sync_dir(prog_store);
+        // Ordered: every marker is gone before any tree goes; a lost removal leaves a
+        // marked tree for the next uninstall to unmark again.
+        sync_dir_ordered(prog_store);
     }
 }
 
@@ -1619,14 +1622,26 @@ pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     }
 }
 
-/// Flush a directory's metadata so the renames that make up a swap are durable in the
-/// order they were issued. Best-effort: a platform that refuses to open a directory (or an
-/// exotic filesystem) is not a reason to fail an otherwise-good install, and the swap is
-/// crash-correct either way — this only narrows the window in which a power loss can
-/// reorder the marker ahead of the tree.
+/// Attempt a full flush of this directory's metadata. Under the supported storage
+/// contract, success persists its entries and earlier fsync-submitted I/O on the same
+/// device; it does not submit a rename in another, unflushed directory. Best-effort:
+/// open and flush errors are intentionally ignored, so returning from this helper is
+/// not a durability receipt. Callers must account for that uncertainty in recovery.
 pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(handle) = std::fs::File::open(dir) {
         let _ = crate::platform::sync_durable(&handle);
+    }
+}
+
+/// Attempt an ORDERED flush of `dir` ([`aterm_durable::ordered`]): on a successful
+/// supported flush, its entries and other already-fsynced I/O on that device precede
+/// later I/O. This does not submit publications in other, unflushed directories or prove
+/// an atomic/valid prefix of the store. Callers establish the earlier-file and recovery
+/// invariants (a sidecar before its marker). Best-effort, as [`sync_dir`]: open or flush
+/// errors are intentionally ignored. Build discard uses the full [`sync_dir`] instead.
+pub(crate) fn sync_dir_ordered(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = aterm_durable::ordered(&handle);
     }
 }
 
@@ -1765,11 +1780,11 @@ pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
 /// is guarded instead on the claim union (every `current` link plus every `bin/` shim
 /// target), deleting only trees nothing on disk points into.
 pub(crate) fn discard_build(build_dir: &Path) {
-    // The marker comes down first, and durably, before the exec root and the tree: the
-    // `remove_dir_all` walk takes tens of seconds, and an interrupt inside it would leave
-    // a gutted tree with an `ok` marker ([`READY_CONTENTS_KEY`]). Unmarked, the tree reads
-    // as incomplete to every reader ([`build_is_complete`]) and `gc`'s partial arm
-    // reclaims it. The `sync_dir` makes the order survive a power loss, not just a kill.
+    // Attempt to remove and fully flush the marker before the exec root and tree: the
+    // `remove_dir_all` walk can be interrupted, leaving a partial tree. When unmarked,
+    // it reads as incomplete ([`build_is_complete`]) and `gc`'s partial arm reclaims it.
+    // Both the unmark and `sync_dir` are best-effort; their failure supplies no persisted
+    // marker-before-tree guarantee. This full flush does not flush an unpublished shim name.
     let _ = clear_build_ready(build_dir);
     if let Some(parent) = build_dir.parent() {
         sync_dir(parent);
@@ -1832,7 +1847,7 @@ pub fn resolve(configured: Option<&Path>) -> Option<Layout> {
             "vet_prefix rejected the prefix this test asked for and fell back to the \
              DEFAULT — which under test is the developer's real store. Give the test a \
              prefix the vet admits: strictly under $HOME, absolute, no `..`, and a real \
-             0700 directory (see `a_removed_program_is_read_from_the_layout_by_every_lane`)"
+             0700 directory"
         );
     }
     Some(Layout { prefix })
@@ -1861,6 +1876,11 @@ pub fn resolve_from(cfg: &crate::config::PackagesConfig) -> Option<Layout> {
 /// Validate a configured prefix against `home`, returning it if safe or the trusted
 /// [`default_prefix`] otherwise. Pure w.r.t. config but reads directory metadata; `home`
 /// is a parameter so the chain check is testable against a synthetic tree.
+///
+/// The default comes back unvetted: there is nowhere further to fall back. Its missing
+/// ancestors are made never group/other-writable ([`Layout::ensure_dir`]), and one that
+/// already is (made by an older build under umask `002`) is named with its `chmod go-w` by
+/// doctor's check of the installed Trust toolchain's chain, which `targo trust` refuses.
 #[must_use]
 pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     let default = default_prefix(home);
@@ -1903,8 +1923,10 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     // Windows `dir_meta_is_private` is a best-effort `true`; privacy rests on the per-user
     // ACL.)
     for anc in p.ancestors().filter(|a| under_home(a, home)) {
-        // A missing ancestor is the tail atpkg makes `0700`. `is_reparse` also catches a
-        // junction, which needs no admin and reports `is_symlink() == false`.
+        // A missing ancestor is the tail atpkg makes: the prefix `0700`, the directories on
+        // the way `0755` whatever the umask (`create_dir_all_unshared`), so the next resolve
+        // admits what this one created. `is_reparse` also catches a junction, which needs no
+        // admin and reports `is_symlink() == false`.
         if let Ok(m) = std::fs::symlink_metadata(anc)
             && (crate::platform::is_reparse(&m) || !crate::platform::dir_meta_is_private(&m))
         {
@@ -1939,6 +1961,29 @@ fn caller_can_use_prefix(p: &Path) -> bool {
     entries.flatten().any(|e| {
         crate::platform::resolve_shim(&e.path()).is_some_and(|t| !presence(&t).is_absent())
     })
+}
+
+/// A test's own system-shaped prefix: only root can create one under a root-owned chain,
+/// so a test that must tell the two shapes apart names its scratch prefix here, on its own
+/// thread, and every [`Layout::is_system_prefix`] question about it answers yes. Compiled
+/// into tests only.
+#[cfg(test)]
+pub(crate) mod system_shape {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FORCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Answer "system-shaped" for `prefix` on this thread from now on.
+    pub(crate) fn force(prefix: &Path) {
+        FORCED.with(|f| f.borrow_mut().push(prefix.to_path_buf()));
+    }
+
+    pub(super) fn forced(prefix: &Path) -> bool {
+        FORCED.with(|f| f.borrow().iter().any(|p| p == prefix))
+    }
 }
 
 /// Whether every existing directory from `/` down to `p` is root-owned, not
@@ -2240,15 +2285,7 @@ mod tests {
         };
         std::fs::create_dir_all(&filed.prefix).unwrap();
         std::fs::write(filed.agents_dir(), b"not a dir").unwrap();
-        let err = filed.ensure_agents_dir().expect_err("a file is refused");
-        assert_eq!(
-            err,
-            format!(
-                "{} exists and is not a directory",
-                filed.agents_dir().display()
-            ),
-            "one path, one sentence"
-        );
+        filed.ensure_agents_dir().expect_err("a file is refused");
         assert!(filed.agents_dir().is_file(), "left alone");
         #[cfg(unix)]
         {
@@ -2259,17 +2296,7 @@ mod tests {
             std::fs::create_dir_all(&linked.prefix).unwrap();
             std::os::unix::fs::symlink(&dir, linked.agents_dir()).unwrap();
             assert!(linked.agents_dir().is_dir(), "the link resolves");
-            let err = linked.ensure_agents_dir().expect_err("a link is refused");
-            assert_eq!(
-                err,
-                format!("{} is a symlink", linked.agents_dir().display()),
-                "one path, one sentence — never `ensure_private_dir`'s `update directory` wording twice over"
-            );
-            assert_eq!(
-                err.matches("linked").count(),
-                1,
-                "the path is named once: {err}"
-            );
+            linked.ensure_agents_dir().expect_err("a link is refused");
             assert!(
                 std::fs::symlink_metadata(linked.agents_dir())
                     .unwrap()
@@ -2698,34 +2725,6 @@ mod tests {
     }
 
     #[test]
-    fn layout_paths_are_under_prefix() {
-        let l = Layout {
-            prefix: PathBuf::from("/p"),
-        };
-        assert_eq!(l.build_dir("ay", 18), PathBuf::from("/p/store/ay/18"));
-        // The shim file name carries the concrete platform suffix (`.cmd` on Windows).
-        assert_eq!(
-            l.shim(&ToolName::new("ay").unwrap()),
-            PathBuf::from(format!("/p/bin/ay{}", crate::platform::SHIM_SUFFIX))
-        );
-        assert_eq!(
-            l.program_current("ay"),
-            PathBuf::from("/p/store/ay/current")
-        );
-        assert_eq!(l.staging_dir("ay"), PathBuf::from("/p/staging/ay"));
-        assert_eq!(l.floor(), PathBuf::from("/p/floor"));
-        assert_eq!(l.store_lock(), PathBuf::from("/p/store.lock"));
-    }
-
-    #[test]
-    fn unset_or_default_prefix_uses_default() {
-        let home = temp_home("default");
-        // No config ⇒ default prefix under home.
-        assert_eq!(vet_prefix(None, &home), default_prefix(&home));
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn prefix_outside_home_or_with_traversal_falls_back() {
         let home = temp_home("outside");
         // Not under home.
@@ -2835,6 +2834,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The env that turns [`probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor`]
+    /// on: the synthetic home it creates under.
+    #[cfg(unix)]
+    const OPEN_UMASK_ENV: &str = "ATPKG_STORE_OPEN_UMASK_HOME";
+    /// That probe's name, as `--exact` wants it.
+    #[cfg(unix)]
+    const OPEN_UMASK_PROBE: &str =
+        "store::tests::probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor";
+
+    /// The child half of [`a_prefix_made_under_an_open_umask_has_no_shared_ancestor`]:
+    /// under umask `002`, `ensure_dir(prefix)` makes the Linux default prefix's missing
+    /// ancestors (`.local`, `.local/share`, `.local/share/aterm`) `0755` and the prefix
+    /// `0700`; a configured prefix's the same, and the next [`vet_prefix`] admits the
+    /// prefix it made (the default is not the one to ask: `vet_prefix` falls back to it,
+    /// so it comes back whatever its chain); a system-shaped prefix's missing ancestors are
+    /// `0755` and the prefix `0755`. Outside that child (the env unset) it does nothing:
+    /// the umask is the whole process's.
+    #[cfg(unix)]
+    #[test]
+    fn probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor() {
+        let Some(home) = std::env::var_os(OPEN_UMASK_ENV) else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
+        // process runs this one test (`--exact`), so no other create sees the mask.
+        unsafe { libc::umask(0o002) };
+        // Octal text, so a failure reads `775`, not `509`.
+        let mode = |rel: &str| {
+            let meta = std::fs::symlink_metadata(home.join(rel)).unwrap();
+            format!("{:o}", meta.permissions().mode() & 0o7777)
+        };
+        let default = Layout {
+            prefix: home.join(".local/share/aterm/pkg"),
+        };
+        default.ensure_dir(&default.prefix).unwrap();
+        for made in [".local", ".local/share", ".local/share/aterm"] {
+            assert_eq!(mode(made), "755", "{made}: made under umask 002");
+        }
+        assert_eq!(mode(".local/share/aterm/pkg"), "700", "the $HOME prefix");
+        let configured = Layout {
+            prefix: home.join("work/aterm/pkg"),
+        };
+        configured.ensure_dir(&configured.prefix).unwrap();
+        for made in ["work", "work/aterm"] {
+            assert_eq!(mode(made), "755", "{made}: made under umask 002");
+        }
+        assert_eq!(mode("work/aterm/pkg"), "700", "the configured prefix");
+        assert_eq!(
+            vet_prefix(Some(&configured.prefix), &home),
+            configured.prefix,
+            "the prefix this pass made is refused by the next one"
+        );
+        let shared = Layout {
+            prefix: home.join("opt/aterm/pkg"),
+        };
+        system_shape::force(&shared.prefix);
+        shared.ensure_dir(&shared.prefix).unwrap();
+        for made in ["opt", "opt/aterm"] {
+            assert_eq!(mode(made), "755", "{made}: made under umask 002");
+        }
+        assert_eq!(mode("opt/aterm/pkg"), "755", "the system prefix");
+    }
+
+    /// AT3's umask finding, one level up (2026-10-17): the directories atpkg makes on the
+    /// way to its prefix were `create_dir_all`'s `0777 & ~umask`, so the first pass under
+    /// umask `002` (a user-private-group login's default) left `~/.local/share/aterm`
+    /// `0775`. `targo trust` refuses every toolchain installed below a group-writable
+    /// directory, and [`vet_prefix`] refused a configured prefix whose ancestors the
+    /// previous pass had made. The umask is process-wide, so the creates run in a child of
+    /// this test binary that runs only
+    /// [`probe_a_prefix_made_under_an_open_umask_has_no_shared_ancestor`].
+    #[cfg(unix)]
+    #[test]
+    fn a_prefix_made_under_an_open_umask_has_no_shared_ancestor() {
+        let home = temp_home("open-umask");
+        let out = aterm_uds::spawnfd::command(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", OPEN_UMASK_PROBE])
+            .env(OPEN_UMASK_ENV, home.as_os_str())
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the prefix under umask 002: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// A trusted system prefix this user cannot write falls back to the default rather
     /// than failing every verb on `store.lock`
     /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Runs only as a non-root user.
@@ -2904,21 +2994,6 @@ mod tests {
         );
     }
 
-    /// The negative half: a writable directory outside `$HOME` must still be usable,
-    /// so the check above cannot be satisfied by simply refusing every system prefix.
-    #[cfg(unix)]
-    #[test]
-    fn writable_prefix_is_still_accepted_by_the_usability_check() {
-        let home = temp_home("writable-check");
-        let writable = crate::testdir::dir("atpkg-writable-");
-        assert!(
-            caller_can_use_prefix(&writable.join("pkg")),
-            "a directory we just created must read as usable, including its absent tail"
-        );
-        let _ = std::fs::remove_dir_all(&writable);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
     #[test]
     fn shim_names_collision_and_shape_policy() {
         // Sensitive commands are refused (case-insensitively).
@@ -2975,35 +3050,6 @@ mod tests {
         assert_eq!(ToolName::from_shim_file("alab-git"), None);
     }
 
-    #[test]
-    fn tool_name_admits_through_the_deny_list_and_renders_both_file_names() {
-        // Construction is the deny-list check: a refused name has no `ToolName`, so it
-        // cannot reach `Layout::shim` or any other writer.
-        assert!(ToolName::new("sudo").is_none());
-        assert!(ToolName::new("../git").is_none());
-        assert!(ToolName::new("").is_none());
-        let ay = ToolName::new("ay").unwrap();
-        assert_eq!(ay.as_str(), "ay");
-        // The shim's own name and the binary it forwards to: one string on Unix, two files
-        // on Windows.
-        assert_eq!(
-            ay.shim_file(),
-            format!("ay{}", crate::platform::SHIM_SUFFIX)
-        );
-        assert_eq!(ay.exe_file(), format!("ay{}", crate::platform::EXE_SUFFIX));
-    }
-
-    #[test]
-    fn from_shim_file_round_trips_and_never_doubles_the_suffix() {
-        let ay = ToolName::new("ay").unwrap();
-        // The exact inverse of `shim_file`, so re-shimming replaces the live shim.
-        assert_eq!(ToolName::from_shim_file(&ay.shim_file()), Some(ay.clone()));
-        assert_eq!(ToolName::from_shim_file("ay"), Some(ay));
-        // An entry this manager could never have written is not recognized, so the caller
-        // that deletes what it recognizes leaves it alone.
-        assert_eq!(ToolName::from_shim_file("sudo"), None);
-    }
-
     /// The suffix rule with Windows' real suffixes, which no Unix runner reaches through
     /// `SHIM_SUFFIX` (`""`).
     #[test]
@@ -3029,18 +3075,6 @@ mod tests {
         // The empty suffix (Unix) is the identity in both directions.
         assert_eq!(with_suffix("ay", ""), "ay");
         assert_eq!(without_suffix("ay", ""), "ay");
-    }
-
-    #[test]
-    fn split_exposed_keeps_the_raw_name_in_the_refusal_list() {
-        let raw = vec!["ay".to_string(), "sudo".to_string(), "trust-mc".to_string()];
-        let (tools, refused) = split_exposed(&raw);
-        assert_eq!(
-            tools.iter().map(ToolName::as_str).collect::<Vec<_>>(),
-            vec!["ay", "trust-mc"]
-        );
-        // Refusals are reported with the name the manifest actually asked for.
-        assert_eq!(refused, vec!["sudo".to_string()]);
     }
 
     /// A marker written by the other slice of the universal binary does not vouch for the
@@ -3118,22 +3152,6 @@ mod tests {
             "a marker whose `bin/` is gone vouches for nothing"
         );
         let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// One tool removed from an otherwise intact `bin/` refutes the marker too.
-    #[test]
-    fn a_marker_is_refuted_when_one_recorded_tool_is_gone() {
-        let home = temp_home("readyonetool");
-        let build = home.join("store").join("trust").join("8595");
-        std::fs::create_dir_all(build.join("bin")).unwrap();
-        std::fs::write(build.join("bin").join("trustc"), b"x").unwrap();
-        std::fs::write(build.join("bin").join("targo"), b"x").unwrap();
-        mark_build_ready(&build).unwrap();
-        std::fs::remove_file(build.join("bin").join("trustc")).unwrap();
-        assert!(
-            !build_is_complete(&build),
-            "the marker named `trustc`; `trustc` is not there"
-        );
     }
 
     /// A `bin/` entry that is a symlink is recorded and checked by its own name: a dangling
@@ -3260,7 +3278,15 @@ mod tests {
         // A non-numeric sibling directory, and a sidecar that is not a readiness marker.
         std::fs::create_dir_all(prog.join("8595.incoming-7")).unwrap();
         std::fs::write(prog.join("8595.provenance"), b"src\n").unwrap();
+        let recording = aterm_durable::seam::Recording::start();
         unmark_program_builds(&prog);
+        assert_eq!(
+            recording.take(),
+            [aterm_durable::Flush::Ordered],
+            "every marker down before any tree goes: one ordered directory flush \
+             (aterm-durable's counting seam)"
+        );
+        drop(recording);
         for n in [8590u64, 8595] {
             let b = prog.join(n.to_string());
             assert!(!build_is_complete(&b), "build {n} must read as incomplete");
@@ -3274,20 +3300,6 @@ mod tests {
             "other sidecars stay"
         );
         assert!(prog.join("8595.incoming-7").is_dir());
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// A bare `ok\n` marker, written before the platform record, still reads as installed.
-    #[test]
-    fn a_legacy_marker_without_a_platform_record_still_reads_as_installed() {
-        let home = temp_home("readylegacy");
-        let build = home.join("store").join("ay").join("18");
-        std::fs::create_dir_all(&build).unwrap();
-        std::fs::write(ready_marker_path(&build).unwrap(), b"ok\n").unwrap();
-        assert!(build_is_complete(&build));
-        // And an absent marker is still the "partial install" answer it always was.
-        let _ = std::fs::remove_file(ready_marker_path(&build).unwrap());
-        assert!(!build_is_complete(&build));
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -61,6 +61,18 @@
 //! `astream-aead`'s job (over the vetted RustCrypto AEAD), wired into the broker
 //! as `serve_tcp_sealed`; a guarded broker (`open_guarded`) composes the two.
 
+// A contracted fn is written once, through `contract_fn!`: under a Trust compiler
+// (`cfg(clean_islands)`, build.rs) it carries its `ensures` clause, which no stock rustc can
+// parse, and every other compiler gets the plain fn.
+#[macro_use]
+#[path = "../../astream-wire/contract_fn.rs"]
+mod contract_fn;
+
+// Plain-Rust twins of the functions this crate's Clean islands compile, for a compiler
+// that cannot lex the islands.
+#[cfg(any(test, not(clean_islands)))]
+mod twins;
+
 pub mod capfile;
 
 use astream_digest::Sha256;
@@ -73,9 +85,27 @@ const TAG: usize = 32; // SHA-256 output size
 /// some other SHA-256 this workspace already computes over the same bytes.
 const PID_DOMAIN: &[u8] = b"astream-pid\0";
 
+/// Offline Macaroon v2 tag context, following [`MACAROON_FRAME_PREFIX`].
+const MACAROON_DOMAIN: &[u8] = b"astream-macaroon-v2\0";
+/// Binary context framing disjoint from the attach message `nonce[32] ‖ grant`:
+/// at byte 32 this message has 0xff, which no UTF-8 `grant` can contain. This is
+/// independent of the nonce's value, including a maliciously chosen challenge.
+const MACAROON_FRAME_PREFIX: [u8; 33] = [0xff; 33];
+
+/// Maximum number of offline Macaroon attenuation hops (`via=<hex>`) in a grant.
+pub const MAX_MACAROON_DEPTH: usize = 8;
+
+/// Maximum byte length of a `via=<hex>` field in a grant prefix.
+const MAX_VIA_HEX_LEN: usize = 4096;
+/// Shared issuance/verification bound for a full offline chained grant. This
+/// keeps pre-proof parent parsing bounded without issuing a cap it cannot verify.
+const MAX_MACAROON_GRANT_BYTES: usize = MAX_VIA_HEX_LEN + 512;
+
 /// The longest a principal's name half may be — short enough that a principal
 /// cannot carry a sentence into an agent's context.
 const PRINCIPAL_NAME_MAX: usize = 32;
+/// Maximum byte length of a full `<class>-<name>` principal (`2 + PRINCIPAL_NAME_MAX`).
+const PRINCIPAL_TOTAL_MAX: usize = 34;
 
 /// The class prefixes a principal may carry: session, node, human, agent/service.
 /// Reserved literal subject segments can never collide with a class-prefixed id.
@@ -91,8 +121,8 @@ pub struct Capability {
     /// read-write, unbound grant) or a mode/principal-prefixed one ([`Grant`]).
     /// The field keeps its name because a bare filter *is* a grant.
     pub filter: String,
-    /// HMAC-SHA256(secret, grant) — the unforgeable seal, over mode, principal and
-    /// filter together.
+    /// HMAC-SHA256(secret, grant) (or chained Macaroon HMAC for `via=` grants) —
+    /// the unforgeable seal, over mode, principal, expiry, provenance, and filter.
     pub tag: [u8; TAG],
 }
 
@@ -153,15 +183,18 @@ impl Grant {
     /// no field value may contain one, and a filter that does is only ever
     /// reached after the prefix has been consumed.
     ///
-    /// The fields are `p=<principal>` and `exp=<unix-ms>`, each at most once and
-    /// in either order. A REPEATED field is refused rather than last-wins: two
-    /// `exp=` values in one string is not a grant whose meaning anyone should
-    /// have to guess, and last-wins would let a longer expiry be appended to a
-    /// string a reader skims. An UNKNOWN field is refused too, because a future
-    /// field silently ignored by an older broker is a capability that means less
-    /// than it says.
+    /// The fields are `p=<principal>`, `exp=<unix-ms>`, and `via=<hex-parent-grant>`
+    /// (for offline-attenuated Macaroon capabilities), each at most once and in any
+    /// order. A REPEATED field is refused rather than last-wins: two `exp=` values
+    /// in one string is not a grant whose meaning anyone should have to guess, and
+    /// last-wins would let a longer expiry be appended to a string a reader skims.
+    /// An UNKNOWN field is refused too, because a future field silently ignored by
+    /// an older broker is a capability that means less than it says.
     pub fn parse(grant: &str) -> Result<Self, String> {
-        parse_grant(grant).map(|(g, _)| g)
+        match parse_grant(grant) {
+            Ok((g, _)) => Ok(g),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -169,15 +202,58 @@ impl Grant {
 /// authorization check matches against it instead of validating the same
 /// string a second time.
 fn parse_grant(grant: &str) -> Result<(Grant, Filter), String> {
+    match parse_grant_depth(grant, 0) {
+        Ok((g, f, _)) => Ok((g, f)),
+        Err(e) => Err(e),
+    }
+}
+
+fn all_ascii_digits(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    for &b in s.as_bytes() {
+        if !b.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_u64_ascii(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut acc = 0u64;
+    for &b in s.as_bytes() {
+        let digit = match b {
+            b'0'..=b'9' => u64::from(b.saturating_sub(b'0')),
+            _ => return None,
+        };
+        acc = acc.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(acc)
+}
+
+fn parse_grant_depth(grant: &str, depth: usize) -> Result<(Grant, Filter, Option<String>), String> {
+    const MAX_MACAROON_DEPTH_LIMIT: u64 = (MAX_MACAROON_DEPTH as u64) + 1;
+    if !macaroon_depth_valid(depth as u64, MAX_MACAROON_DEPTH_LIMIT) {
+        return Err(format!(
+            "invalid grant: macaroon attenuation chain exceeds max depth {MAX_MACAROON_DEPTH}"
+        ));
+    }
     if grant.starts_with('/') {
-        let f = Filter::new(grant).map_err(|e| format!("invalid filter: {e}"))?;
+        let f = match Filter::new(grant) {
+            Ok(f) => f,
+            Err(e) => return Err(format!("invalid filter: {e}")),
+        };
         let g = Grant {
             mode: Mode::ReadWrite,
             principal: None,
             filter: grant.to_string(),
             expires_at: None,
         };
-        return Ok((g, f));
+        return Ok((g, f, None));
     }
     let Some((prefix, filter)) = grant.split_once(':') else {
         return Err(format!(
@@ -189,6 +265,7 @@ fn parse_grant(grant: &str) -> Result<(Grant, Filter), String> {
     let mode_tok = fields.next().unwrap_or("");
     let mut principal: Option<String> = None;
     let mut expires_at: Option<u64> = None;
+    let mut via_parent: Option<String> = None;
     for field in fields {
         if let Some(p) = field.strip_prefix("p=") {
             if principal.is_some() {
@@ -211,19 +288,38 @@ fn parse_grant(grant: &str) -> Result<(Grant, Filter), String> {
             // leading `+`. (Leading zeros still parse, as does either field
             // order, so one authority can have several spellings and tags;
             // nothing keys authority on the spelling.)
-            if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+            if !all_ascii_digits(v) {
                 return Err(format!(
                     "invalid grant expiry {v:?}: expected unix milliseconds as ASCII digits"
                 ));
             }
-            let ms = v.parse::<u64>().map_err(|_| {
-                format!("invalid grant expiry {v:?}: does not fit in u64 milliseconds")
-            })?;
+            let Some(ms) = parse_u64_ascii(v) else {
+                return Err(format!(
+                    "invalid grant expiry {v:?}: does not fit in u64 milliseconds"
+                ));
+            };
             expires_at = Some(ms);
+        } else if let Some(h) = field.strip_prefix("via=") {
+            if via_parent.is_some() {
+                return Err(format!(
+                    "invalid grant prefix {prefix:?}: repeated \"via=\""
+                ));
+            }
+            if !macaroon_depth_valid(depth as u64, MAX_MACAROON_DEPTH as u64) {
+                return Err(format!(
+                    "invalid grant: macaroon attenuation chain exceeds max depth {MAX_MACAROON_DEPTH}"
+                ));
+            }
+            let Some(parent_str) = decode_lower_hex_utf8(h) else {
+                return Err(format!(
+                    "invalid grant via field {h:?}: expected lowercase hex-encoded parent grant"
+                ));
+            };
+            via_parent = Some(parent_str);
         } else {
             return Err(format!(
-                "invalid grant prefix {prefix:?}: expected \",p=<principal>\" or \
-                 \",exp=<unix-ms>\""
+                "invalid grant prefix {prefix:?}: expected \",p=<principal>\", \
+                 \",exp=<unix-ms>\", or \",via=<hex>\""
             ));
         }
     }
@@ -236,14 +332,90 @@ fn parse_grant(grant: &str) -> Result<(Grant, Filter), String> {
             ))
         }
     };
-    let f = Filter::new(filter).map_err(|e| format!("invalid filter: {e}"))?;
+    let f = match Filter::new(filter) {
+        Ok(f) => f,
+        Err(e) => return Err(format!("invalid filter: {e}")),
+    };
     let g = Grant {
         mode,
         principal,
         filter: filter.to_string(),
         expires_at,
     };
-    Ok((g, f))
+    if let Some(ref parent_str) = via_parent {
+        let (pg, pf, _) = parse_grant_depth(parent_str, depth.saturating_add(1))?;
+        check_attenuation_parsed(parent_str, &pg, &pf, grant, &g, &f)?;
+    }
+    Ok((g, f, via_parent))
+}
+
+const fn hex_digit_char(nibble: u8) -> char {
+    match nibble & 0x0f {
+        0 => '0',
+        1 => '1',
+        2 => '2',
+        3 => '3',
+        4 => '4',
+        5 => '5',
+        6 => '6',
+        7 => '7',
+        8 => '8',
+        9 => '9',
+        10 => 'a',
+        11 => 'b',
+        12 => 'c',
+        13 => 'd',
+        14 => 'e',
+        _ => 'f',
+    }
+}
+
+const fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0' => Some(0),
+        b'1' => Some(1),
+        b'2' => Some(2),
+        b'3' => Some(3),
+        b'4' => Some(4),
+        b'5' => Some(5),
+        b'6' => Some(6),
+        b'7' => Some(7),
+        b'8' => Some(8),
+        b'9' => Some(9),
+        b'a' => Some(10),
+        b'b' => Some(11),
+        b'c' => Some(12),
+        b'd' => Some(13),
+        b'e' => Some(14),
+        b'f' => Some(15),
+        _ => None,
+    }
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in bytes {
+        out.push(hex_digit_char(b >> 4));
+        out.push(hex_digit_char(b & 0x0f));
+    }
+    out
+}
+
+fn decode_lower_hex_utf8(hex: &str) -> Option<String> {
+    if hex.is_empty() || hex.len() > MAX_VIA_HEX_LEN {
+        return None;
+    }
+    let (pairs, rem) = hex.as_bytes().as_chunks::<2>();
+    if !rem.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for &[hi_b, lo_b] in pairs {
+        let hi = hex_nibble(hi_b)?;
+        let lo = hex_nibble(lo_b)?;
+        out.push((hi << 4) | lo);
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Whether `p` is a well-formed principal: a class prefix (`s-` session, `n-`
@@ -254,14 +426,151 @@ fn parse_grant(grant: &str) -> Result<(Grant, Filter), String> {
 /// confuse the grant grammar or the subject grammar — a `:`, a `/`, a wildcard, a
 /// control byte, an over-long or empty name — not anything about who issued the id.
 fn valid_principal(p: &str) -> bool {
-    let Some(name) = PRINCIPAL_CLASSES.iter().find_map(|c| p.strip_prefix(c)) else {
+    let bytes = p.as_bytes();
+    if bytes.len() < 3 || bytes.len() > PRINCIPAL_TOTAL_MAX {
         return false;
-    };
-    !name.is_empty()
-        && name.len() <= PRINCIPAL_NAME_MAX
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    }
+    if bytes[1] != b'-' {
+        return false;
+    }
+    if !matches!(bytes[0], b's' | b'n' | b'h' | b'a') {
+        return false;
+    }
+    for &b in &bytes[2..] {
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return false;
+        }
+    }
+    true
+}
+
+// The Clean island, out of line: only a Trust compiler lexes it, so it mounts under
+// `cfg(clean_islands)` (build.rs) and a stock compiler never opens the file.
+#[cfg(clean_islands)]
+mod cap_island;
+#[cfg(not(clean_islands))]
+pub use crate::twins::{attenuate_expiry_min, cap_clock_advance_monotone, live_expiry_or_zero};
+#[cfg(clean_islands)]
+pub use cap_island::{attenuate_expiry_min, cap_clock_advance_monotone, live_expiry_or_zero};
+
+contract_fn! {
+    /// Kernel-certified half-open expiry predicate (`exp <= now_ms`).
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `grant_expired_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub fn grant_expired_at(exp: u64, now_ms: u64) -> bool
+    clauses [ensures result == (exp <= now_ms)]
+    {
+        exp <= now_ms
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified principal-to-`producer_id` binding equality check.
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `pid_matches_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub fn producer_id_matches(expected: u64, actual: u64) -> bool
+    clauses [ensures result == (expected == actual)]
+    {
+        expected == actual
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified expiry-attenuation predicate (`child_exp <= parent_exp`).
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `expiry_attenuates_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub fn expiry_attenuates(child_exp: u64, parent_exp: u64) -> bool
+    clauses [ensures result == (child_exp <= parent_exp)]
+    {
+        child_exp <= parent_exp
+    }
+}
+
+contract_fn! {
+    /// Kernel-certified Macaroon chain depth bound check (`depth < max_depth`).
+    ///
+    /// Discharged in the Clean CIC kernel by definitional equality against
+    /// `depth_within_limit_isl` (`clean-kernel-defeq`).
+    #[must_use]
+    pub fn macaroon_depth_valid(depth: u64, max_depth: u64) -> bool
+    clauses [ensures result == (depth < max_depth)]
+    {
+        depth < max_depth
+    }
+}
+
+/// Advance an authorization clock monotonically (`max(cur_ms, sample_ms)`),
+/// delegating directly to the Clean-origin `cap_clock_advance_monotone` transition.
+#[must_use]
+pub const fn advance_auth_clock_ms(cur_ms: u64, sample_ms: u64) -> u64 {
+    cap_clock_advance_monotone(cur_ms, sample_ms)
+}
+
+/// Compute the tightest effective expiry timestamp (`unix_ms`) across an entire
+/// offline-attenuated Macaroon delegation chain (`via=<hex>`), folding each hop's
+/// `expires_at` via the Clean-origin `attenuate_expiry_min` transition.
+#[must_use]
+pub fn effective_expiry_ms(grant: &str) -> Option<u64> {
+    let mut cur = grant.to_string();
+    let mut effective: Option<u64> = None;
+    for depth in 0..=MAX_MACAROON_DEPTH {
+        let Ok((parsed, _, parent)) = parse_grant_depth(&cur, depth) else {
+            return None;
+        };
+        if let Some(exp) = parsed.expires_at {
+            effective = Some(match effective {
+                Some(acc) => attenuate_expiry_min(acc, exp),
+                None => exp,
+            });
+        }
+        match parent {
+            None => return effective,
+            Some(p) => cur = p,
+        }
+    }
+    None
+}
+
+/// 3-parameter Macaroon expiry attenuation + live clock enforcement kernel:
+/// collapses to `0` (immediately expired) if `min(parent_exp, child_exp) <= now_ms`,
+/// and otherwise returns `min(parent_exp, child_exp)`.
+///
+/// Composes the 3-parameter Clean-origin [`live_expiry_or_zero`] and 2-parameter
+/// [`attenuate_expiry_min`] transitions (`TlaCapabilityProtocol::attenuate_bounded_expiry_le_parent`).
+#[must_use]
+pub const fn attenuate_bounded_expiry(now_ms: u64, parent_exp: u64, child_exp: u64) -> u64 {
+    live_expiry_or_zero(attenuate_expiry_min(parent_exp, child_exp), now_ms, 0)
+}
+
+/// Compute the live clock-bounded effective expiry (`unix_ms`) across an entire
+/// offline-attenuated Macaroon delegation chain at `now_ms`, folding each hop via
+/// [`attenuate_bounded_expiry`] (`0` if any link has already lapsed at `now_ms`).
+#[must_use]
+pub fn effective_bounded_expiry_ms(grant: &str, now_ms: u64) -> Option<u64> {
+    let mut cur = grant.to_string();
+    let mut effective: Option<u64> = None;
+    for depth in 0..=MAX_MACAROON_DEPTH {
+        let Ok((parsed, _, parent)) = parse_grant_depth(&cur, depth) else {
+            return None;
+        };
+        if let Some(exp) = parsed.expires_at {
+            effective = Some(match effective {
+                Some(acc) => attenuate_bounded_expiry(now_ms, acc, exp),
+                None => attenuate_bounded_expiry(now_ms, exp, exp),
+            });
+        }
+        match parent {
+            None => return effective,
+            Some(p) => cur = p,
+        }
+    }
+    None
 }
 
 /// When `grant` stops authorizing, as unix milliseconds — `None` for a grant
@@ -272,7 +581,10 @@ fn valid_principal(p: &str) -> bool {
 /// it separates them the other way (an unparseable string is expired).
 #[must_use]
 pub fn expires_at(grant: &str) -> Option<u64> {
-    Grant::parse(grant).ok().and_then(|g| g.expires_at)
+    match Grant::parse(grant) {
+        Ok(g) => g.expires_at,
+        Err(_) => None,
+    }
 }
 
 /// Whether `grant` has stopped authorizing at `now_ms` (unix milliseconds).
@@ -294,14 +606,47 @@ pub fn expires_at(grant: &str) -> Option<u64> {
 pub fn is_expired(grant: &str, now_ms: u64) -> bool {
     match Grant::parse(grant) {
         Err(_) => true,
-        Ok(g) => g.expires_at.is_some_and(|exp| now_ms >= exp),
+        Ok(g) => match g.expires_at {
+            Some(exp) => grant_expired_at(exp, now_ms),
+            None => false,
+        },
     }
 }
 
 /// The mode `grant` authorizes, or `None` if it is not a grant at all.
 #[must_use]
 pub fn mode_of(grant: &str) -> Option<Mode> {
-    Grant::parse(grant).ok().map(|g| g.mode)
+    match Grant::parse(grant) {
+        Ok(g) => Some(g.mode),
+        Err(_) => None,
+    }
+}
+
+/// The immediate parent grant string embedded in an offline-attenuated Macaroon
+/// capability (`via=<hex>`), or `None` for a root capability or unparseable string.
+#[must_use]
+pub fn parent_grant(grant: &str) -> Option<String> {
+    match parse_grant_depth(grant, 0) {
+        Ok((_, _, p)) => p,
+        Err(_) => None,
+    }
+}
+
+/// The number of offline Macaroon attenuation hops (`via=<hex>`) in `grant` (`0` for
+/// a root capability), or `None` if `grant` does not parse.
+#[must_use]
+pub fn attenuation_depth(grant: &str) -> Option<usize> {
+    let mut cur = grant.to_string();
+    for depth in 0..=MAX_MACAROON_DEPTH {
+        let Ok((_, _, parent)) = parse_grant_depth(&cur, depth) else {
+            return None;
+        };
+        match parent {
+            None => return Some(depth),
+            Some(p) => cur = p,
+        }
+    }
+    None
 }
 
 /// The producer id the **broker** derives for `principal`:
@@ -316,16 +661,155 @@ pub fn producer_id_of(principal: &str) -> u64 {
     let mut h = Sha256::new();
     h.update(PID_DOMAIN);
     h.update(principal.as_bytes());
-    // A fixed `[u8; 32]`, so the first 8 bytes are a static, in-bounds slice.
+    // A fixed `[u8; 32]`, so the first 8 bytes are static, in-bounds indices.
     let digest: [u8; TAG] = h.finalize();
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&digest[..8]);
+    let head = [
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ];
     u64::from_le_bytes(head)
 }
 
 /// HMAC-SHA256(key, msg) per RFC 2104, over `astream-digest`'s SHA-256.
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; TAG] {
     hmac_sha256_parts(key, &[msg])
+}
+
+const fn hmac_ipad(k: &[u8; BLOCK]) -> [u8; BLOCK] {
+    [
+        k[0] ^ 0x36,
+        k[1] ^ 0x36,
+        k[2] ^ 0x36,
+        k[3] ^ 0x36,
+        k[4] ^ 0x36,
+        k[5] ^ 0x36,
+        k[6] ^ 0x36,
+        k[7] ^ 0x36,
+        k[8] ^ 0x36,
+        k[9] ^ 0x36,
+        k[10] ^ 0x36,
+        k[11] ^ 0x36,
+        k[12] ^ 0x36,
+        k[13] ^ 0x36,
+        k[14] ^ 0x36,
+        k[15] ^ 0x36,
+        k[16] ^ 0x36,
+        k[17] ^ 0x36,
+        k[18] ^ 0x36,
+        k[19] ^ 0x36,
+        k[20] ^ 0x36,
+        k[21] ^ 0x36,
+        k[22] ^ 0x36,
+        k[23] ^ 0x36,
+        k[24] ^ 0x36,
+        k[25] ^ 0x36,
+        k[26] ^ 0x36,
+        k[27] ^ 0x36,
+        k[28] ^ 0x36,
+        k[29] ^ 0x36,
+        k[30] ^ 0x36,
+        k[31] ^ 0x36,
+        k[32] ^ 0x36,
+        k[33] ^ 0x36,
+        k[34] ^ 0x36,
+        k[35] ^ 0x36,
+        k[36] ^ 0x36,
+        k[37] ^ 0x36,
+        k[38] ^ 0x36,
+        k[39] ^ 0x36,
+        k[40] ^ 0x36,
+        k[41] ^ 0x36,
+        k[42] ^ 0x36,
+        k[43] ^ 0x36,
+        k[44] ^ 0x36,
+        k[45] ^ 0x36,
+        k[46] ^ 0x36,
+        k[47] ^ 0x36,
+        k[48] ^ 0x36,
+        k[49] ^ 0x36,
+        k[50] ^ 0x36,
+        k[51] ^ 0x36,
+        k[52] ^ 0x36,
+        k[53] ^ 0x36,
+        k[54] ^ 0x36,
+        k[55] ^ 0x36,
+        k[56] ^ 0x36,
+        k[57] ^ 0x36,
+        k[58] ^ 0x36,
+        k[59] ^ 0x36,
+        k[60] ^ 0x36,
+        k[61] ^ 0x36,
+        k[62] ^ 0x36,
+        k[63] ^ 0x36,
+    ]
+}
+
+const fn hmac_opad(k: &[u8; BLOCK]) -> [u8; BLOCK] {
+    [
+        k[0] ^ 0x5c,
+        k[1] ^ 0x5c,
+        k[2] ^ 0x5c,
+        k[3] ^ 0x5c,
+        k[4] ^ 0x5c,
+        k[5] ^ 0x5c,
+        k[6] ^ 0x5c,
+        k[7] ^ 0x5c,
+        k[8] ^ 0x5c,
+        k[9] ^ 0x5c,
+        k[10] ^ 0x5c,
+        k[11] ^ 0x5c,
+        k[12] ^ 0x5c,
+        k[13] ^ 0x5c,
+        k[14] ^ 0x5c,
+        k[15] ^ 0x5c,
+        k[16] ^ 0x5c,
+        k[17] ^ 0x5c,
+        k[18] ^ 0x5c,
+        k[19] ^ 0x5c,
+        k[20] ^ 0x5c,
+        k[21] ^ 0x5c,
+        k[22] ^ 0x5c,
+        k[23] ^ 0x5c,
+        k[24] ^ 0x5c,
+        k[25] ^ 0x5c,
+        k[26] ^ 0x5c,
+        k[27] ^ 0x5c,
+        k[28] ^ 0x5c,
+        k[29] ^ 0x5c,
+        k[30] ^ 0x5c,
+        k[31] ^ 0x5c,
+        k[32] ^ 0x5c,
+        k[33] ^ 0x5c,
+        k[34] ^ 0x5c,
+        k[35] ^ 0x5c,
+        k[36] ^ 0x5c,
+        k[37] ^ 0x5c,
+        k[38] ^ 0x5c,
+        k[39] ^ 0x5c,
+        k[40] ^ 0x5c,
+        k[41] ^ 0x5c,
+        k[42] ^ 0x5c,
+        k[43] ^ 0x5c,
+        k[44] ^ 0x5c,
+        k[45] ^ 0x5c,
+        k[46] ^ 0x5c,
+        k[47] ^ 0x5c,
+        k[48] ^ 0x5c,
+        k[49] ^ 0x5c,
+        k[50] ^ 0x5c,
+        k[51] ^ 0x5c,
+        k[52] ^ 0x5c,
+        k[53] ^ 0x5c,
+        k[54] ^ 0x5c,
+        k[55] ^ 0x5c,
+        k[56] ^ 0x5c,
+        k[57] ^ 0x5c,
+        k[58] ^ 0x5c,
+        k[59] ^ 0x5c,
+        k[60] ^ 0x5c,
+        k[61] ^ 0x5c,
+        k[62] ^ 0x5c,
+        k[63] ^ 0x5c,
+    ]
 }
 
 /// HMAC-SHA256 of the CONCATENATION of `parts`, streamed into the inner hash one
@@ -338,12 +822,8 @@ fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
     } else {
         k[..key.len()].copy_from_slice(key);
     }
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
+    let ipad = hmac_ipad(&k);
+    let opad = hmac_opad(&k);
     let mut inner = Sha256::new();
     inner.update(ipad);
     for part in parts {
@@ -356,10 +836,53 @@ fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
     outer.finalize()
 }
 
+/// The offline tag message has an explicit binary context before any grant.
+///
+/// Root-capability tags and the attach wire message are unchanged. Old offline
+/// v1 tags are intentionally refused: reissue every offline chain from its root
+/// capability. There is no legacy tag fallback, which would retain the proof
+/// substitution vulnerability. The `via=` grant and capfile syntax stay unchanged.
+fn macaroon_tag(parent_tag: &[u8; TAG], grant: &str) -> [u8; TAG] {
+    hmac_sha256_parts(
+        parent_tag,
+        &[&MACAROON_FRAME_PREFIX, MACAROON_DOMAIN, grant.as_bytes()],
+    )
+}
+
+/// Compute the expected HMAC tag for `grant` under `secret`, supporting both root
+/// capabilities (`HMAC-SHA256(secret, grant)`) and offline-attenuated Macaroon
+/// capabilities carrying `via=<hex-parent-grant>` (`HMAC-SHA256(parent_tag, MACAROON_FRAME_PREFIX ‖ MACAROON_DOMAIN ‖ grant)`).
+///
+/// Fast-path allocation guard (`cap.attach-proof-before-parse`): if `grant` starts
+/// with `'/'`, exceeds `MAX_MACAROON_GRANT_BYTES` bytes, or has no `,via=` in its
+/// prefix, this computes `hmac_sha256(secret, grant.as_bytes())` directly with zero
+/// heap allocation.
+fn expected_tag(secret: &[u8], grant: &str) -> [u8; TAG] {
+    expected_tag_depth(secret, grant, 0)
+}
+
+fn expected_tag_depth(secret: &[u8], grant: &str, depth: usize) -> [u8; TAG] {
+    if !grant.starts_with('/')
+        && grant.len() <= MAX_MACAROON_GRANT_BYTES
+        && macaroon_depth_valid(depth as u64, MAX_MACAROON_DEPTH as u64)
+    {
+        if let Some((pfx, _)) = grant.split_once(':') {
+            if pfx.contains(",via=") {
+                if let Ok((_, _, Some(parent_str))) = parse_grant_depth(grant, depth) {
+                    let parent_tag =
+                        expected_tag_depth(secret, &parent_str, depth.saturating_add(1));
+                    return macaroon_tag(&parent_tag, grant);
+                }
+            }
+        }
+    }
+    hmac_sha256(secret, grant.as_bytes())
+}
+
 /// The folded difference between two tags: the OR of all 32 byte-wise XORs. Zero
 /// exactly when they are equal.
 ///
-/// The loop has no data-dependent exit — every one of the 32 bytes is read and
+/// The expression has no data-dependent exit — every one of the 32 bytes is read and
 /// folded whatever the inputs are, so how long the compare runs, and what it
 /// returns, say nothing about WHERE the first difference is.
 ///
@@ -371,23 +894,51 @@ fn hmac_sha256_parts(key: &[u8], parts: &[&[u8]]) -> [u8; TAG] {
 /// one that compares in the entry point instead leaves the helper uncalled, which
 /// `deny(dead_code)` makes a build failure. It is a structural property of the
 /// source, not a timing measurement.
-fn ct_diff(a: &[u8; TAG], b: &[u8; TAG]) -> u8 {
-    let mut diff = 0u8;
-    for i in 0..TAG {
-        diff |= a[i] ^ b[i];
-    }
-    diff
+const fn ct_diff(a: &[u8; TAG], b: &[u8; TAG]) -> u8 {
+    (a[0] ^ b[0])
+        | (a[1] ^ b[1])
+        | (a[2] ^ b[2])
+        | (a[3] ^ b[3])
+        | (a[4] ^ b[4])
+        | (a[5] ^ b[5])
+        | (a[6] ^ b[6])
+        | (a[7] ^ b[7])
+        | (a[8] ^ b[8])
+        | (a[9] ^ b[9])
+        | (a[10] ^ b[10])
+        | (a[11] ^ b[11])
+        | (a[12] ^ b[12])
+        | (a[13] ^ b[13])
+        | (a[14] ^ b[14])
+        | (a[15] ^ b[15])
+        | (a[16] ^ b[16])
+        | (a[17] ^ b[17])
+        | (a[18] ^ b[18])
+        | (a[19] ^ b[19])
+        | (a[20] ^ b[20])
+        | (a[21] ^ b[21])
+        | (a[22] ^ b[22])
+        | (a[23] ^ b[23])
+        | (a[24] ^ b[24])
+        | (a[25] ^ b[25])
+        | (a[26] ^ b[26])
+        | (a[27] ^ b[27])
+        | (a[28] ^ b[28])
+        | (a[29] ^ b[29])
+        | (a[30] ^ b[30])
+        | (a[31] ^ b[31])
 }
 
 /// Mint a capability granting `grant`, sealed with `secret`. The grant is parsed —
 /// its filter half validated by `Filter::new` — so an unparseable grant (a bad
 /// mode, a malformed principal, an invalid filter) is rejected up front. The tag
-/// is over the grant string exactly as given.
+/// is over the grant string exactly as given (including Macaroon HMAC chain
+/// derivation when `grant` carries a valid `via=<hex>` parent).
 pub fn mint(secret: &[u8], grant: &str) -> Result<Capability, String> {
     Grant::parse(grant)?;
     Ok(Capability {
         filter: grant.to_string(),
-        tag: hmac_sha256(secret, grant.as_bytes()),
+        tag: expected_tag(secret, grant),
     })
 }
 
@@ -398,7 +949,7 @@ pub fn mint(secret: &[u8], grant: &str) -> Result<Capability, String> {
 /// It exists so the no-early-exit shape can be asserted *through the function the
 /// mint check calls* rather than beside it — see `ct_diff`.
 fn verify_diff(secret: &[u8], cap: &Capability) -> u8 {
-    ct_diff(&hmac_sha256(secret, cap.filter.as_bytes()), &cap.tag)
+    ct_diff(&expected_tag(secret, &cap.filter), &cap.tag)
 }
 
 /// Verify a capability was minted with `secret` — its grant string (mode,
@@ -433,8 +984,10 @@ pub fn attach_proof(tag: &[u8; TAG], nonce: &[u8], grant: &str) -> [u8; TAG] {
 /// It exists so the no-early-exit shape can be asserted *through the function the
 /// accept path calls* rather than beside it — see `ct_diff`.
 fn verify_attach_diff(secret: &[u8], grant: &str, nonce: &[u8], proof: &[u8]) -> Option<u8> {
-    let proof = <&[u8; TAG]>::try_from(proof).ok()?;
-    let tag = hmac_sha256(secret, grant.as_bytes());
+    let Ok(proof) = <&[u8; TAG]>::try_from(proof) else {
+        return None;
+    };
+    let tag = expected_tag(secret, grant);
     let diff = ct_diff(&attach_proof(&tag, nonce, grant), proof);
     if diff == 0 && Grant::parse(grant).is_err() {
         return None;
@@ -467,9 +1020,11 @@ fn authentic_grant(secret: &[u8], cap: &Capability, now_ms: u64) -> Option<(Gran
     if !verify(secret, cap) {
         return None;
     }
-    let (grant, filter) = parse_grant(cap.filter.as_str()).ok()?;
+    let Ok((grant, filter)) = parse_grant(cap.filter.as_str()) else {
+        return None;
+    };
     match grant.expires_at {
-        Some(exp) if now_ms >= exp => None,
+        Some(exp) if grant_expired_at(exp, now_ms) => None,
         _ => Some((grant, filter)),
     }
 }
@@ -518,7 +1073,7 @@ pub fn grants_publish(
         None => false,
         Some(grant) => match grant.principal {
             None => true,
-            Some(p) => producer_id_of(&p) == producer_id,
+            Some(p) => producer_id_matches(producer_id_of(&p), producer_id),
         },
     }
 }
@@ -542,12 +1097,361 @@ pub fn grants_filter(secret: &[u8], cap: &Capability, filter: &str, now_ms: u64)
     let Some((_, granted)) = authentic_grant(secret, cap, now_ms) else {
         return false;
     };
-    Filter::new(filter).is_ok_and(|requested| granted.contains(&requested))
+    match Filter::new(filter) {
+        Ok(requested) => granted.contains(&requested),
+        Err(_) => false,
+    }
+}
+
+fn check_attenuation_parsed(
+    parent_grant: &str,
+    pg: &Grant,
+    pf: &Filter,
+    child_grant: &str,
+    cg: &Grant,
+    cf: &Filter,
+) -> Result<(), String> {
+    if pg.mode == Mode::ReadOnly && cg.mode == Mode::ReadWrite {
+        return Err(format!(
+            "cannot attenuate mode: parent {parent_grant:?} is ReadOnly, child {child_grant:?} requests ReadWrite"
+        ));
+    }
+    if let Some(pp) = &pg.principal {
+        if cg.principal.as_ref() != Some(pp) {
+            return Err(format!(
+                "cannot attenuate principal: parent {parent_grant:?} is bound to {pp:?}, child {child_grant:?} has {:?}",
+                cg.principal
+            ));
+        }
+    }
+    if let Some(p_exp) = pg.expires_at {
+        match cg.expires_at {
+            Some(c_exp) if expiry_attenuates(c_exp, p_exp) => {}
+            Some(c_exp) => {
+                return Err(format!(
+                    "cannot attenuate expiry: child expiry {c_exp} exceeds parent expiry {p_exp}"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "cannot attenuate expiry: parent expires at {p_exp}, child has no expiry"
+                ))
+            }
+        }
+    }
+    if !pf.contains(cf) {
+        return Err(format!(
+            "cannot attenuate filter: parent filter {:?} does not contain child filter {:?}",
+            pg.filter, cg.filter
+        ));
+    }
+    Ok(())
+}
+
+/// Check whether `child_grant` is a valid, monotone attenuation of `parent_grant`
+/// (`REQUIREMENTS` R6):
+///
+/// 1. **Mode**: `child.mode <= parent.mode` (`ReadOnly <= ReadWrite`; a `ReadOnly`
+///    parent can never attenuate to `ReadWrite`).
+/// 2. **Principal**: If `parent.principal` is `Some(p)`, `child.principal` must also
+///    be `Some(p)` (a principal-bound grant cannot unbind or switch principals). An
+///    unbound parent (`None`) may remain unbound or bind any valid principal.
+/// 3. **Expiry**: If `parent.expires_at` is `Some(exp_p)`, `child.expires_at` must be
+///    `Some(exp_c)` with `exp_c <= exp_p` ([`expiry_attenuates`]). A non-expiring
+///    parent (`None`) may remain non-expiring or add an expiry.
+/// 4. **Filter**: `parent_filter.contains(&child_filter)` — every subject matched by
+///    `child_grant` is matched by `parent_grant`.
+pub fn can_attenuate(parent_grant: &str, child_grant: &str) -> Result<(), String> {
+    let (pg, pf) = parse_grant(parent_grant)?;
+    let (cg, cf) = parse_grant(child_grant)?;
+    check_attenuation_parsed(parent_grant, &pg, &pf, child_grant, &cg, &cf)
+}
+
+/// Mint an attenuated child capability from a verified, non-expired `parent`
+/// capability under `secret` at `now_ms` (`REQUIREMENTS` R6).
+///
+/// Fails closed if `parent` does not verify under `secret`, has expired at `now_ms`,
+/// or if `child_grant` widens any dimension of `parent` ([`can_attenuate`]).
+pub fn attenuate(
+    secret: &[u8],
+    parent: &Capability,
+    child_grant: &str,
+    now_ms: u64,
+) -> Result<Capability, String> {
+    if !verify(secret, parent) {
+        return Err("parent capability tag does not verify under secret".to_string());
+    }
+    if is_expired(&parent.filter, now_ms) {
+        let exp = expires_at(&parent.filter).unwrap_or(0);
+        return Err(format!(
+            "parent capability expired at {exp} (now {now_ms}, unix ms)"
+        ));
+    }
+    can_attenuate(&parent.filter, child_grant)?;
+    mint(secret, child_grant)
+}
+
+/// Offline bearer-attenuated Macaroon capability derivation (`ROADMAP.md` & `REQUIREMENTS` R6).
+///
+/// Derives a narrower child [`Capability`] from `parent` **without** the broker's
+/// master `secret`:
+/// - Validates that `parent` has not expired at `now_ms` and that `child_grant`
+///   is a valid monotone narrowing of `parent.filter` ([`can_attenuate`]).
+/// - Embeds `via=<hex(parent.filter)>` into the child grant's prefix (bounded to
+///   [`MAX_MACAROON_DEPTH`] hops).
+/// - Computes `tag = HMAC-SHA256(parent.tag, MACAROON_FRAME_PREFIX ‖ MACAROON_DOMAIN ‖ chained_grant)`.
+///
+/// Given a genuine parent, the resulting capability verifies directly under
+/// [`verify`], [`verify_attach`], [`grants`], [`grants_publish`], [`grants_commit`],
+/// and [`grants_filter`] on any broker holding the root `secret`.
+///
+/// This issues binary-framed v2 offline tags. Root-capability tags, attach proofs,
+/// and the `via=` grant/capfile syntax are unchanged. Existing v1 offline chains
+/// must be reissued from their roots; their old tags are deliberately not accepted.
+/// An over-bound chained grant is refused before its hex encoding is allocated.
+pub fn attenuate_offline(
+    parent: &Capability,
+    child_grant: &str,
+    now_ms: u64,
+) -> Result<Capability, String> {
+    if is_expired(&parent.filter, now_ms) {
+        let exp = expires_at(&parent.filter).unwrap_or(0);
+        return Err(format!(
+            "parent capability expired at {exp} (now {now_ms}, unix ms)"
+        ));
+    }
+    let (cg, _, child_via) = parse_grant_depth(child_grant, 0)?;
+    if child_via.is_some() {
+        return Err(
+            "child_grant passed to attenuate_offline must not already contain a via= field"
+                .to_string(),
+        );
+    }
+    can_attenuate(&parent.filter, child_grant)?;
+    let mode_str = match cg.mode {
+        Mode::ReadWrite => "rw",
+        Mode::ReadOnly => "ro",
+    };
+    let mut prefix = String::from(mode_str);
+    if let Some(ref p) = cg.principal {
+        prefix.push_str(",p=");
+        prefix.push_str(p);
+    }
+    if let Some(exp) = cg.expires_at {
+        prefix.push_str(&format!(",exp={exp}"));
+    }
+    prefix.push_str(",via=");
+    let Some(parent_hex_len) = parent.filter.len().checked_mul(2) else {
+        return Err("parent grant exceeds the offline via= byte bound".to_string());
+    };
+    if parent_hex_len > MAX_VIA_HEX_LEN {
+        return Err("parent grant exceeds the offline via= byte bound".to_string());
+    }
+    let Some(l1) = prefix.len().checked_add(parent_hex_len) else {
+        return Err("child grant exceeds the offline chained-grant byte bound".to_string());
+    };
+    let Some(l2) = l1.checked_add(1) else {
+        return Err("child grant exceeds the offline chained-grant byte bound".to_string());
+    };
+    let Some(total_len) = l2.checked_add(cg.filter.len()) else {
+        return Err("child grant exceeds the offline chained-grant byte bound".to_string());
+    };
+    if total_len > MAX_MACAROON_GRANT_BYTES {
+        return Err("child grant exceeds the offline chained-grant byte bound".to_string());
+    }
+    prefix.push_str(&encode_lower_hex(parent.filter.as_bytes()));
+    let chained = format!("{prefix}:{}", cg.filter);
+    // Validate the full chained grant (including depth and hex bounds).
+    Grant::parse(&chained)?;
+    let tag = macaroon_tag(&parent.tag, &chained);
+    Ok(Capability {
+        filter: chained,
+        tag,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_macaroon_attenuation_chains_verify_without_secret_at_mint_time() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let root = mint(secret, "rw:/f/fleet/>").unwrap();
+        assert_eq!(attenuation_depth(&root.filter), Some(0));
+        assert_eq!(parent_grant(&root.filter), None);
+
+        // Hop 1 (offline — no secret passed!): unbound root -> principal-bound + expiring node cap.
+        let node_cap = attenuate_offline(
+            &root,
+            "rw,p=n-0123456789abcdef,exp=2000:/f/fleet/in/n-0123456789abcdef/>",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(attenuation_depth(&node_cap.filter), Some(1));
+        assert_eq!(
+            parent_grant(&node_cap.filter).as_deref(),
+            Some("rw:/f/fleet/>")
+        );
+        assert!(verify(secret, &node_cap));
+        let nonce = [0x42u8; 32];
+        let proof1 = attach_proof(&node_cap.tag, &nonce, &node_cap.filter);
+        assert!(verify_attach(secret, &node_cap.filter, &nonce, &proof1));
+        let pid = producer_id_of("n-0123456789abcdef");
+        assert!(grants_publish(
+            secret,
+            &node_cap,
+            "/f/fleet/in/n-0123456789abcdef/task",
+            pid,
+            1500,
+        ));
+        assert!(!grants_publish(
+            secret,
+            &node_cap,
+            "/f/fleet/in/n-0123456789abcdef/task",
+            pid,
+            2000,
+        ));
+
+        // Hop 2 (offline — chained from node_cap!): rw -> ro + tighter expiry + narrower filter.
+        let tool_ro = attenuate_offline(
+            &node_cap,
+            "ro,p=n-0123456789abcdef,exp=1500:/f/fleet/in/n-0123456789abcdef/task",
+            1000,
+        )
+        .unwrap();
+        assert_eq!(attenuation_depth(&tool_ro.filter), Some(2));
+        assert!(verify(secret, &tool_ro));
+        let proof2 = attach_proof(&tool_ro.tag, &nonce, &tool_ro.filter);
+        assert!(verify_attach(secret, &tool_ro.filter, &nonce, &proof2));
+        assert!(grants_filter(
+            secret,
+            &tool_ro,
+            "/f/fleet/in/n-0123456789abcdef/task",
+            1499,
+        ));
+        // Read-only cannot publish or commit:
+        assert!(!grants_publish(
+            secret,
+            &tool_ro,
+            "/f/fleet/in/n-0123456789abcdef/task",
+            pid,
+            1200,
+        ));
+        // Expired at 1500:
+        assert!(!grants_filter(
+            secret,
+            &tool_ro,
+            "/f/fleet/in/n-0123456789abcdef/task",
+            1500,
+        ));
+
+        // Forgery attempt: bearer of tool_ro tries to hand-craft a widened `rw` via= grant
+        // signed with `tool_ro.tag`!
+        let forged_grant = format!(
+            "rw,p=n-0123456789abcdef,exp=1500,via={}:/f/fleet/in/n-0123456789abcdef/task",
+            encode_lower_hex(tool_ro.filter.as_bytes())
+        );
+        let forged_tag = macaroon_tag(&tool_ro.tag, &forged_grant);
+        let forged_cap = Capability {
+            filter: forged_grant.clone(),
+            tag: forged_tag,
+        };
+        assert!(Grant::parse(&forged_grant).is_err());
+        assert!(!verify(secret, &forged_cap));
+        let forged_proof = attach_proof(&forged_cap.tag, &nonce, &forged_cap.filter);
+        assert!(!verify_attach(
+            secret,
+            &forged_cap.filter,
+            &nonce,
+            &forged_proof
+        ));
+    }
+
+    #[test]
+    fn capability_attenuation_enforces_monotone_narrowing() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let root = mint(secret, "rw:/f/fleet/>").unwrap();
+
+        // 1. Narrowing unbound root -> principal-bound + expiring + narrower subtree succeeds.
+        let node = attenuate(
+            secret,
+            &root,
+            "rw,p=n-0123456789abcdef,exp=2000:/f/fleet/in/n-0123456789abcdef/>",
+            1000,
+        )
+        .unwrap();
+        assert!(verify(secret, &node));
+
+        // 2. Narrowing rw -> ro with tighter expiry and narrower filter succeeds.
+        let ro_child = attenuate(
+            secret,
+            &node,
+            "ro,p=n-0123456789abcdef,exp=1500:/f/fleet/in/n-0123456789abcdef/task",
+            1000,
+        )
+        .unwrap();
+        assert!(verify(secret, &ro_child));
+
+        // 3. Widening ro -> rw is refused.
+        assert!(attenuate(
+            secret,
+            &ro_child,
+            "rw,p=n-0123456789abcdef,exp=1500:/f/fleet/in/n-0123456789abcdef/task",
+            1000,
+        )
+        .is_err());
+
+        // 4. Widening expiry (1600 > 1500) or dropping expiry is refused.
+        assert!(attenuate(
+            secret,
+            &ro_child,
+            "ro,p=n-0123456789abcdef,exp=1600:/f/fleet/in/n-0123456789abcdef/task",
+            1000,
+        )
+        .is_err());
+        assert!(attenuate(
+            secret,
+            &ro_child,
+            "ro,p=n-0123456789abcdef:/f/fleet/in/n-0123456789abcdef/task",
+            1000,
+        )
+        .is_err());
+
+        // 5. Changing or dropping principal binding is refused.
+        assert!(attenuate(
+            secret,
+            &node,
+            "rw,p=n-fedcba9876543210,exp=1500:/f/fleet/in/n-0123456789abcdef/task",
+            1000,
+        )
+        .is_err());
+        assert!(attenuate(
+            secret,
+            &node,
+            "rw,exp=1500:/f/fleet/in/n-0123456789abcdef/task",
+            1000,
+        )
+        .is_err());
+
+        // 6. Widening filter is refused.
+        assert!(attenuate(
+            secret,
+            &node,
+            "rw,p=n-0123456789abcdef,exp=1500:/f/fleet/>",
+            1000,
+        )
+        .is_err());
+
+        // 7. Attenuating an expired parent capability is refused.
+        assert!(attenuate(
+            secret,
+            &node,
+            "ro,p=n-0123456789abcdef,exp=1500:/f/fleet/in/n-0123456789abcdef/task",
+            2000,
+        )
+        .is_err());
+    }
 
     #[test]
     fn debug_output_names_the_grant_but_never_the_tag() {
@@ -1366,5 +2270,133 @@ mod tests {
             &nonce,
             &proof
         ));
+    }
+
+    /// An attach proof over a chosen 32-byte challenge must never become a bearer
+    /// tag in the offline-attenuation context, even for an equal-authority child.
+    #[test]
+    fn a_chosen_attach_challenge_is_not_an_offline_bearer_tag() {
+        let secret = b"synthetic context separation secret";
+        let parent = mint(secret, "/a").expect("root");
+        assert!(verify(secret, &parent));
+        let child = attenuate_offline(&parent, "rw:/a", 0).expect("equal-authority child");
+        assert_eq!(child.filter, "rw,via=2f61:/a");
+        assert!(verify(secret, &child), "ordinary offline child is accepted");
+        let ordinary_nonce = [7u8; 32];
+        let ordinary_proof = attach_proof(&child.tag, &ordinary_nonce, &child.filter);
+        assert!(verify_attach(
+            secret,
+            &child.filter,
+            &ordinary_nonce,
+            &ordinary_proof
+        ));
+
+        // This is the old v1 message collision: 20 domain bytes + 12 prefix bytes
+        // make a legal 32-byte nonce. The subsequent grant is the parent's /a.
+        let mut chosen_nonce = [0u8; 32];
+        chosen_nonce[..20].copy_from_slice(b"astream-macaroon-v1\0");
+        chosen_nonce[20..].copy_from_slice(b"rw,via=2f61:");
+        let proof = attach_proof(&parent.tag, &chosen_nonce, &parent.filter);
+        let substituted = Capability {
+            filter: child.filter.clone(),
+            tag: proof,
+        };
+        let substituted_proof = attach_proof(&proof, &ordinary_nonce, &child.filter);
+        let same_tag = child.tag == proof;
+        let accepted_bearer = verify(secret, &substituted);
+        let accepted_attach =
+            verify_attach(secret, &child.filter, &ordinary_nonce, &substituted_proof);
+        assert_eq!(
+            (same_tag, accepted_bearer, accepted_attach),
+            (false, false, false)
+        );
+    }
+
+    /// Issuance and verification share the same chained-grant byte bound. A child
+    /// past that bound is an explicit refusal, never an unusable accepted cap.
+    #[test]
+    fn offline_issuance_refuses_a_child_beyond_the_verifiers_bound() {
+        let secret = b"synthetic issuance bound secret";
+        let parent = mint(secret, "/f/>").expect("root");
+        let small = attenuate_offline(&parent, "rw:/f/a", 0).expect("small child");
+        assert!(verify(secret, &small));
+
+        // Existing verification threshold; the new shared constant must preserve it.
+        let bound = MAX_VIA_HEX_LEN + 512;
+        let overhead = "rw,via=".len() + 2 * parent.filter.len() + 1;
+        let at_filter = format!("/f/{}", "a".repeat(bound - overhead - "/f/".len()));
+        let at = attenuate_offline(&parent, &format!("rw:{at_filter}"), 0).expect("at bound");
+        assert_eq!(at.filter.len(), bound);
+        assert!(verify(secret, &at), "accepted boundary child verifies");
+
+        let over_grant = format!("rw:{at_filter}a");
+        assert!(Grant::parse(&over_grant).is_ok(), "valid filter grammar");
+        assert!(
+            can_attenuate(&parent.filter, &over_grant).is_ok(),
+            "valid narrowing"
+        );
+        let direct = mint(secret, &over_grant).expect("root issuer retains long ordinary grants");
+        assert!(
+            verify(secret, &direct),
+            "ordinary non-via root tags are unchanged"
+        );
+        let over = attenuate_offline(&parent, &over_grant, 0);
+        let returned_error = over.is_err();
+        let returned_unverifiable = over.as_ref().is_ok_and(|cap| !verify(secret, cap));
+        assert_eq!((returned_error, returned_unverifiable), (true, false));
+    }
+
+    #[test]
+    fn offline_attenuation_keeps_utf8_parent_filters_and_rejects_invalid_utf8() {
+        let secret = b"synthetic Unicode attenuation secret";
+        let now_ms = 1000;
+
+        let ascii = mint(secret, "rw:/cafe/>").expect("ASCII parent");
+        let ascii_child = attenuate_offline(&ascii, "rw:/cafe/topic", now_ms).expect("ASCII child");
+        assert!(verify(secret, &ascii_child));
+        assert_eq!(
+            parent_grant(&ascii_child.filter).as_deref(),
+            Some("rw:/cafe/>")
+        );
+        assert!(grants_publish(
+            secret,
+            &ascii_child,
+            "/cafe/topic",
+            7,
+            now_ms
+        ));
+        assert!(!grants_publish(
+            secret,
+            &ascii_child,
+            "/cafe/other",
+            7,
+            now_ms
+        ));
+        assert!(attenuate_offline(&ascii, "rw:/elsewhere/topic", now_ms).is_err());
+
+        // Hex is lowercase and byte-paired, but these parent byte strings are not UTF-8.
+        for via in ["ff", "c3", "c328"] {
+            assert!(mint(secret, &format!("rw,via={via}:/cafe/topic")).is_err());
+        }
+        for via in ["0", "GG"] {
+            assert!(mint(secret, &format!("rw,via={via}:/cafe/topic")).is_err());
+        }
+
+        let parent_grant_text = "rw:/café/>";
+        let parent = mint(secret, parent_grant_text).expect("valid UTF-8 parent filter");
+        assert!(verify(secret, &parent));
+        assert!(grants_publish(secret, &parent, "/café/topic", 7, now_ms));
+        let child = attenuate_offline(&parent, "rw:/café/topic", now_ms);
+        let roundtrip = child.as_ref().is_ok_and(|child| {
+            parent_grant(&child.filter).as_deref() == Some(parent_grant_text)
+                && verify(secret, child)
+                && grants_publish(secret, child, "/café/topic", 7, now_ms)
+                && !grants_publish(secret, child, "/café/other", 7, now_ms)
+                && !grants_publish(secret, child, "/cafe/topic", 7, now_ms)
+        });
+        assert!(
+            roundtrip,
+            "ASTREAM_CAP_UTF8_OFFLINE_PARENT_CHAIN_FAILED: {child:?}"
+        );
     }
 }

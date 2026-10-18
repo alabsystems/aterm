@@ -1,0 +1,19 @@
+# agy 1.4.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Antigravity CLI, launched by path with a scratch `HOME` whose settings name the Gemini API provider, its Google hosts black-holed, a fake `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` (a local stub of the Gemini API, crates/aterm-lab) · the stub's `500`: 500 INTERNAL `An internal error has occurred` on every attempt (launched with AGY_CLI_MODEL_API_MAX_RETRIES=2): the error at once (not retried: one attempt)
+
+      ▄▀▀▄        Antigravity CLI 1.4.0
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     /private/tmp/at.zkQU/proj
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> carry on with the task
+
+⚠ agent executor error: generating and executing: Error 500, Message: An internal error has occurred. Please retry or report in
+https://developers.generativeai.google/guide/troubleshooting, Status: INTERNAL, Details: []
+Error ID: 8f359d5d-0d28-4cd7-acc2-f5a6ef015733-1
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                             Gemini 3.1 Pro · low

@@ -5,7 +5,8 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 // Modified by the aterm project in 2026; see the repository NOTICE. (Percent-decoding
-// through the backend's own helper, `common/percent.rs`, not the `percent-encoding` crate.)
+// through the backend's own helper, `common/percent.rs`, not the `percent-encoding` crate.
+// The requests are aterm-x11's encoders, where upstream used x11rb's.)
 
 use std::io;
 use std::os::raw::*;
@@ -13,11 +14,11 @@ use std::path::PathBuf;
 use std::str::Utf8Error;
 use std::sync::Arc;
 
-use x11rb::protocol::xproto::{self, ConnectionExt};
+use aterm_x11::proto::{atom, xproto};
 
 use super::atoms::AtomName::None as DndNone;
 use super::atoms::*;
-use super::{util, CookieResultExt, X11Error, XConnection};
+use super::{util, CookieResultExt, IgnoreError as _, X11Error, XConnection};
 use crate::platform_impl::common::percent::{percent_decode_utf8, uri_list_entries};
 
 #[derive(Debug, Clone, Copy)]
@@ -123,24 +124,19 @@ impl Dnd {
         source_window: xproto::Window,
     ) -> Result<Vec<xproto::Atom>, util::GetPropertyError> {
         let atoms = self.xconn.atoms();
-        self.xconn.get_property(
-            source_window,
-            atoms[XdndTypeList],
-            xproto::Atom::from(xproto::AtomEnum::ATOM),
-        )
+        self.xconn.get_property(source_window, atoms[XdndTypeList], atom::ATOM)
     }
 
     pub unsafe fn convert_selection(&self, window: xproto::Window, time: xproto::Timestamp) {
         let atoms = self.xconn.atoms();
         self.xconn
-            .xcb_connection()
-            .convert_selection(
+            .send_void(xproto::convert_selection(
                 window,
                 atoms[XdndSelection],
                 atoms[TextUriList],
                 atoms[XdndSelection],
                 time,
-            )
+            ))
             .expect_then_ignore_error("Failed to send XdndSelection event")
     }
 

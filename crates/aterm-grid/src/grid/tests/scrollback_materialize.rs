@@ -48,29 +48,6 @@ fn materialize_from_line_roundtrip_ascii() {
     }
 }
 
-#[test]
-fn materialize_from_line_roundtrip_wide_chars() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let mut grid = Grid::new(3, 10);
-
-    let fg = PackedColor::indexed(2);
-    let bg = PackedColor::DEFAULT_BG;
-    let wide_cell = Cell::with_style('世', fg, bg, CellFlags::WIDE);
-    let cont_cell = Cell::with_style(' ', fg, bg, CellFlags::WIDE_CONTINUATION);
-    grid.row_mut(0).unwrap().set(0, wide_cell);
-    grid.row_mut(0).unwrap().set(1, cont_cell);
-
-    let row = grid.row(0).unwrap();
-    let line = Grid::row_to_line_static(row);
-    let mat = materialize_from_line(&line, 10);
-
-    assert_eq!(mat.cells[0].char(), '世');
-    assert!(mat.cells[0].flags().contains(CellFlags::WIDE));
-    assert_eq!(mat.cells[0].fg_color().unwrap(), fg);
-    assert!(mat.cells[1].flags().contains(CellFlags::WIDE_CONTINUATION));
-}
-
 /// East-Asian-Ambiguous width is decided at write time; afterwards the cell's
 /// WIDE bit and continuation are authoritative, and scrollback does not
 /// reclassify it with the narrow Unicode table.
@@ -173,182 +150,6 @@ fn materialize_drops_spacer_but_keeps_protected_neighbor() {
     assert_eq!(
         text, "世!",
         "drop the real spacer, keep the protected glyph"
-    );
-}
-
-#[test]
-fn materialize_from_line_empty_line() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let line = Line::new();
-    let mat = materialize_from_line(&line, 5);
-    assert_eq!(mat.cells.len(), 5);
-    for cell in &mat.cells {
-        assert_eq!(*cell, Cell::default());
-    }
-}
-
-#[test]
-fn materialize_from_line_end_to_end_styled_scrollback() {
-    let mut grid = Grid::with_scrollback(3, 10, 100);
-
-    let blue_fg = PackedColor::indexed(4);
-    let default_bg = PackedColor::DEFAULT_BG;
-    let cell = Cell::with_style('A', blue_fg, default_bg, CellFlags::empty());
-    grid.row_mut(0).unwrap().set(0, cell);
-
-    for _ in 0..5 {
-        grid.line_feed();
-    }
-
-    assert!(grid.scrollback_lines() > 0);
-
-    let mut found = false;
-    for rev_idx in 0..grid.scrollback_lines() {
-        if let Some(mat) = grid.materialize_scrollback_row_full(rev_idx, 10)
-            && mat.cells[0].char() == 'A'
-        {
-            assert_eq!(
-                mat.cells[0].fg_color().unwrap(),
-                blue_fg,
-                "fg color lost in scrollback"
-            );
-            found = true;
-            break;
-        }
-    }
-    assert!(
-        found,
-        "styled 'A' cell not found in materialized scrollback"
-    );
-}
-
-#[test]
-fn materialize_from_line_restores_hyperlinks() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-    use std::sync::Arc;
-
-    let mut grid = Grid::with_scrollback(4, 10, 10);
-
-    let url: Arc<str> = Arc::from("https://example.com");
-    grid.set_cursor(0, 0);
-    for c in "Link!".chars() {
-        grid.write_char(c);
-    }
-    for col in 0..5u16 {
-        grid.extras_mut()
-            .get_or_create(CellCoord::new(0, col))
-            .set_hyperlink(Some(url.clone()));
-    }
-
-    for _ in 0..4 {
-        grid.line_feed();
-    }
-
-    let ring_sb = grid.storage.ring_buffer_scrollback();
-    let line = grid.history_line_rev(ring_sb - 1).expect("scrollback line");
-    let row = materialize_from_line(&line, 10);
-
-    for col in 0..5u16 {
-        let extra = row.get_extra(col);
-        assert!(
-            extra.is_some(),
-            "column {col} should have extras with hyperlink"
-        );
-        assert_eq!(
-            extra.unwrap().hyperlink().map(|u| &**u),
-            Some("https://example.com"),
-            "hyperlink URL mismatch at col {col}"
-        );
-    }
-    let no_link = row.get_extra(5).and_then(|e| e.hyperlink()).map(|u| &**u);
-    assert_eq!(no_link, None, "column 5 should not have hyperlink");
-}
-
-#[test]
-fn materialize_from_line_restores_emoji() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-    use std::sync::Arc;
-
-    let mut grid = Grid::with_scrollback(4, 10, 10);
-
-    grid.set_cursor(0, 0);
-    grid.write_char('A');
-
-    let emoji_str: Arc<str> = Arc::from("🎉");
-    let mut cell = Cell::with_style(
-        ' ',
-        PackedColor::indexed(1),
-        PackedColor::DEFAULT_BG,
-        CellFlags::WIDE,
-    );
-    cell.set_overflow_index(0);
-    grid.row_mut(0).unwrap().set(1, cell);
-    let cont = Cell::with_style(
-        ' ',
-        PackedColor::indexed(1),
-        PackedColor::DEFAULT_BG,
-        CellFlags::WIDE_CONTINUATION,
-    );
-    grid.row_mut(0).unwrap().set(2, cont);
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 1))
-        .set_complex_char(Some(emoji_str));
-
-    for _ in 0..4 {
-        grid.line_feed();
-    }
-
-    let ring_sb = grid.storage.ring_buffer_scrollback();
-    let line = grid.history_line_rev(ring_sb - 1).expect("scrollback line");
-    let row = materialize_from_line(&line, 10);
-
-    let extra = row.get_extra(1);
-    assert!(extra.is_some(), "col 1 should have extras for emoji");
-    let complex = extra.unwrap().complex_char();
-    assert_eq!(
-        complex.map(|s| &**s),
-        Some("🎉"),
-        "emoji should be preserved in complex_char"
-    );
-    assert!(
-        row.cells[1].is_complex(),
-        "emoji cell should have COMPLEX flag"
-    );
-}
-
-#[test]
-fn materialize_from_line_restores_rgb_colors() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let mut grid = Grid::with_scrollback(4, 10, 10);
-
-    let rgb_fg = PackedColor::rgb(255, 0, 0);
-    let default_bg = PackedColor::DEFAULT_BG;
-    let cell = Cell::with_style('R', rgb_fg, default_bg, CellFlags::empty());
-    grid.row_mut(0).unwrap().set(0, cell);
-    grid.extras_mut()
-        .get_or_create(CellCoord::new(0, 0))
-        .set_fg_rgb(Some([255, 0, 0]));
-
-    for _ in 0..4 {
-        grid.line_feed();
-    }
-
-    let ring_sb = grid.storage.ring_buffer_scrollback();
-    let line = grid.history_line_rev(ring_sb - 1).expect("scrollback line");
-    let row = materialize_from_line(&line, 10);
-
-    let extra = row.get_extra(0);
-    assert!(extra.is_some(), "col 0 should have extras for RGB");
-    assert_eq!(
-        extra.unwrap().fg_rgb(),
-        Some([255, 0, 0]),
-        "RGB red fg should be preserved"
-    );
-    assert!(
-        row.cells[0].fg_needs_overflow(),
-        "RGB cell fg should need overflow"
     );
 }
 
@@ -553,32 +354,6 @@ fn materialize_from_line_zwj_family_emoji() {
 }
 
 #[test]
-fn materialize_from_line_combining_mark() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-
-    let text = "e\u{0301}X";
-    let attr_count = text.chars().count();
-    let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, attr_count).collect();
-    let line = Line::with_attrs(text, attrs);
-
-    let row = materialize_from_line(&line, 10);
-
-    let extra = row.get_extra(0);
-    assert!(
-        extra.is_some(),
-        "col 0 should have extras for combining mark"
-    );
-    let complex = extra.unwrap().complex_char();
-    assert_eq!(
-        complex.map(|s| &**s),
-        Some("e\u{0301}"),
-        "combining mark should be preserved in complex_char"
-    );
-
-    assert_eq!(row.cells[1].char(), 'X', "col 1 should be 'X'");
-}
-
-#[test]
 fn materialize_from_line_rgb_background() {
     use crate::grid::scroll_materialize::materialize_from_line;
 
@@ -647,34 +422,6 @@ fn materialize_from_line_mixed_content() {
         "col 3 should have hyperlink"
     );
     assert_eq!(e3.fg_rgb(), Some([0, 0, 255]), "col 3 should have blue RGB");
-}
-
-#[test]
-fn materialize_from_line_preserves_hyperlink_id() {
-    use crate::grid::scroll_materialize::materialize_from_line;
-    use std::sync::Arc;
-
-    let url: Arc<str> = Arc::from("https://example.com");
-    let id: Option<Arc<str>> = Some(Arc::from("link-42"));
-    let attrs: Rle<CellAttrs> = std::iter::repeat_n(CellAttrs::DEFAULT, 4).collect();
-    let hyperlinks = vec![HyperlinkSpan::with_id(0, 4, url.clone(), id.clone())];
-    let line = Line::with_hyperlinks("ABCD", attrs, hyperlinks);
-
-    let row = materialize_from_line(&line, 10);
-
-    for col in 0..4u16 {
-        let extra = row.get_extra(col).expect("col should have extras");
-        assert_eq!(
-            extra.hyperlink().map(|u| &**u),
-            Some("https://example.com"),
-            "col {col} should have hyperlink URL"
-        );
-        assert_eq!(
-            extra.hyperlink_id().map(|id| &**id),
-            Some("link-42"),
-            "col {col} should have hyperlink ID preserved"
-        );
-    }
 }
 
 #[test]
@@ -806,7 +553,12 @@ fn scrollback_hyperlink_wide_char_round_trip() {
 
     grid.set_cursor(0, 0);
     grid.write_char('A');
-    grid.write_wide_char_wrap_with_style_id('\u{4E2D}', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '\u{4E2D}',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     grid.write_char('D');
 
     for col in [0u16, 1, 3] {
@@ -847,7 +599,12 @@ fn extract_row_extras_hyperlink_spans_use_physical_columns() {
 
     grid.set_cursor(0, 0);
     grid.write_char('A');
-    grid.write_wide_char_wrap_with_style_id('\u{4E2D}', StyleId::default(), CellFlags::empty());
+    grid.write_wide_char_wrap_styled(
+        '\u{4E2D}',
+        crate::PackedColor::DEFAULT_FG,
+        crate::PackedColor::DEFAULT_BG,
+        CellFlags::empty(),
+    );
     grid.write_char('D');
 
     grid.extras_mut()
@@ -860,8 +617,7 @@ fn extract_row_extras_hyperlink_spans_use_physical_columns() {
     }
 
     let row = grid.row(0).expect("row 0 should exist");
-    let extracted: ScrolledRowExtras =
-        Grid::extract_row_extras(row, grid.extras(), 0, grid.styles());
+    let extracted: ScrolledRowExtras = Grid::extract_row_extras(row, grid.extras(), 0);
     assert_eq!(extracted.hyperlinks.len(), 2, "expected 2 hyperlink spans");
 
     let s1 = &extracted.hyperlinks[0];

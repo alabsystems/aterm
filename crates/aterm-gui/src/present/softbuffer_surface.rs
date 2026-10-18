@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `softbuffer`-backed CPU presenter, for every cell that is not macOS.
+//! The `softbuffer`-backed CPU presenter: Windows, until its first-party GDI
+//! presenter (LW.3 of docs/AUDIT-third-party-2026-10-15.md). Linux left it at
+//! LW.6, macOS before.
 //!
 //! A thin adapter. Its only work is translating [`DamageRect`] into
 //! `softbuffer::Rect` through a presenter-owned scratch, so a damage-bounded

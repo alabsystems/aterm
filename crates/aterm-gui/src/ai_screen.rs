@@ -13,7 +13,9 @@
 //! [`LOOK_EVERY`], when the AI store's wake marker (`<state>/ai/wake`, rewritten
 //! after every sign-in and review) changes, after an `[ai]` or fleet-document
 //! edit ([`App::ai_config_changed`]), and on the page's Refresh and arrival.
-//! With `[ai] enabled = false` it takes no look, and the AI lines end.
+//! With `[ai] enabled = false` it takes no look, and the AI lines end. A look
+//! first fetches the fleet document from its URL when one is named and due
+//! (every six hours; the page's Fetch now forces it), off the event loop.
 //!
 //! **The lines** ([`ai_entries`]) are `Family::Ai`, a LEVEL family: each look
 //! states its whole answer through `App::except_replace`. One
@@ -39,6 +41,8 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::ai::config::{FleetState, From, Settings};
 use aterm_agent::ai::connector;
+use aterm_agent::ai::fleet::Held;
+use aterm_agent::ai::permission::Choice;
 use aterm_agent::ai::state::{Mark, State};
 use aterm_messages::Severity;
 use aterm_messages::exceptions::{Entry, Family};
@@ -122,6 +126,9 @@ pub(crate) struct AiReading {
     pub(crate) clis: Vec<AiCli>,
     /// Why the AI store's record was not used, if it was not.
     pub(crate) store_note: Option<String>,
+    /// What aterm holds of a fleet document from a URL, its last error one
+    /// sanitized line.
+    pub(crate) held: Option<Held>,
 }
 
 impl AiReading {
@@ -150,6 +157,10 @@ impl AiReading {
             preferred: look.settings.preferred.0.id,
             clis,
             store_note: look.store_note.as_deref().map(one_line),
+            held: look.held.clone().map(|held| Held {
+                error: held.error.as_deref().map(one_line),
+                ..held
+            }),
         }
     }
 
@@ -176,7 +187,11 @@ fn one_line(text: &str) -> String {
 pub(crate) struct AiChoices {
     /// The preferred CLI and where that came from.
     pub(crate) preferred: (&'static str, From),
-    /// The reviewers, in order (the egress grant), and where they came from.
+    /// Whether reviews run, and where that came from.
+    pub(crate) reviews: (bool, From),
+    /// The reviewers' permission level, and where that came from.
+    pub(crate) review_permissions: (Choice, From),
+    /// The reviewers, in order, and where they came from.
     pub(crate) reviewers: (Vec<&'static str>, From),
     /// Reviewers per review.
     pub(crate) review_count: u8,
@@ -186,6 +201,10 @@ pub(crate) struct AiChoices {
     pub(crate) uses: Vec<(&'static str, bool, From)>,
     /// This machine's name in the fleet document.
     pub(crate) machine: Option<String>,
+    /// Where the fleet document comes from, as shown.
+    pub(crate) fleet_source: Option<String>,
+    /// The fleet document's pinned signer.
+    pub(crate) fleet_key: Option<String>,
     /// The fleet document's fate.
     pub(crate) fleet: FleetState,
     /// What the readers said, one line each.
@@ -203,6 +222,8 @@ impl AiChoices {
     pub(crate) fn of(settings: &Settings) -> Self {
         Self {
             preferred: (settings.preferred.0.id, settings.preferred.1),
+            reviews: settings.reviews,
+            review_permissions: settings.review_permissions,
             reviewers: (
                 settings.reviewers.0.iter().map(|c| c.id).collect(),
                 settings.reviewers.1,
@@ -215,9 +236,11 @@ impl AiChoices {
                 .map(|(c, on, from)| (c.id, *on, *from))
                 .collect(),
             machine: settings.machine.clone(),
+            fleet_source: settings.fleet_source.as_deref().map(one_line),
+            fleet_key: settings.fleet_key.clone(),
             fleet: match &settings.fleet {
-                FleetState::Refused { path, why } => FleetState::Refused {
-                    path: path.clone(),
+                FleetState::Refused { source, why } => FleetState::Refused {
+                    source: one_line(source),
                     why: one_line(why),
                 },
                 other => other.clone(),
@@ -315,6 +338,8 @@ pub(crate) struct AiProjection {
     pub(crate) review_rows: Vec<(String, String)>,
     /// The FLEET card's facts.
     pub(crate) fleet_rows: Vec<(String, String)>,
+    /// Whether `[ai] fleet` names a URL (Fetch now has something to fetch).
+    pub(crate) fleet_from_url: bool,
 }
 
 /// Whether a value came from the fleet document.
@@ -376,6 +401,10 @@ impl AiState {
             preferred_from_fleet: from_fleet(choices.preferred.1),
             review_rows: self.review_rows(),
             fleet_rows: self.fleet_rows(),
+            fleet_from_url: choices
+                .fleet_source
+                .as_deref()
+                .is_some_and(aterm_agent::ai::fleet::is_url),
         }
     }
 
@@ -465,26 +494,48 @@ impl AiState {
             .collect()
     }
 
-    /// The REVIEWS card: who may receive this machine's code (the grant,
-    /// shown and never edited here), where that came from, and the knobs.
+    /// The REVIEWS card's facts, under its two rows (Reviews across AIs and
+    /// Reviewer permissions): who reviews and how long each may take.
     fn review_rows(&self) -> Vec<(String, String)> {
         let c = &self.choices;
         let row = |label: &str, value: String| (label.to_string(), value);
-        let (reviewers, from) = (&c.reviewers.0, c.reviewers.1);
-        let mut rows = vec![row(
-            "Reviewers",
-            if reviewers.is_empty() {
-                "none: reviews are off until [ai] reviewers lists a CLI".to_string()
-            } else {
-                reviewers.join(", ")
-            },
-        )];
-        rows.push(row("From", from_words(from).to_string()));
-        if !reviewers.is_empty() {
-            rows.push(row(
+        if !c.reviews.0 {
+            return vec![row(
+                "Reviewers",
+                format!("none: reviews are off ({})", from_words(c.reviews.1)),
+            )];
+        }
+        let used: Vec<&str> = c
+            .reviewers
+            .0
+            .iter()
+            .copied()
+            .filter(|id| c.wants(id))
+            .collect();
+        let who = match (used.as_slice(), c.reviewers.1) {
+            ([], _) => "none: no AI CLI is used here".to_string(),
+            (_, From::Default) => "every AI CLI used here but the one asking".to_string(),
+            (list, from) => format!(
+                "{}, but the one asking ({})",
+                list.join(", "),
+                from_words(from)
+            ),
+        };
+        let level = match c.review_permissions.0 {
+            Choice::Inherit => "the asking agent's own; yolo when you ask".to_string(),
+            Choice::Fixed(level) => format!(
+                "{} for every reviewer ({})",
+                level.word(),
+                from_words(c.review_permissions.1)
+            ),
+        };
+        vec![
+            row("Reviewers", who),
+            row("Permissions", level),
+            row(
                 "Each review",
                 format!(
-                    "{} {}, up to {} s each",
+                    "up to {} {}, up to {} s each, with all their tools",
                     c.review_count,
                     if c.review_count == 1 {
                         "reviewer"
@@ -493,9 +544,8 @@ impl AiState {
                     },
                     c.review_timeout_s
                 ),
-            ));
-        }
-        rows
+            ),
+        ]
     }
 
     /// The FLEET card: this machine's name, the document and what became of
@@ -509,10 +559,17 @@ impl AiState {
                 .clone()
                 .unwrap_or_else(|| "not named ([ai] machine)".to_string()),
         )];
+        rows.push(row(
+            "Signer",
+            c.fleet_key.as_deref().map_or_else(
+                || "none pinned".to_string(),
+                |key| format!("{}\u{2026}", aterm_agent::ai::fleet::fingerprint(key)),
+            ),
+        ));
         match &c.fleet {
             FleetState::None => rows.push(row("Document", "none".to_string())),
-            FleetState::Read { path, row: own } => {
-                rows.push(row("Document", path.display().to_string()));
+            FleetState::Read { source, row: own } => {
+                rows.push(row("Document", source.clone()));
                 rows.push(row(
                     "State",
                     if *own {
@@ -522,9 +579,32 @@ impl AiState {
                     },
                 ));
             }
-            FleetState::Refused { path, why } => {
-                rows.push(row("Document", path.display().to_string()));
+            FleetState::Refused { source, why } => {
+                rows.push(row("Document", source.clone()));
                 rows.push(row("State", format!("refused: {why}")));
+            }
+        }
+        if let Some(held) = self.reading.as_ref().and_then(|r| r.held.as_ref()) {
+            let offset = self.reading.as_ref().and_then(|r| r.offset_s);
+            let at = |t: Option<i64>| {
+                t.map_or_else(
+                    || "never".to_string(),
+                    |t| crate::harness_screen::read_at_words(t.saturating_mul(1000), offset),
+                )
+            };
+            rows.push(row(
+                "Held",
+                format!(
+                    "seq {} \u{b7} fetched {}",
+                    held.seq.map_or_else(|| "?".to_string(), |n| n.to_string()),
+                    at(held.fetched_at)
+                ),
+            ));
+            if let Some(error) = &held.error {
+                rows.push(row(
+                    "Last fetch",
+                    format!("{error} (tried {})", at(held.tried_at)),
+                ));
             }
         }
         let reading_note = self.reading.as_ref().and_then(|r| r.store_note.clone());
@@ -607,6 +687,9 @@ fn ai_entry(cli: &AiCli, preferred: bool) -> Entry {
 pub(crate) enum AiAsk {
     /// Look now (and keep looking: `[ai] enabled` is on).
     Look(u64),
+    /// Fetch the fleet document from its URL now, then look (the page's
+    /// Fetch now).
+    Fetch(u64),
     /// Take no look until asked again (`[ai] enabled = false`).
     Off,
 }
@@ -631,17 +714,18 @@ fn look_loop(
     mut generation: u64,
     wake: Option<&Path>,
     (every, poll): (Duration, Duration),
-    look: &dyn Fn() -> Result<AiReading, String>,
+    look: &dyn Fn(bool) -> Result<AiReading, String>,
     send: &dyn Fn(u64, Result<AiReading, String>) -> bool,
 ) {
     let mut want = on;
+    let mut fetch = false;
     let mut last: Option<Instant> = None;
     let mut seen = wake_stamp(wake);
     loop {
         if want && on {
             want = false;
             last = Some(Instant::now());
-            if !send(generation, look()) {
+            if !send(generation, look(std::mem::take(&mut fetch))) {
                 return;
             }
         }
@@ -650,6 +734,12 @@ fn look_loop(
                 generation = next;
                 on = true;
                 want = true;
+            }
+            Ok(AiAsk::Fetch(next)) => {
+                generation = next;
+                on = true;
+                want = true;
+                fetch = true;
             }
             Ok(AiAsk::Off) => on = false,
             Err(RecvTimeoutError::Timeout) => {}
@@ -666,15 +756,18 @@ fn look_loop(
     }
 }
 
-/// One look, as the window takes it: the doctor's look over this process's
-/// paths, with the environment a tab's shell has (aterm strips the AI
-/// variables from every shell it spawns, so a key set in the window's own
-/// environment is no key a tab's CLI would use). Reads files only.
-fn look_now() -> Result<AiReading, String> {
+/// One look, as the window takes it: the fleet document fetched from its URL
+/// when one is named and due (now, with `fetch`), then the doctor's look over
+/// this process's paths, with the environment a tab's shell has (aterm strips
+/// the AI variables from every shell it spawns, so a key set in the window's
+/// own environment is no key a tab's CLI would use). Runs no child process
+/// but the fetch's own `curl`.
+fn look_now(fetch: bool) -> Result<AiReading, String> {
     let mut env = aterm_agent::ai::cli::Env::from_process();
     env.vars
         .retain(|(name, _)| !aterm_types::domain::is_ai_env_var(name));
     env.harness_state = crate::harness_host::harness_state();
+    let _ = aterm_agent::ai::cli::fleet_fetch(&env, &aterm_agent::ai::fleet::LiveFetcher, fetch);
     let look = aterm_agent::ai::cli::look(&env);
     Ok(AiReading::of(
         &look,
@@ -794,15 +887,15 @@ impl App {
         let wake = aterm_types::dirs::state_dir()
             .map(|root| aterm_agent::ai::store::Store::at(&root).wake_path());
         let (asks, asked) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name("aterm-ai-look".into())
-            .spawn(move || {
-                // Nothing on the keystroke path waits for it.
-                crate::qos::set_self(crate::qos::Role::Background);
+        // Background: nothing on the keystroke path waits for it.
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-ai-look",
+            crate::qos::Role::Background,
+            move || {
                 // A look that panicked still answers, so Refresh is never
                 // left busy for a reading that will not come.
-                let look = || {
-                    std::panic::catch_unwind(look_now)
+                let look = |fetch: bool| {
+                    std::panic::catch_unwind(|| look_now(fetch))
                         .unwrap_or_else(|_| Err("the look failed".to_string()))
                 };
                 let send = |generation, result| {
@@ -822,7 +915,8 @@ impl App {
                     &look,
                     &send,
                 );
-            });
+            },
+        );
         match spawned {
             Ok(_) => {
                 self.ai_screen.asks = Some(asks);
@@ -847,6 +941,19 @@ impl App {
         {
             self.ai_screen.generation = self.ai_screen.generation.wrapping_add(1);
             self.ai_screen.looking = asks.send(AiAsk::Look(self.ai_screen.generation)).is_ok();
+        }
+        self.publish_native_harness_state();
+    }
+
+    /// Fetch the fleet document from its URL now, then look (the page's Fetch
+    /// now), and republish so the page shows busy. Nothing while `[ai]
+    /// enabled` is off.
+    pub(crate) fn ask_ai_fetch(&mut self) {
+        if self.config.ai.enabled()
+            && let Some(asks) = &self.ai_screen.asks
+        {
+            self.ai_screen.generation = self.ai_screen.generation.wrapping_add(1);
+            self.ai_screen.looking = asks.send(AiAsk::Fetch(self.ai_screen.generation)).is_ok();
         }
         self.publish_native_harness_state();
     }

@@ -1,0 +1,26 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-spec-anchor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The registry and anchor records that aterm's #[refines] attributes reference"
+
+[dependencies]
+# The anchor attributes themselves (`refines`, `spec_unmodeled`),
+# re-exported so an anchored crate names one path. Proc macros: host-only, and a
+# release build strips every attribute that would expand them. Behind `macros`
+# so `-p aterm-spec-anchor`'s lib closure holds no proc macro and Trust's loader
+# admits it (PM-1, docs/PLAN-pm1-proc-macro-reach-2026-10-16.md); the workspace
+# row turns `macros` on, so every anchored crate has them.
+aterm-spec-macros = { workspace = true, optional = true }
+
+[features]
+# Re-export the anchor attributes. On through the workspace row.
+macros = ["dep:aterm-spec-macros"]
+
+[lints]
+workspace = true

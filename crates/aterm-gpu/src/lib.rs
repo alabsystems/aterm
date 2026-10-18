@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-// aterm GPU renderer: wgpu, and first-party Metal on macOS.
+// aterm GPU renderer: first-party Metal on macOS, first-party OpenGL ES on
+// Linux and over WebGL2 in a browser, and wgpu on Windows.
 //
 // The terminal grid is drawn on the GPU: a glyph atlas texture plus instanced
 // quads per cell (background fill and glyph). The renderer targets an on-screen
@@ -11,8 +12,8 @@
 
 // Every build compiles with all lints on, whatever its arm count: a crossing
 // refusal between backend arms compiles only under `cfg(multi_arm)` (build.rs),
-// so the single-armed builds (macOS production: Metal; Linux, Windows, wasm:
-// wgpu) spell no unreachable pattern. See `device_layer`.
+// so the single-armed builds (macOS production: Metal; Linux and wasm: GL;
+// Windows: wgpu) spell no unreachable pattern. See `device_layer`.
 
 /// `eprintln!` that cannot panic, for every stderr line this crate writes at
 /// runtime. `eprintln!` panics when stderr fails (a closed pipe or pty), and
@@ -36,8 +37,9 @@ pub fn set_verbose(on: bool) {
     VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether the host asked for `--verbose` (read by the wgpu arm's surface notes).
-#[cfg(wgpu_arm)]
+/// Whether the host asked for `--verbose` (read by the wgpu and GL arms'
+/// window surface notes).
+#[cfg(any(wgpu_arm, all(gl_arm, not(target_arch = "wasm32"))))]
 pub(crate) fn verbose() -> bool {
     VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -51,32 +53,40 @@ mod format_plan;
 // wgpu renderer and the Metal backend.
 mod pipeline_table;
 // A one-future executor for wgpu's async adapter/device acquisition on native.
-// The browser must not block its main thread, so wasm awaits instead.
-#[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
+// The wasm path has no wgpu and nothing to wait on (`web`).
+#[cfg(wgpu_arm)]
 mod block_on;
 
 // The EDR present gate's pure decision functions, re-exported so
-// tests/hdr_gate.rs enumerates the shipping policy.
+// tests/hdr_gate.rs enumerates the shipping attach and present policy
+// (`hdr_swapchain_wants_f16`, `hdr_present_plan`).
 pub use format_plan::{
     HdrPlan, HdrReconfigurePlan, hdr_live_upgrade_wants_f16, hdr_present_plan,
-    hdr_reconfigure_plan, hdr_screen_upgrade_wants_f16, hdr_swapchain_wants_f16,
-    hdr_swapchain_wants_f16_on_screen,
+    hdr_reconfigure_plan, hdr_screen_upgrade_decision, hdr_screen_upgrade_wants_f16,
+    hdr_swapchain_wants_f16, hdr_swapchain_wants_f16_on_screen,
 };
 // The first-party Metal backend, the renderer's arm on macOS. See
 // `metal/mod.rs`.
 #[cfg(target_os = "macos")]
 mod metal;
+// The first-party OpenGL ES arm, Linux's renderer and, over WebGL2, the
+// browser's (`cfg(gl_arm)`, build.rs). See `gl/mod.rs`.
+#[cfg(gl_arm)]
+mod gl;
 /// The launch's first-frame Metal warm (see `metal/warm.rs`).
 #[cfg(target_os = "macos")]
 pub use metal::warm::FirstFrameWarm;
+/// The first-frame compile measurement (`benches/first_frame_compile.rs`).
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use metal::warm::{first_frame_bench_main, first_frame_bench_warm};
 mod renderer;
-// The shader-twin scan: every `.metal` / `.glsl` / `.hlsl` twin's entry points
-// and bindings against the pipeline table (text only, every host).
-#[cfg(test)]
-mod shader_twins;
+/// A window the native backends attach a swapchain to (a browser has only
+/// its canvas: `web`).
+#[cfg(not(target_arch = "wasm32"))]
+pub use renderer::WindowTarget;
 pub use renderer::{
     DropOverlay, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad, WindowGpu,
-    WindowTarget,
 };
 /// The demand-built effect pipelines (see `renderer::EffectPipelines`). The
 /// enum and name table let a test name a slot and read
@@ -259,6 +269,15 @@ pub struct GpuContext {
     /// non-opaque modes; the renderer keys backdrop-margin alpha and the
     /// PreMultiplied present off this. Always `false` off Windows.
     pub(crate) visual_swapchain: bool,
+    /// The GL driver's 2-D texture ceiling, read by the context's probe (the
+    /// shipped Linux build and wasm32, where no wgpu device answers it).
+    #[cfg(all(gl_arm, not(wgpu_arm)))]
+    pub(crate) gl_max_texture_dim: u32,
+    /// The WebGL2 context on the canvas the context was made for: in a
+    /// browser the device is the canvas's, so the renderer's GL arm draws on
+    /// this one rather than minting its own (`web::GpuContext::for_canvas`).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) gl_canvas: gl::device::GlDevice,
 }
 
 /// Row alignment required by `copy_texture_to_buffer`, also the frame byte
@@ -312,6 +331,33 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
     }
 }
 
+/// One [`GpuContext::new`] at a time in a process: its instance, adapter and
+/// device. Vulkan's loader and NVIDIA's ICD do not survive two instances made
+/// at once (two threads in `vk_icdNegotiateLoaderICDInterfaceVersion`, one
+/// jumps to address 0: measured on driver 580.159, libvulkan 1.4.328). The
+/// window makes one context per process; parallel tests make many.
+#[cfg(wgpu_arm)]
+static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `wgpu::Instance::new`, under a name of its own: the lock-order census
+/// resolves a call held under [`GPU_INIT`] by callee name, and a bare `new`
+/// there reads as `GpuContext::new` re-taking the lock.
+#[cfg(wgpu_arm)]
+fn fresh_instance(desc: wgpu::InstanceDescriptor) -> wgpu::Instance {
+    wgpu::Instance::new(desc)
+}
+
+/// The Vulkan cell's instance flags: the build's, less `DEBUG`. `DEBUG` labels
+/// every texture, pipeline and command buffer through the loader's
+/// `vkSetDebugUtilsObjectNameEXT` trampoline, which faults while another
+/// instance's `vkEnumeratePhysicalDevices` unloads the ICDs it does not use
+/// (measured as above). Only a debug build sets `DEBUG`, and only a process with
+/// two instances meets the race: parallel tests, never a window.
+#[cfg(all(wgpu_arm, unix, not(target_vendor = "apple")))]
+fn vulkan_instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
+    flags - wgpu::InstanceFlags::DEBUG
+}
+
 /// GPU selection development seams ([`aterm_types::dev_seam!`]; shipped
 /// binaries read none of them):
 ///
@@ -319,14 +365,12 @@ fn parse_gpu_power(v: &str) -> Option<wgpu::PowerPreference> {
 ///   this, case-insensitive; falls back to default selection with a warning.
 /// * `ATERM_GPU_POWER=low|high`: power preference, default `low` (keeps hybrid
 ///   laptops on the iGPU).
-/// * `ATERM_GPU_MEMBLOCK=performance|small|default|<4..=256>`: the
-///   suballocator's block-size floor; `<N>` is the device floor in MiB (host is
-///   half). Default 16 MiB; see [`terminal_memory_hints`].
 ///
-/// The backend is not selectable: each platform compiles one wgpu backend
-/// (DX12 on Windows, Vulkan elsewhere). A driver that cannot render falls to
-/// the CPU present path; `gpu = false` in aterm.toml chooses it outright.
-#[cfg(not(target_arch = "wasm32"))]
+/// The backend is not selectable: each platform compiles one backend (the
+/// first-party Metal and OpenGL ES arms on macOS and Linux, where wgpu is only
+/// the test oracle; wgpu's DX12 on Windows, its Vulkan elsewhere). A driver
+/// that cannot render falls to the CPU present path; `gpu = false` in
+/// aterm.toml chooses it outright.
 #[cfg(wgpu_arm)]
 fn default_backends() -> wgpu::Backends {
     #[cfg(windows)]
@@ -396,26 +440,6 @@ const MEMBLOCK_FLOOR_MIB: u64 = 16;
 #[cfg(wgpu_arm)]
 const MEMBLOCK_CEILING_MIB: u64 = 128;
 
-/// Parse `ATERM_GPU_MEMBLOCK` (see [`terminal_memory_hints`]).
-/// `None` = unrecognized (caller warns and keeps the default).
-#[cfg(wgpu_arm)]
-fn parse_memblock(v: &str) -> Option<wgpu::MemoryHints> {
-    match v.to_ascii_lowercase().as_str() {
-        "performance" => Some(wgpu::MemoryHints::Performance),
-        "small" => Some(wgpu::MemoryHints::MemoryUsage),
-        "default" => Some(terminal_memory_hints_default()),
-        other => {
-            let mib: u64 = other.parse().ok()?;
-            // gpu-allocator clamps to 4..=256 MiB itself; refuse a value outside
-            // that rather than silently honouring a different number.
-            if !(4..=256).contains(&mib) {
-                return None;
-            }
-            Some(memblock_hints(mib, mib.max(MEMBLOCK_CEILING_MIB)))
-        }
-    }
-}
-
 /// Build a `MemoryHints::Manual` from a `(min, max)` device block size in MiB.
 /// Host block sizes are half the device ones.
 #[cfg(wgpu_arm)]
@@ -426,12 +450,6 @@ fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
     }
 }
 
-/// The shipped block sizing, before the env override.
-#[cfg(wgpu_arm)]
-fn terminal_memory_hints_default() -> wgpu::MemoryHints {
-    memblock_hints(MEMBLOCK_FLOOR_MIB, MEMBLOCK_CEILING_MIB)
-}
-
 /// The suballocator sizing aterm asks its GPU device for.
 ///
 /// [`wgpu::MemoryHints::Performance`] floors the suballocator at 128 MiB device
@@ -440,27 +458,81 @@ fn terminal_memory_hints_default() -> wgpu::MemoryHints {
 /// uses a few MB (the one large resource, the offscreen, gets a dedicated heap
 /// anyway). A 16 MiB device floor keeps the reservation at 24 MiB; smaller
 /// floors cost more heap creations for little gain.
-///
-/// A development build can override it with `ATERM_GPU_MEMBLOCK` (the `<MiB>`
-/// arm sets the device floor, clamped to 4..=256); see [`default_backends`].
 #[must_use]
 #[cfg(wgpu_arm)]
 pub(crate) fn terminal_memory_hints() -> wgpu::MemoryHints {
-    match aterm_types::dev_seam!("ATERM_GPU_MEMBLOCK").map(|v| v.to_string_lossy().into_owned()) {
-        Some(v) if !v.is_empty() => parse_memblock(&v).unwrap_or_else(|| {
-            crate::stderr_line!(
-                "aterm-gpu: unknown ATERM_GPU_MEMBLOCK {v:?} \
-                 (want performance|small|default|<4..=256 MiB>); using default"
-            );
-            terminal_memory_hints_default()
-        }),
-        _ => terminal_memory_hints_default(),
+    memblock_hints(MEMBLOCK_FLOOR_MIB, MEMBLOCK_CEILING_MIB)
+}
+
+/// The view-descriptor heap aterm asks a DX12 device for, in descriptors
+/// (`wgpu::Limits::max_non_sampler_bindings`).
+///
+/// wgpu-hal's DX12 backend creates one shader-visible CBV/SRV/UAV descriptor
+/// heap of exactly this many descriptors when the device is created, and
+/// carves every bind group's buffers and texture views out of it for the bind
+/// group's life. wgpu's default is 1,000,000, a bindless engine's number. No
+/// other backend sizes anything by the limit, so only a DX12 device is asked
+/// for a smaller one ([`terminal_device_limits`]).
+///
+/// The working tree this was ported from (last touched 2026-09-29, parked as
+/// 6ad1a274d8) recorded, on an AMD Radeon 780M under DX12 (an integrated
+/// adapter, so the heap is system RAM): the default heap as one 30.5 MiB
+/// region (32 bytes a descriptor), every page resident and zero, and a bare
+/// device at 125 MB working set / 98 MB private with it against 95 MB / 68 MB
+/// with a 4,096 heap. Those are that snapshot's numbers, not re-measured.
+///
+/// What a terminal holds: sixteen `create_bind_group` sites in `renderer.rs`,
+/// none with more than two non-sampler entries (samplers live in their own
+/// heap). A dropped bind group returns its range once the GPU is done with it
+/// (`a_dropped_bind_group_returns_its_view_descriptors`). Running out would
+/// fail `create_bind_group` with an out-of-memory device error, so 16,384 is
+/// sized for headroom (hundreds of windows at that rate), not for the
+/// measurement.
+#[cfg(wgpu_arm)]
+const TERMINAL_VIEW_DESCRIPTORS: u32 = 16_384;
+
+/// The device limits aterm asks of an adapter on `backend`: wgpu's defaults,
+/// with a DX12 view-descriptor heap sized for a terminal
+/// ([`TERMINAL_VIEW_DESCRIPTORS`]). DX12 compiles only into the Windows build,
+/// so every other build asks for wgpu's defaults, as before.
+#[cfg(wgpu_arm)]
+fn terminal_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
+    match backend {
+        wgpu::Backend::Dx12 => wgpu::Limits {
+            max_non_sampler_bindings: TERMINAL_VIEW_DESCRIPTORS,
+            ..wgpu::Limits::default()
+        },
+        _ => wgpu::Limits::default(),
     }
 }
 
-/// The `ATERM_GPU_ADAPTER` seam (see [`default_backends`]). Native only; wasm
-/// has one adapter.
-#[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
+/// The instance flags aterm asks for over `backends`: `flags`, less
+/// indirect-call validation on a DX12 instance, which is the Windows build's
+/// ([`default_backends`]) and no other's.
+///
+/// `VALIDATION_INDIRECT_CALL` (in wgpu's defaults for every build) makes
+/// wgpu-core build two compute pipelines, their layouts and their shader at
+/// device creation, to validate the arguments of indirect draws and
+/// dispatches. aterm issues none (clippy.toml bans wgpu's indirect draws and
+/// dispatches: no indirect call), so they are built for nothing. The same
+/// snapshot (6ad1a274d8) recorded, on that Radeon 780M under DX12 (a bare
+/// device, three paired runs), 78.5 to 74.0 MB working set in every pair and
+/// device creation 167/242/147 to 125/178/121 ms; Metal and Vulkan were not
+/// measured and keep wgpu's flags.
+#[cfg(wgpu_arm)]
+fn terminal_instance_flags(
+    flags: wgpu::InstanceFlags,
+    backends: wgpu::Backends,
+) -> wgpu::InstanceFlags {
+    if backends == wgpu::Backends::DX12 {
+        flags - wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL
+    } else {
+        flags
+    }
+}
+
+/// The `ATERM_GPU_ADAPTER` seam (see [`default_backends`]).
+#[cfg(wgpu_arm)]
 async fn adapter_from_env(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
     let want = aterm_types::dev_seam!("ATERM_GPU_ADAPTER")
         .map(|v| v.to_string_lossy().into_owned())
@@ -477,12 +549,6 @@ async fn adapter_from_env(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
         );
     }
     found
-}
-
-// Adapter enumeration is native-only; the wasm build has exactly one adapter.
-#[cfg(all(wgpu_arm, target_arch = "wasm32"))]
-async fn adapter_from_env(_instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
-    None
 }
 
 impl GpuContext {
@@ -510,12 +576,37 @@ impl GpuContext {
         Ok(ctx)
     }
 
+    /// The production Linux constructor (no wgpu): a headless probe of the
+    /// GL arm's driver (`libEGL.so.1`, an EGL 1.5 display, a GLES 3.0
+    /// context), whose facts the context keeps: the renderer's name, the
+    /// texture ceiling, and whether the native format plan's two views exist
+    /// (`srgb_offscreen`). The probe's device is dropped; the renderer mints
+    /// its own on the render thread, on the window system's display once a
+    /// window attaches (`gl_arm::GpuRenderer::gl_arm_ready`), and takes these
+    /// facts from that device, which can be another GPU than the probe's.
+    /// `Err` (no EGL, no GLES 3 driver) sends the frontend to the CPU renderer.
+    #[cfg(all(not(wgpu_arm), gl_arm, not(target_arch = "wasm32")))]
+    pub fn new() -> Result<Self, String> {
+        let probe = gl::device::GlDevice::headless()?;
+        let caps = probe.caps().clone();
+        drop(probe);
+        Ok(Self {
+            adapter_name: caps.renderer,
+            backend: "Gl".to_owned(),
+            srgb_offscreen: caps.srgb_views,
+            device_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            device_loss_msg: std::sync::Arc::default(),
+            visual_swapchain: false,
+            gl_max_texture_dim: caps.max_texture_dim,
+        })
+    }
+
     /// Acquire a GPU headless, picking the default low-power adapter, subject to
     /// the development `ATERM_GPU_*` seams (see [`default_backends`]).
     ///
-    /// Native only: it blocks via the crate's private `block_on`. The wasm path
-    /// awaits instead (see [`GpuContext::request`]).
-    #[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
+    /// Blocks via the crate's private `block_on`. The browser's path is
+    /// `web`'s `GpuContext::for_canvas`.
+    #[cfg(wgpu_arm)]
     pub fn new() -> Result<Self, String> {
         // The instance outlives device creation so window surfaces can be made
         // from it later. It is surface-capable without a display handle except
@@ -524,6 +615,15 @@ impl GpuContext {
         let desc = wgpu::InstanceDescriptor {
             backends: default_backends(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
+        };
+        let desc = wgpu::InstanceDescriptor {
+            flags: terminal_instance_flags(desc.flags, desc.backends),
+            ..desc
+        };
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        let desc = wgpu::InstanceDescriptor {
+            flags: vulkan_instance_flags(desc.flags),
+            ..desc
         };
         // Honour the visual-swapchain latch via the explicit descriptor field.
         // Ignored by non-DX12 backends; `visual_swapchain` below records the
@@ -537,11 +637,15 @@ impl GpuContext {
             }
             desc
         };
-        // The first timed cold-build leg: backend enumeration and driver load.
-        let instance = startup_probe::timed(startup_probe::Leg::GpuInstance, || {
-            wgpu::Instance::new(desc)
-        });
-        let ctx = crate::block_on::block_on(Self::from_instance(instance))?;
+        let ctx = {
+            let _one_at_a_time = GPU_INIT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The first timed cold-build leg: backend enumeration and driver load.
+            let instance =
+                startup_probe::timed(startup_probe::Leg::GpuInstance, || fresh_instance(desc));
+            crate::block_on::block_on(Self::from_instance(instance))?
+        };
         // The visual path is active only if DX12 won adapter selection.
         // Recorded on the context and the process global.
         #[cfg(windows)]
@@ -565,29 +669,17 @@ impl GpuContext {
     }
 
     /// Async adapter and device acquisition on an existing `wgpu::Instance`,
-    /// shared by the native (`block_on`) and wasm (`.await`) paths. No
-    /// compatible surface; the WebGL backend uses
-    /// [`from_instance_with_surface`](Self::from_instance_with_surface).
-    #[cfg(all(wgpu_arm, not(target_arch = "wasm32")))]
-    pub(crate) async fn from_instance(instance: wgpu::Instance) -> Result<Self, String> {
-        Self::from_instance_with_surface(instance, None).await
-    }
-
-    /// Async adapter and device acquisition with an optional
-    /// `compatible_surface`: WebGL can only enumerate an adapter compatible
-    /// with the canvas surface. Native passes `None`.
+    /// driven by this crate's `block_on`; no compatible surface (every
+    /// instance here is surface-capable without one).
     #[cfg(wgpu_arm)]
-    pub(crate) async fn from_instance_with_surface(
-        instance: wgpu::Instance,
-        compatible_surface: Option<&wgpu::Surface<'_>>,
-    ) -> Result<Self, String> {
+    pub(crate) async fn from_instance(instance: wgpu::Instance) -> Result<Self, String> {
         let adapter_started = aterm_time::Instant::now();
         let adapter = match adapter_from_env(&instance).await {
             Some(adapter) => adapter,
             None => instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: power_preference_from_env(),
-                    compatible_surface,
+                    compatible_surface: None,
                     force_fallback_adapter: false,
                 })
                 .await
@@ -596,13 +688,7 @@ impl GpuContext {
         let info = adapter.get_info();
         startup_probe::record(startup_probe::Leg::GpuAdapter, adapter_started.elapsed());
         let device_started = aterm_time::Instant::now();
-        // WebGL2 cannot satisfy `Limits::default()` (no compute, lower ceilings),
-        // so on wasm32 request the adapter's own limits, which also keeps its
-        // real texture-dimension ceiling for Hi-DPI canvases.
-        #[cfg(target_arch = "wasm32")]
-        let required_limits = adapter.limits();
-        #[cfg(not(target_arch = "wasm32"))]
-        let required_limits = wgpu::Limits::default();
+        let required_limits = terminal_device_limits(info.backend);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("aterm-gpu device"),
@@ -672,6 +758,18 @@ impl GpuContext {
             return true;
         }
         self.device_lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Latch a window surface wgpu refused to configure as this context's
+    /// loss, with `why` as the cause when it is the first: the frontend's loss
+    /// poll ([`Self::device_lost`]) then downgrades to the CPU renderer, as for
+    /// a lost device, where a surface it presents to was refused (its window
+    /// system gone, a lost swapchain). Sticky like a device loss.
+    #[cfg(wgpu_arm)]
+    pub(crate) fn latch_surface_loss(&self, why: String) {
+        let _ = self.device_loss_msg.set(why);
+        self.device_lost
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The first latched loss's cause, for the downgrade line: the Metal latch's
@@ -883,84 +981,74 @@ impl GpuContext {
     }
 }
 
-#[cfg(test)]
-mod env_override_tests {
+#[cfg(all(test, wgpu_arm))]
+mod device_request_tests {
     use super::*;
 
+    /// The DX12 view-descriptor heap is the one device limit aterm moves off
+    /// wgpu's defaults, and only for a DX12 adapter: every other limit, and
+    /// every other backend's whole request, is wgpu's default.
     #[test]
-    fn power_parses_low_and_high_only() {
-        assert_eq!(
-            parse_gpu_power("high"),
-            Some(wgpu::PowerPreference::HighPerformance)
+    fn only_a_dx12_device_moves_off_the_default_limits() {
+        let defaults = wgpu::Limits::default();
+        let dx12 = terminal_device_limits(wgpu::Backend::Dx12);
+        assert_eq!(dx12.max_non_sampler_bindings, TERMINAL_VIEW_DESCRIPTORS);
+        assert!(
+            TERMINAL_VIEW_DESCRIPTORS <= defaults.max_non_sampler_bindings / 32,
+            "the heap must stay a small fraction of wgpu's bindless default"
         );
         assert_eq!(
-            parse_gpu_power("LOW"),
-            Some(wgpu::PowerPreference::LowPower)
+            wgpu::Limits {
+                max_non_sampler_bindings: defaults.max_non_sampler_bindings,
+                ..dx12
+            },
+            defaults,
+            "every other DX12 limit is wgpu's default"
         );
-        assert_eq!(parse_gpu_power("medium"), None);
-    }
-
-    /// The block-size range a `MemoryHints` carries, in MiB, or `None` for a
-    /// variant that carries no explicit range.
-    fn range_mib(h: &wgpu::MemoryHints) -> Option<(u64, u64)> {
-        const MIB: u64 = 1024 * 1024;
-        match h {
-            wgpu::MemoryHints::Manual {
-                suballocated_device_memory_block_size: r,
-            } => Some((r.start / MIB, r.end / MIB)),
-            _ => None,
+        for backend in wgpu::Backend::ALL {
+            if backend != wgpu::Backend::Dx12 {
+                assert_eq!(
+                    terminal_device_limits(backend),
+                    defaults,
+                    "{backend:?} must keep wgpu's default limits"
+                );
+            }
         }
     }
 
-    /// The floor: 16 MiB device (8 MiB host), growing to 128 MiB under real
-    /// pressure. See `terminal_memory_hints`.
+    /// Indirect-call validation is dropped from a DX12 instance and nothing
+    /// else moves; every other instance keeps the flags it was given. The
+    /// DX12-only instance is the Windows build's and no other build's, so off
+    /// Windows the shipped flags are wgpu's, untouched.
     #[test]
-    fn the_shipped_floor_is_terminal_sized_not_streaming_sized() {
-        let d = terminal_memory_hints_default();
-        assert_eq!(
-            range_mib(&d),
-            Some((16, 128)),
-            "the shipped hint must be an explicit Manual range, not a wgpu preset"
-        );
-        // The wgpu presets this replaces, for the record: `Performance` floors at
-        // 128 MiB device / 64 MiB host, which is what regressing to it would cost.
+    fn indirect_call_validation_is_dropped_on_a_dx12_instance_only() {
+        let indirect = wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL;
+        let defaults = wgpu::InstanceFlags::default();
         assert!(
-            matches!(d, wgpu::MemoryHints::Manual { .. }),
-            "a preset would put the floor back in wgpu's hands"
+            defaults.contains(indirect),
+            "wgpu's defaults carry it, or there is nothing to drop"
         );
-    }
-
-    #[test]
-    fn memblock_env_parses_the_documented_table() {
-        assert!(matches!(
-            parse_memblock("performance"),
-            Some(wgpu::MemoryHints::Performance)
-        ));
-        assert!(matches!(
-            parse_memblock("SMALL"),
-            Some(wgpu::MemoryHints::MemoryUsage)
-        ));
+        let dx12 = terminal_instance_flags(defaults, wgpu::Backends::DX12);
+        assert!(!dx12.contains(indirect), "a DX12 instance drops it");
+        assert_eq!(dx12 | indirect, defaults, "and nothing else");
+        for backends in [
+            wgpu::Backends::METAL,
+            wgpu::Backends::VULKAN,
+            wgpu::Backends::GL,
+            wgpu::Backends::PRIMARY,
+            wgpu::Backends::all(),
+        ] {
+            assert_eq!(
+                terminal_instance_flags(defaults, backends),
+                defaults,
+                "{backends:?} keeps wgpu's flags"
+            );
+        }
         assert_eq!(
-            range_mib(&parse_memblock("default").expect("default parses")),
-            Some((16, 128))
+            default_backends() == wgpu::Backends::DX12,
+            cfg!(windows),
+            "the DX12-only instance is Windows's alone"
         );
-        // A numeric floor sets the DEVICE minimum; the ceiling never drops below
-        // the shipped one, so growth under pressure is never taken away.
-        assert_eq!(
-            range_mib(&parse_memblock("8").expect("8 parses")),
-            Some((8, 128))
-        );
-        assert_eq!(
-            range_mib(&parse_memblock("256").expect("256 parses")),
-            Some((256, 256))
-        );
-        // gpu-allocator itself clamps to 4..=256 MiB; a value outside that would
-        // silently become a different number, so refuse it instead.
-        assert!(parse_memblock("3").is_none(), "below gpu-allocator's floor");
-        assert!(parse_memblock("257").is_none(), "above its ceiling");
-        assert!(parse_memblock("0").is_none());
-        assert!(parse_memblock("lots").is_none());
-        assert!(parse_memblock("").is_none());
     }
 }
 
@@ -989,6 +1077,108 @@ mod offscreen_extent_tests {
             "width {a} must be clamped below the 40000px request"
         );
         assert_eq!(a, b, "oversized widths must clamp to the SAME device limit");
+    }
+}
+
+/// The device `GpuContext::new` builds carries the limits its backend is asked
+/// for (`terminal_device_limits`), and on DX12 its view-descriptor heap
+/// recycles.
+#[cfg(all(test, wgpu_arm))]
+mod device_limits_tests {
+    use super::{GpuContext, TERMINAL_VIEW_DESCRIPTORS, terminal_device_limits};
+
+    fn context() -> GpuContext {
+        GpuContext::new()
+            .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU available: {e}")))
+    }
+
+    /// The request reaches the device: a DX12 device holds the terminal-sized
+    /// heap, every other device wgpu's default limits (macOS's oracle lane
+    /// runs on Metal, so this is where it shows its request is unchanged).
+    #[test]
+    fn the_device_carries_the_limits_its_backend_is_asked_for() {
+        let ctx = context();
+        let backend = ctx.adapter.get_info().backend;
+        let limits = ctx.device.limits();
+        assert_eq!(limits, terminal_device_limits(backend), "{backend:?}");
+        assert_eq!(
+            limits.max_non_sampler_bindings == TERMINAL_VIEW_DESCRIPTORS,
+            backend == wgpu::Backend::Dx12,
+            "{backend:?}: only a DX12 device is asked for the terminal-sized heap"
+        );
+    }
+
+    /// The heap's sizing leans on one property, checked here rather than
+    /// assumed: a DROPPED bind group gives its descriptors back. Three heaps'
+    /// worth of bind groups are created and dropped in batches of a quarter
+    /// heap; if ranges leaked, creation would run the heap out of memory before
+    /// the first third was through. Only DX12 has the heap, and only the
+    /// Windows build compiles DX12.
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_bind_group_returns_its_view_descriptors() {
+        let ctx = context();
+        let device = &ctx.device;
+        assert_eq!(
+            device.limits().max_non_sampler_bindings,
+            TERMINAL_VIEW_DESCRIPTORS,
+            "the Windows device must be requested with the terminal-sized heap"
+        );
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("heap recycle probe bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("heap recycle probe texture"),
+            size: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        for _ in 0..12 {
+            let groups: Vec<wgpu::BindGroup> = (0..TERMINAL_VIEW_DESCRIPTORS / 4)
+                .map(|_| {
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &layout,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        }],
+                    })
+                })
+                .collect();
+            drop(groups);
+            ctx.queue.submit(std::iter::empty());
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("an empty submission completes");
+        }
+        // wgpu-core answers an error scope on its first poll.
+        let error = crate::block_on::block_on(scope.pop());
+        assert!(
+            error.is_none(),
+            "3x the heap's descriptors, created and dropped in batches, must never \
+             run it out: {error:?}"
+        );
     }
 }
 

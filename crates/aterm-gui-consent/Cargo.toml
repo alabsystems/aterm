@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-gui-consent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm-gui's access card below the window: the macOS access card's pure decision and words, the bounded config-directory marker files it records answers in, and the durability flushes they share. No App, window or event loop; aterm-gui re-exports each module under its old name."
+
+[dependencies]
+# The protected-folder vocabulary the card's words and decision read.
+aterm-containment = { workspace = true }
+# The bounded, regular-file-only UTF-8 read the markers go through.
+aterm-effects = { workspace = true }
+# The workspace's one epoch-clock read.
+aterm-time = { workspace = true }
+# `fsync` for the crash journal's lighter flush.
+libc = { workspace = true }
+# How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
+aterm-durable = { workspace = true }
+
+[dev-dependencies]
+# The card's Tier-1 binds to its derived model.
+aterm-spec = { workspace = true }
+# Scratch config directories for the verified-host record's tests.
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true

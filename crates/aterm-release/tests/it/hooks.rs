@@ -442,6 +442,15 @@ fn astream(root: &Path, git: &Git) -> PathBuf {
     ] {
         astream_crate(&dir, c, "");
     }
+    // What a build reads beside src/: the build script and the shared file every crate
+    // includes; and the targets that stay private.
+    let wire = dir.join("crates/astream-wire");
+    std::fs::write(wire.join("build.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(wire.join("contract_fn.rs"), "// SHARED\n").unwrap();
+    for d in ["tests", "examples", "benches"] {
+        std::fs::create_dir_all(wire.join(d)).unwrap();
+        std::fs::write(wire.join(format!("{d}/private.rs")), "// never exported\n").unwrap();
+    }
     astream_crate(
         &dir,
         "astream-cap",
@@ -523,10 +532,10 @@ fn export_fixture(export: &Path) -> String {
     for f in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
         std::fs::copy(repo.join(f), export.join(f)).unwrap();
     }
-    std::fs::create_dir_all(export.join("crates/atpkg/src")).unwrap();
+    std::fs::create_dir_all(export.join("crates/atpkg-publish/src/artifact")).unwrap();
     std::fs::copy(
-        repo.join("crates/atpkg/src/relocate.rs"),
-        export.join("crates/atpkg/src/relocate.rs"),
+        repo.join("crates/atpkg-publish/src/artifact/relocate.rs"),
+        export.join("crates/atpkg-publish/src/artifact/relocate.rs"),
     )
     .unwrap();
     let fx = export.join("crates/fixture");
@@ -552,6 +561,16 @@ fn export_fixture(export: &Path) -> String {
     .unwrap();
     std::fs::write(fx.join("tests/suite.rs"), "#[test]\nfn t() {}\n").unwrap();
     link_crate(export, "astream-broker");
+    // A workspace member's dev-dependency is read whenever cargo loads the workspace, as
+    // aterm-conformance's astream-term (the differential VT oracle's fold) is.
+    let oracle = export.join("crates/oracle");
+    std::fs::create_dir_all(&oracle).unwrap();
+    std::fs::write(
+        oracle.join("Cargo.toml"),
+        "[package]\nname = \"oracle\"\n\n[dev-dependencies]\nastream-term = { path = \
+         \"../../vendor/astream/crates/astream-term\" }\n",
+    )
+    .unwrap();
     lib
 }
 
@@ -589,9 +608,12 @@ fn tree_text(dir: &Path, out: &mut String) {
 }
 
 /// THE EXPORT TRANSFORMS: astream written as files from the EXPORTED commit's gitlink (not
-/// the checkout's), only the manifests and sources of the crates the export's path
-/// dependencies reach (optional, target and workspace rows; no dev-dependency, no
-/// unreached crate); every guarded shape
+/// the checkout's), only the crates the export's path
+/// dependencies reach (optional, target and workspace rows, and an exported member's
+/// dev-dependency; never an astream crate's own dev-dependency, no unreached crate), each
+/// with its build script and the files beside src/ but none of its test, example or bench
+/// targets;
+/// every guarded shape
 /// rewritten to exactly the guards' form and nothing else moved — the toolchain pin, the
 /// version (a patch slot other than 0 reaches the engine as declared) and a bare
 /// `/Users/` that is behaviour all ship as written; a declared target whose file is
@@ -645,6 +667,7 @@ fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_sh
         "astream-broker",
         "astream-cap",
         "astream-digest",
+        "astream-term",
         "astream-wire",
     ];
     assert_eq!(exported_astream(&export), reached);
@@ -657,13 +680,23 @@ fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_sh
     );
     assert!(v.join("Cargo.toml").is_file() && v.join("LICENSE").is_file());
     assert!(!v.join("tests").exists(), "astream's tests stay private");
+    let wire = v.join("crates/astream-wire");
+    assert_eq!(
+        std::fs::read_to_string(wire.join("contract_fn.rs")).unwrap(),
+        "// SHARED\n"
+    );
+    assert!(wire.join("build.rs").is_file());
+    for d in ["tests", "examples", "benches"] {
+        assert!(!wire.join(d).exists(), "a crate's {d}/ stays private");
+    }
     let rev = git.ok(&sp, &["ls-tree", &captured, "--", "vendor/astream"]);
     let rev = rev.split_whitespace().nth(2).unwrap();
     let readme = std::fs::read_to_string(v.join("README.md")).unwrap();
     assert!(readme.contains(rev), "{readme}");
     assert!(
         readme.contains(
-            "`astream-aead`, `astream-broker`, `astream-cap`, `astream-digest`, `astream-wire`"
+            "`astream-aead`, `astream-broker`, `astream-cap`, `astream-digest`, `astream-term`, \
+             `astream-wire`"
         ),
         "{readme}"
     );
@@ -690,7 +723,9 @@ fn the_transforms_write_astream_from_the_exported_commit_and_leave_no_guarded_sh
     );
     assert!(said.contains(&"  target-strip: crates/fixture/Cargo.toml [[test]] withheld (its file is not exported)".to_string()), "{said:?}");
 
-    let relocate = std::fs::read_to_string(export.join("crates/atpkg/src/relocate.rs")).unwrap();
+    let relocate =
+        std::fs::read_to_string(export.join("crates/atpkg-publish/src/artifact/relocate.rs"))
+            .unwrap();
     assert!(
         relocate.contains("path.starts_with(\"/Users/\")"),
         "the machine-local prefix ships as written"

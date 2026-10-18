@@ -14,7 +14,7 @@ use aterm_messages::need::{Fingerprint, LaterAsk, RESOLVE_AFTER, Reason, Resurfa
 use aterm_messages::{
     Duration, Instant, Message, MessageCenter, MessageLog, Severity, WallStamp, tags,
 };
-use aterm_spec::derive::exceptions_digest_ends_model;
+use aterm_models_session::exceptions_digest_ends_model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify;
 

@@ -96,7 +96,7 @@ fn apply_is_idempotent_by_seq() {
 fn apply_is_idempotent_across_a_handoff() {
     let mut old = Log::new(2);
     traffic(&mut old);
-    let mut new = Log::after_handoff(3, Limits::SESSION, old.id_counters(), at(90_000));
+    let mut new = Log::after_handoff(3, Limits::SESSION, old.id_counters(), 1, at(90_000));
     traffic_from(&mut new, 90_000);
     let fold_of = |passes: &[&[Rec]]| {
         let mut f = Fold::new(0);
@@ -299,6 +299,94 @@ fn the_confidence_law_keeps_the_most_reliable_value() {
         Conf::Claim,
         9
     ));
+}
+
+/// Equal field counts can retain different amounts of owned text. The
+/// estimate must follow that storage in both open and closed fold state;
+/// numeric magnitudes and static word lengths do not allocate more space.
+#[test]
+fn retained_heap_grows_with_owned_values_but_not_inline_values() {
+    let node_sizes = |fields: Fields| {
+        let mut log = Log::new(0);
+        let run = log
+            .open(
+                Open::new(Kind::Cmd, Src::Shell, Conf::Exact).fields(fields),
+                at(0),
+            )
+            .unwrap();
+        let open = log.fold().footprint();
+        log.close(
+            run,
+            Close::new(Out::Run(RunOut::Ok), Src::Shell, Conf::Exact),
+            at(1),
+        )
+        .unwrap();
+        (open, log.fold().footprint())
+    };
+    for (short, long) in [
+        (
+            Fields::new().tok(Key::Prog, "x").unwrap(),
+            Fields::new().tok(Key::Prog, &"x".repeat(32)).unwrap(),
+        ),
+        (
+            Fields::new().text(Key::Cwd, "x").unwrap(),
+            Fields::new().text(Key::Cwd, &"x".repeat(128)).unwrap(),
+        ),
+    ] {
+        let small = node_sizes(short);
+        let large = node_sizes(long);
+        assert!(large.0 > small.0, "open fields retain their owned content");
+        assert!(
+            large.1 > small.1,
+            "closed fields retain their owned content"
+        );
+    }
+    for (small, large) in [
+        (
+            Fields::new().u(Key::Blk, 1).unwrap(),
+            Fields::new().u(Key::Blk, u64::MAX).unwrap(),
+        ),
+        (
+            Fields::new().word(Key::Word, "busy").unwrap(),
+            Fields::new().word(Key::Word, "question").unwrap(),
+        ),
+    ] {
+        assert_eq!(node_sizes(small), node_sizes(large), "inline value control");
+    }
+    let mark_size = |kind, fields| {
+        let mut log = Log::new(0);
+        log.mark(
+            Mark::new(kind, Src::Mark, Conf::Claim).fields(fields),
+            at(0),
+        )
+        .unwrap();
+        log.fold().footprint()
+    };
+    let failure_size = |code| {
+        let mut log = Log::new(0);
+        let run = log
+            .open(Open::new(Kind::Cmd, Src::Shell, Conf::Exact), at(0))
+            .unwrap();
+        log.close(
+            run,
+            Close::new(Out::Run(RunOut::Fail), Src::Shell, Conf::Exact)
+                .fields(Fields::new().i(Key::Code, code).unwrap()),
+            at(1),
+        )
+        .unwrap();
+        log.fold().footprint()
+    };
+    assert!(
+        failure_size(i64::MIN) > failure_size(1),
+        "a failure retains its numeric code as owned need detail"
+    );
+    assert!(
+        mark_size(
+            Kind::Label,
+            Fields::new().text(Key::Text, &"x".repeat(128)).unwrap()
+        ) > mark_size(Kind::Label, Fields::new().text(Key::Text, "x").unwrap()),
+        "retained claim text"
+    );
 }
 
 #[test]

@@ -31,8 +31,8 @@
 //!   on demand and kept): serving a request whose time is spent WAITING on an
 //!   event — `await`, `ready`, `wait`, `turn`, a `post` or `inbox get @…` that
 //!   parks on the bridge, a paste into another session waiting (bounded) for its
-//!   program to read it — or relaying the connection somewhere else (`dial
-//!   <name>`, a session this instance does not host). A request lane that reads
+//!   program to read it — or relaying the connection to a session this
+//!   instance does not host. A request lane that reads
 //!   such a line hands the connection over and is free again at once. No lane
 //!   waits on a program to WRITE to it: a verb's input never parks its lane
 //!   (`control::background_input`).
@@ -46,11 +46,9 @@
 //!   queued — waited behind them. Now the other half of the lanes is always free
 //!   to serve requests. A wait with requests PIPELINED behind it moves like any
 //!   other, taking with it the bytes its request lane had already read past it
-//!   ([`Conn::carry`]): the one in-tree client that writes that way,
-//!   `RelayClient::dial_via_local` (`dial <name>` then `version`, back to back),
-//!   is one `aterm drive --dial` relay each, and while such waits stayed on their
-//!   request lane the budget's four places turned the fifth relay away with most
-//!   of the wait lanes free.
+//!   ([`Conn::carry`]): while such waits stayed on their request lane the
+//!   budget's four places turned the fifth pipelining client away with most of
+//!   the wait lanes free.
 //! * PARKED ([`Parker`], one thread): between requests — idle, or waiting on
 //!   its peer: for the rest of its next request (a handshake not yet whole
 //!   included), or to take the rest of its last answer ([`Outbox`]). One
@@ -107,7 +105,7 @@
 //! connection bound is the lanes', exactly as before (a handshake still has
 //! `AUTH_READ_TIMEOUT` from the lane's pick-up to be whole).
 //!
-//! Derived model: `aterm_spec::derive::control_lane_tenure_model` (a running
+//! Derived model: `aterm_models_native::control_lane_tenure_model` (a running
 //! parker's lanes; a stopped parker's fallback is the design it rejects, on
 //! purpose); its Tier-1 bind (`control_lanes_conformance.rs`) drives these lanes
 //! with real sockets.
@@ -123,8 +121,8 @@ use std::time::{Duration, Instant};
 use aterm_uds::CtlStream;
 
 use super::{
-    AUTH_READ_TIMEOUT, BoundedDispatch, MAX_REQUEST_LINE, Scope, ServeDisposition, announced_body,
-    decode_request_line, read_authenticated_request_line,
+    AUTH_READ_TIMEOUT, BoundedDispatch, MAX_REQUEST_LINE, Principal, Scope, ServeDisposition,
+    announced_body, decode_request_line, read_authenticated_request_line,
 };
 
 /// What a lane serves a connection's requests with: the control server in the
@@ -136,7 +134,7 @@ pub(super) trait LaneService: Send + Sync {
         &self,
         stream: &CtlStream,
         reader: &mut LaneReader<'_>,
-    ) -> Option<(Scope, Option<String>)>;
+    ) -> Option<(Scope, Principal, Option<String>)>;
     /// Serve one authenticated request, writing its answer into `out` (the
     /// lane delivers it, without waiting for the peer to read it). `reader`
     /// holds the whole request: its line was read from it, and the body a
@@ -251,6 +249,10 @@ pub(super) struct Outbox {
     sent: usize,
     /// Close the connection once the answer is delivered: its request ended it.
     then_close: bool,
+    /// The answer is one the exit waits for ([`super::FinalReplies`]): its request
+    /// can end the process. Held until the answer is delivered, by the lane or by
+    /// the parker, or the connection is gone.
+    final_reply: Option<super::FinalReply>,
 }
 
 impl Outbox {
@@ -298,6 +300,8 @@ impl Outbox {
             self.bytes.clear();
         }
         self.sent = 0;
+        // Delivered: the exit no longer waits for it.
+        self.final_reply = None;
         Ok(true)
     }
 }
@@ -483,6 +487,9 @@ pub(super) struct Conn {
     stream: CtlStream,
     /// `None` until the handshake on its first lane.
     scope: Option<Scope>,
+    /// Who presented its token (phase 3A, the session log's `by=`), from the
+    /// handshake.
+    principal: Principal,
     tenure: ConnTenure,
     /// Bytes read from the peer and not served yet, read first wherever the
     /// connection lands ([`lane_reader`]): the requests a request lane had read
@@ -517,24 +524,24 @@ impl Conn {
     /// the last copy of this end closed — and a child any thread forked holds
     /// one until it execs.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "Close",
             project = "aterm_gui::control::control_lanes::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "WaitClose",
             project = "aterm_gui::control::control_lanes::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "InlineClose",
             project = "aterm_gui::control::control_lanes::conformance::project"
@@ -548,8 +555,8 @@ impl Conn {
     /// free again, and its socket blocks again (a parked one does not). `false`
     /// when it cannot be made to: the lane closes it.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "Pick",
             project = "aterm_gui::control::control_lanes::conformance::project"
@@ -572,6 +579,10 @@ impl Conn {
 /// slot its admission took), or a parked one that turned readable.
 enum Job {
     Fresh(CtlStream, Slot),
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the unix parker resumes a connection")
+    )]
     Resume(Conn),
 }
 
@@ -639,6 +650,10 @@ pub(super) struct Lanes {
     #[cfg(unix)]
     parker: OnceLock<Arc<Parker>>,
     service: OnceLock<Arc<dyn LaneService>>,
+    /// The scheduling tests' own [`super::FinalReplies`]
+    /// ([`Self::count_final_replies_on`]); the instance's otherwise.
+    #[cfg(test)]
+    final_replies: OnceLock<&'static super::FinalReplies>,
     /// How long a fresh connection has to make its handshake line whole
     /// (milliseconds): `AUTH_READ_TIMEOUT`, short in the tests.
     handshake_ms: AtomicU64,
@@ -683,6 +698,8 @@ impl Lanes {
             #[cfg(unix)]
             parker: OnceLock::new(),
             service: OnceLock::new(),
+            #[cfg(test)]
+            final_replies: OnceLock::new(),
             handshake_ms: AtomicU64::new(
                 u64::try_from(AUTH_READ_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
             ),
@@ -699,6 +716,25 @@ impl Lanes {
         self.handshake_ms.store(ms, Ordering::Release);
     }
 
+    /// Count the answers these lanes owe at exit on `replies` rather than the
+    /// instance's, so a test reads its own lanes' count alone.
+    #[cfg(test)]
+    pub(super) fn count_final_replies_on(&self, replies: &'static super::FinalReplies) {
+        assert!(
+            self.final_replies.set(replies).is_ok(),
+            "set once, before any request"
+        );
+    }
+
+    /// Where these lanes count the answers the exit waits for.
+    fn final_replies(&self) -> &'static super::FinalReplies {
+        #[cfg(test)]
+        if let Some(replies) = self.final_replies.get() {
+            return replies;
+        }
+        &super::FINAL_REPLIES
+    }
+
     fn handshake_lifetime(&self) -> Duration {
         Duration::from_millis(self.handshake_ms.load(Ordering::Acquire))
     }
@@ -710,18 +746,19 @@ impl Lanes {
         let mut started = 0;
         for index in 0..self.limits.rpc {
             let lanes = Arc::clone(self);
-            match std::thread::Builder::new()
-                .name(format!("aterm-control-{index}"))
-                .spawn(move || {
+            match crate::qos::spawn_lane_thread(
+                format!("aterm-control-{index}"),
+                crate::qos::Role::Responsive,
+                move || {
                     // QoS floor (qos.rs): this lane runs verb dispatch, and a
                     // read verb holds the terminal mutex while it formats. At the
                     // default band it would sit below the UI thread that takes
                     // the same mutex, leaving a descheduled holder in front of the
                     // next keystroke. Not `Interactive`: a verb storm must never
                     // outrank the UI thread.
-                    crate::qos::set_self(crate::qos::Role::Responsive);
                     lanes.rpc_lane();
-                }) {
+                },
+            ) {
                 Ok(_) => started += 1,
                 Err(error) => aterm_log::warn!("control worker {index} could not start: {error}"),
             }
@@ -743,16 +780,16 @@ impl Lanes {
     /// (for the listener's busy reply) when every request lane is taken by work
     /// or the open-connection bound is reached.
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "Admit",
             project = "aterm_gui::control::control_lanes::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "Refuse",
             project = "aterm_gui::control::control_lanes::conformance::project"
@@ -829,6 +866,7 @@ impl Lanes {
                     let conn = Conn {
                         stream,
                         scope: None,
+                        principal: Principal::Instance,
                         tenure: ConnTenure {
                             id: super::NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed),
                             claimed: false,
@@ -857,7 +895,6 @@ impl Lanes {
     }
 
     fn wait_lane(self: &Arc<Self>) {
-        crate::qos::set_self(crate::qos::Role::Responsive);
         let mut state = self
             .waits
             .state
@@ -897,8 +934,8 @@ impl Lanes {
     /// wait no lane can take at once comes back, to be served where it is
     /// (boxed: it is built only when no wait lane can take the wait).
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "Defer",
             project = "aterm_gui::control::control_lanes::conformance::project"
@@ -916,10 +953,9 @@ impl Lanes {
             }
             let lanes = Arc::clone(self);
             let name = format!("aterm-control-wait-{}", state.threads);
-            match std::thread::Builder::new()
-                .name(name)
-                .spawn(move || lanes.wait_lane())
-            {
+            match crate::qos::spawn_lane_thread(name, crate::qos::Role::Responsive, move || {
+                lanes.wait_lane();
+            }) {
                 Ok(_) => state.threads += 1,
                 Err(error) => {
                     aterm_log::warn!("control wait lane could not start: {error}");
@@ -995,6 +1031,7 @@ impl Lanes {
         let Conn {
             stream,
             scope,
+            principal,
             tenure,
             carry,
             reply,
@@ -1032,11 +1069,13 @@ impl Lanes {
                         Gathered::Broken => return Here::Closed,
                     }
                 }
-                let Some((authenticated, inline)) = service.authenticate(stream, &mut reader)
+                let Some((authenticated, presented, inline)) =
+                    service.authenticate(stream, &mut reader)
                 else {
                     return Here::Closed;
                 };
                 *scope = Some(authenticated);
+                *principal = presented;
                 *expires = None;
                 // A verb folded into the handshake is the first request: put at
                 // the head of what is buffered, it is judged whole or not and
@@ -1051,6 +1090,9 @@ impl Lanes {
                 authenticated
             }
         };
+        // The session log names this connection's Owner requests by who
+        // presented its token, for as long as this lane serves it.
+        let _principal = super::ServingPrincipal::enter(*principal);
         loop {
             let parking = (may_park || served) && self.parker_runs();
             // The last answer goes out first, and nothing more is read until the
@@ -1116,8 +1158,14 @@ impl Lanes {
                 }
             }
             may_defer = true;
+            // Owed from BEFORE the dispatch (the action may end the process) until
+            // the answer is delivered ([`Outbox::final_reply`]).
+            let final_reply = self.final_replies().enter(&line);
             let disposition =
                 service.serve_line(line, scope, stream, &mut reader, &mut reply.bytes);
+            if reply.owed() {
+                reply.final_reply = final_reply;
+            }
             drop(inline);
             served = true;
             match disposition {
@@ -1135,8 +1183,8 @@ impl Lanes {
     /// wait lane can take, held while it serves the wait; `None` when every
     /// place is taken (the wait is refused: [`refuse_wait`]).
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "InlineWait",
             project = "aterm_gui::control::control_lanes::conformance::project"
@@ -1195,24 +1243,24 @@ impl Lanes {
     /// last look), or a socket that cannot be made non-blocking.
     #[cfg(unix)]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "Finish",
             project = "aterm_gui::control::control_lanes::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "WaitFinish",
             project = "aterm_gui::control::control_lanes::conformance::project"
         )
     )]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "InlineFinish",
             project = "aterm_gui::control::control_lanes::conformance::project"
@@ -1263,13 +1311,14 @@ impl Lanes {
         });
         let lanes = Arc::clone(self);
         let polled = Arc::clone(&parker);
-        match std::thread::Builder::new()
-            .name("aterm-control-parker".to_string())
-            .spawn(move || {
+        match crate::qos::spawn_lane_thread(
+            "aterm-control-parker".to_string(),
+            crate::qos::Role::Responsive,
+            move || {
                 // On the latency path of every parked driver's next request.
-                crate::qos::set_self(crate::qos::Role::Responsive);
                 lanes.parker_thread(&polled, &listen);
-            }) {
+            },
+        ) {
             // Published only once something polls it; until then (or forever,
             // if the thread could not start) idle connections stay on their
             // lanes.
@@ -1450,8 +1499,8 @@ impl Lanes {
     /// behind whatever runs, holding its parking slot until a lane takes it.
     #[cfg(unix)]
     #[cfg_attr(
-        test,
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ControlLaneTenure",
             action = "Wake",
             project = "aterm_gui::control::control_lanes::conformance::project"
@@ -1653,8 +1702,8 @@ impl Parker {
 /// idle, like any answered one, or serves what is pipelined behind the wait);
 /// only a failed delivery ends it.
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ControlLaneTenure",
         action = "BusyWait",
         project = "aterm_gui::control::control_lanes::conformance::project"
@@ -1668,8 +1717,8 @@ fn refuse_wait(out: &mut Vec<u8>) {
 /// it is, its tenure (and any claim bound to it) ended with it.
 #[cfg(unix)]
 #[cfg_attr(
-    test,
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "ControlLaneTenure",
         action = "ParkedClose",
         project = "aterm_gui::control::control_lanes::conformance::project"

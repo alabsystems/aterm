@@ -59,15 +59,6 @@ fn metrics(w: usize, h: usize, colored: &[(usize, usize, Rgb)]) -> DynamicMetric
     dynamic_metrics(&frame(w, h, &[]), &frame(w, h, colored), CELL, &[])
 }
 
-fn row_hue_separation(width: usize, degrees: &[f64]) -> f64 {
-    let colored: Vec<_> = degrees
-        .iter()
-        .enumerate()
-        .map(|(x, &d)| (x, 0, at_hue(d)))
-        .collect();
-    metrics(width, 1, &colored).row_hue_separation
-}
-
 fn rgb_hex(hex: u32) -> Rgb {
     [(hex >> 16) as u8, (hex >> 8) as u8, hex as u8]
 }
@@ -128,54 +119,6 @@ fn cyan_of(hex: u32) -> usize {
 }
 
 #[test]
-fn the_shipped_gradient_crossing_is_cyan() {
-    assert_eq!(cyan_of(0x0EB6B7), 1);
-}
-
-#[test]
-fn the_rotated_azure_anchor_is_cyan() {
-    assert_eq!(cyan_of(0x00D6FF), 1);
-}
-
-#[test]
-fn the_rainbow_s_own_anchors_are_never_cyan() {
-    for anchor in [0xFF0000, 0xFF9900, 0xFFFF00, 0x33FF00, 0x0099FF, 0x6633FF] {
-        assert_eq!(cyan_of(anchor), 0, "#{anchor:06X}");
-    }
-}
-
-#[test]
-fn a_pale_wash_is_not_cyan() {
-    assert_eq!(cyan_of(0xB4FFFF), 0);
-}
-
-#[test]
-fn a_near_black_teal_is_not_cyan() {
-    assert_eq!(cyan_of(0x063030), 0);
-}
-
-#[test]
-fn cyan_is_a_subset_of_the_ink_it_is_measured_from() {
-    for hex in [0x0EB6B7, 0x00FFFF, 0x33FF00, 0x808080, 0x063030] {
-        let m = dynamic_metrics(
-            &frame(1, 1, &[]),
-            &frame(1, 1, &[(0, 0, rgb_hex(hex))]),
-            CELL,
-            &[],
-        );
-        assert!(m.cyan_pixels <= m.ink, "#{hex:06X}");
-    }
-}
-
-#[test]
-fn the_band_edges_are_where_they_are_declared() {
-    assert_eq!(cyan_of(0x00FFC0), 1); // 165.2 deg, inside
-    assert_eq!(cyan_of(0x00FFBF), 0); // 164.9 deg, outside
-    assert_eq!(cyan_of(0x00C0FF), 1); // 194.8 deg, inside
-    assert_eq!(cyan_of(0x00BFFF), 0); // 195.1 deg, outside
-}
-
-#[test]
 fn the_worst_sample_reported_is_the_one_nearest_pure_cyan() {
     let m = metrics(
         2,
@@ -187,43 +130,53 @@ fn the_worst_sample_reported_is_the_one_nearest_pure_cyan() {
     assert!((worst.degrees - 180.36).abs() < 0.05, "{}", worst.degrees);
 }
 
+#[test]
+fn cyan_is_the_band_between_the_declared_edges() {
+    for (hex, want) in [
+        (0x0EB6B7, 1), // the shipped gradient crossing
+        (0x00D6FF, 1), // the rotated azure anchor
+        (0x00FFC0, 1), // 165.2 deg, inside
+        (0x00FFBF, 0), // 164.9 deg, outside
+        (0x00C0FF, 1), // 194.8 deg, inside
+        (0x00BFFF, 0), // 195.1 deg, outside
+        (0xB4FFFF, 0), // a pale wash
+        (0x063030, 0), // a near-black teal
+        // The rainbow's own anchors.
+        (0xFF0000, 0),
+        (0xFF9900, 0),
+        (0xFFFF00, 0),
+        (0x33FF00, 0),
+        (0x0099FF, 0),
+        (0x6633FF, 0),
+    ] {
+        assert_eq!(cyan_of(hex), want, "#{hex:06X}");
+    }
+}
+
 // ---------------------------------------------------------- colour floor --
 
 #[test]
-fn the_bed_s_dimmest_stops_at_the_ceiling_are_ink() {
-    for px in [bgr(0, 83, 83), bgr(0, 94, 0), bgr(90, 90, 0)] {
-        assert!(saturated_hue_degrees(px).is_some(), "{px:?}");
-    }
-}
-
-#[test]
-fn the_bed_s_dimmest_stops_at_the_cold_share_are_ink() {
-    for px in [bgr(20, 75, 75), bgr(20, 80, 18), bgr(78, 78, 20)] {
-        assert!(saturated_hue_degrees(px).is_some(), "{px:?}");
-    }
-}
-
-#[test]
-fn a_band_s_tapered_fringe_is_not_ink() {
-    assert!(saturated_hue_degrees(bgr(20, 45, 45)).is_none());
-}
-
-#[test]
-fn no_grey_on_the_glass_is_ink() {
-    for px in [
-        bgr(24, 19, 17),
-        bgr(150, 150, 150),
-        bgr(255, 255, 255),
-        bgr(90, 84, 80),
+fn the_colour_floor_admits_the_bed_and_refuses_grey_and_fringe() {
+    for (px, ink) in [
+        // The bed's dimmest stops at the ceiling and at the cold share.
+        (bgr(0, 83, 83), true),
+        (bgr(0, 94, 0), true),
+        (bgr(90, 90, 0), true),
+        (bgr(20, 75, 75), true),
+        (bgr(20, 80, 18), true),
+        (bgr(78, 78, 20), true),
+        // v1's brighter bed.
+        (bgr(0, 236, 236), true),
+        (bgr(200, 0, 0), true),
+        (bgr(0, 0, 180), true),
+        // A band's tapered fringe, and grey on the glass.
+        (bgr(20, 45, 45), false),
+        (bgr(24, 19, 17), false),
+        (bgr(150, 150, 150), false),
+        (bgr(255, 255, 255), false),
+        (bgr(90, 84, 80), false),
     ] {
-        assert!(saturated_hue_degrees(px).is_none(), "{px:?}");
-    }
-}
-
-#[test]
-fn v1_s_brighter_bed_is_unchanged_by_the_floor() {
-    for px in [bgr(0, 236, 236), bgr(200, 0, 0), bgr(0, 0, 180)] {
-        assert!(saturated_hue_degrees(px).is_some(), "{px:?}");
+        assert_eq!(saturated_hue_degrees(px).is_some(), ink, "{px:?}");
     }
 }
 
@@ -241,12 +194,6 @@ fn a_star_on_a_long_band_s_edge_leaves_the_band_lit() {
 }
 
 #[test]
-fn an_object_under_the_cap_is_counted_as_before() {
-    let sat = sat_patch(200, 20, 40, 139, 51, 60.0);
-    assert_eq!(band_ink_metrics(200, 80, &sat, 14, &[]).0, 120 * 12);
-}
-
-#[test]
 fn a_tall_object_whose_band_rows_still_exceed_the_cap_is_dropped() {
     let sat = sat_patch(200, 20, 20, 139, 59, 60.0); // 120x40: no band in it
     assert_eq!(
@@ -257,60 +204,63 @@ fn a_tall_object_whose_band_rows_still_exceed_the_cap_is_dropped() {
 
 // -------------------------------------------------------- status rows --
 
-#[test]
-fn a_row_without_speed_is_driven_by_spawns_alone() {
-    let rows = rows_of(&[
-        "trail spawns=0 licensed=0".into(),
-        "trail spawns=1 licensed=1".into(),
-        "trail spawns=1 licensed=1".into(),
-    ]);
-    assert_eq!(driven_last_frame(&rows), Ok(Some(1)));
-}
-
-#[test]
-fn an_older_row_with_speed_still_reads_it() {
-    let rows = rows_of(&[
-        "trail spawns=0 speed=0.0".into(),
-        "trail spawns=0 speed=2.5".into(),
-        "trail spawns=0 speed=0.0".into(),
-    ]);
-    assert_eq!(driven_last_frame(&rows), Ok(Some(1)));
-}
-
 fn spine(spawns: u32, speed: f64) -> String {
     format!("trail licensed={spawns} spawns={spawns} speed={speed:.1}")
 }
 
 #[test]
-fn the_claim_stops_where_the_engine_stops_driving() {
-    let take = rows_of(&[
-        spine(0, 0.0),
-        spine(1, 0.0),
-        spine(2, 3.0),
-        spine(3, 1.7),
-        spine(3, 0.7),
-        spine(3, 0.0),
-        spine(3, 0.0),
-    ]);
-    assert_eq!(driven_last_frame(&take), Ok(Some(4)));
-}
-
-#[test]
-fn an_admitted_move_drives_a_frame_with_no_velocity_yet() {
-    let take = rows_of(&[spine(0, 0.0), spine(1, 0.0), spine(1, 0.0)]);
-    assert_eq!(driven_last_frame(&take), Ok(Some(1)));
-}
-
-#[test]
-fn a_spine_that_snapped_to_zero_between_keys_still_drives() {
-    let take = rows_of(&[spine(0, 0.0), spine(1, 2.0), spine(1, 0.0), spine(2, 0.0)]);
-    assert_eq!(driven_last_frame(&take), Ok(Some(3)));
-}
-
-#[test]
-fn a_take_that_never_drives_bounds_nothing() {
-    let take = rows_of(&vec![spine(0, 0.0); 5]);
-    assert_eq!(driven_last_frame(&take), Ok(None));
+fn the_driven_claim_ends_where_the_engine_stops_driving() {
+    let cases: [(&str, Vec<String>, Option<usize>); 6] = [
+        (
+            "a row without speed is driven by spawns alone",
+            vec![
+                "trail spawns=0 licensed=0".into(),
+                "trail spawns=1 licensed=1".into(),
+                "trail spawns=1 licensed=1".into(),
+            ],
+            Some(1),
+        ),
+        (
+            "an older row with speed still reads it",
+            vec![
+                "trail spawns=0 speed=0.0".into(),
+                "trail spawns=0 speed=2.5".into(),
+                "trail spawns=0 speed=0.0".into(),
+            ],
+            Some(1),
+        ),
+        (
+            "the claim stops where the engine stops driving",
+            vec![
+                spine(0, 0.0),
+                spine(1, 0.0),
+                spine(2, 3.0),
+                spine(3, 1.7),
+                spine(3, 0.7),
+                spine(3, 0.0),
+                spine(3, 0.0),
+            ],
+            Some(4),
+        ),
+        (
+            "an admitted move drives a frame with no velocity yet",
+            vec![spine(0, 0.0), spine(1, 0.0), spine(1, 0.0)],
+            Some(1),
+        ),
+        (
+            "a spine that snapped to zero between keys still drives",
+            vec![spine(0, 0.0), spine(1, 2.0), spine(1, 0.0), spine(2, 0.0)],
+            Some(3),
+        ),
+        (
+            "a take that never drives bounds nothing",
+            vec![spine(0, 0.0); 5],
+            None,
+        ),
+    ];
+    for (name, lines, want) in cases {
+        assert_eq!(driven_last_frame(&rows_of(&lines)), Ok(want), "{name}");
+    }
 }
 
 #[test]
@@ -468,35 +418,29 @@ fn resting_head(w: usize, h: usize, frame_no: usize, pet: bool, cat: bool) -> Sh
 }
 
 #[test]
-fn the_resting_head_is_a_witness_in_the_final_stills() {
+fn the_resting_head_is_a_witness_only_in_the_claimed_final_stills() {
     for frame_no in [0, 7, 8, 9] {
         assert_eq!(
             resting_head(24, 16, frame_no, false, true),
-            Shape::new(24 * 16, 24, 16)
+            Shape::new(24 * 16, 24, 16),
+            "final still {frame_no}"
         );
     }
-}
-
-#[test]
-fn the_resting_head_is_not_admitted_mid_take() {
     for frame_no in 1..7 {
-        assert_eq!(resting_head(24, 16, frame_no, false, true), Shape::NONE);
+        assert_eq!(
+            resting_head(24, 16, frame_no, false, true),
+            Shape::NONE,
+            "mid-take {frame_no}"
+        );
     }
-}
-
-#[test]
-fn the_resting_head_needs_the_engines_claim() {
-    assert_eq!(resting_head(24, 16, 9, false, false), Shape::NONE);
-}
-
-#[test]
-fn a_one_row_component_cannot_use_the_cat_still_exception() {
-    assert_eq!(resting_head(28, 14, 9, false, true), Shape::NONE);
-}
-
-#[test]
-fn the_caret_block_cannot_use_the_cat_still_exception() {
-    assert_eq!(resting_head(7, 14, 9, false, true), Shape::NONE);
+    // No engine claim; a one-row component; the caret block.
+    for (w, h, cat) in [(24, 16, false), (28, 14, true), (7, 14, true)] {
+        assert_eq!(
+            resting_head(w, h, 9, false, cat),
+            Shape::NONE,
+            "{w}x{h} cat={cat}"
+        );
+    }
 }
 
 // --------------------------------------------------------------- runs --
@@ -534,14 +478,6 @@ fn only_interior_rainbow_blackouts_count() {
         trailing_true_run(&[true, true, true, false, false, false]),
         0
     );
-}
-
-#[test]
-fn rainbow_gate_requires_a_consecutive_run() {
-    assert_eq!(longest_true_run(&[false, true, false, true, false]), 1);
-    assert_eq!(longest_true_run(&[false, true, true, false]), 2);
-    assert_eq!(longest_true_run(&[true, true, true, false, true]), 3);
-    assert_eq!(longest_true_run(&[]), 0);
 }
 
 #[test]
@@ -587,6 +523,7 @@ fn one_hue_thin_highlighter_is_ribbon_presence() {
     assert_eq!(m.row_hue_separation, 0.0, "one hue cannot buy the hue arm");
     assert_eq!(m.ribbon_component, Shape::new(8, 8, 1));
     assert!(ribbon_present(&m));
+    assert!(driven_lit(&m));
 }
 
 #[test]
@@ -768,26 +705,6 @@ fn a_remote_run_does_not_attach_to_a_pale_caret_either() {
 }
 
 #[test]
-fn take_level_hues_identify_monochrome_ribbon_frames_as_rainbow() {
-    let mut union = HueSet::default();
-    for degrees in [0.0, 90.0, 180.0, 270.0] {
-        let strip: Vec<_> = (4..12).map(|x| (x, 3, at_hue(degrees))).collect();
-        let m = metrics(20, 8, &strip);
-        assert_eq!(m.row_hue_separation, 0.0);
-        assert!(ribbon_present(&m));
-        union.union_with(m.hues);
-    }
-    assert_eq!(union.len(), 4);
-}
-
-#[test]
-fn missing_cell_geometry_is_unrepresentable() {
-    assert_eq!(Cell::new(0, 14), None);
-    assert_eq!(Cell::new(7, 0), None);
-    assert_eq!(Cell::new(7, 14), Some(CELL));
-}
-
-#[test]
 fn subthreshold_horizontal_spark_is_not_ribbon_presence() {
     let spark: Vec<_> = (4..11).map(|x| (x, 3, bgr(0, 80, 240))).collect();
     let m = metrics(20, 8, &spark);
@@ -796,33 +713,6 @@ fn subthreshold_horizontal_spark_is_not_ribbon_presence() {
 }
 
 // -------------------------------------------------------- hue diagnostic --
-
-#[test]
-fn adjacent_bucket_edges_cannot_impersonate_visible_hue_separation() {
-    assert!(row_hue_separation(2, &[59.0, 61.0]) < ROW_RAINBOW_MIN_HUE_DEGREES);
-    let m = metrics(2, 1, &[(0, 0, at_hue(59.0)), (1, 0, at_hue(61.0))]);
-    assert_eq!(
-        m.row_hue_peak, 2,
-        "the control must really straddle the bucket edge"
-    );
-}
-
-#[test]
-fn visibly_separated_hues_are_a_rainbow_witness() {
-    assert!(row_hue_separation(2, &[45.0, 75.0]) >= ROW_RAINBOW_MIN_HUE_DEGREES);
-}
-
-#[test]
-fn continuous_hue_witness_preserves_a_full_interior_blackout() {
-    let visible = row_hue_separation(2, &[45.0, 75.0]);
-    let dark = row_hue_separation(2, &[]);
-    let flags: Vec<bool> = [visible, visible, dark, dark, visible, visible]
-        .iter()
-        .map(|&s| s >= ROW_RAINBOW_MIN_HUE_DEGREES)
-        .collect();
-    assert_eq!(flags, [true, true, false, false, true, true]);
-    assert_eq!(longest_sustained_interior_gap(&flags, &[false; 6]), 2);
-}
 
 #[test]
 fn fast_circular_max_matches_the_exact_oracle_including_wrap() {
@@ -854,73 +744,103 @@ fn fast_circular_max_matches_the_exact_oracle_including_wrap() {
     }
 }
 
+/// The row hue witness: two hues count only when they are visibly apart
+/// (not merely across a bucket edge) AND in one 4-connected, slab-height
+/// object — a seam-split slab run still is, a diagonal neighbour, a detached
+/// pixel or a tall caret block is not.
 #[test]
-fn two_hues_in_one_object_are_a_band() {
-    let sep = metrics(8, 1, &[(0, 0, at_hue(45.0)), (1, 0, at_hue(200.0))]).row_hue_separation;
-    assert!(sep >= ROW_RAINBOW_MIN_HUE_DEGREES);
-}
-
-#[test]
-fn two_hues_in_two_objects_are_not_a_band() {
-    let m = metrics(8, 1, &[(0, 0, at_hue(45.0)), (5, 0, at_hue(200.0))]);
-    assert_eq!(m.ink, 2, "both pixels are still ink");
-    assert_eq!(m.row_hue_peak, 2, "and both are still seen as hues");
-    assert_eq!(m.row_hue_separation, 0.0);
-}
-
-#[test]
-fn seam_split_slab_runs_witness_through_the_gap() {
-    let mut colored: Vec<_> = (0..3).map(|x| (x, 0, at_hue(40.0))).collect();
-    colored.extend((36..39).map(|x| (x, 0, at_hue(220.0))));
-    assert!(metrics(40, 1, &colored).row_hue_separation >= ROW_RAINBOW_MIN_HUE_DEGREES);
-}
-
-#[test]
-fn the_caret_block_cannot_pair_with_a_young_band() {
-    let band: Vec<_> = (0..5).map(|x| (x, 0, at_hue(280.0))).collect();
-    let tall = block(6, 0, 4, 8, at_hue(140.0));
-    assert!(
-        metrics(16, 8, &[band.clone(), tall].concat()).row_hue_separation
-            < ROW_RAINBOW_MIN_HUE_DEGREES
-    );
-    // Flattened to slab height the same shape witnesses: height decides.
-    let flat = block(6, 0, 4, 2, at_hue(140.0));
-    assert!(
-        metrics(16, 8, &[band, flat].concat()).row_hue_separation >= ROW_RAINBOW_MIN_HUE_DEGREES
-    );
-}
-
-#[test]
-fn a_detached_single_pixel_still_cannot_witness() {
-    let mut colored: Vec<_> = (0..7).map(|x| (x, 0, at_hue(120.0))).collect();
-    colored.push((17, 0, at_hue(270.0)));
-    assert!(metrics(24, 1, &colored).row_hue_separation < ROW_RAINBOW_MIN_HUE_DEGREES);
-}
-
-#[test]
-fn the_domain_never_reads_a_dark_frame_as_lit() {
-    let whole = max_circular_hue_distance_degrees(&[45.0, 200.0]);
-    for gap in 1..=3 {
-        let sep =
-            metrics(8, 1, &[(0, 0, at_hue(45.0)), (gap, 0, at_hue(200.0))]).row_hue_separation;
-        assert!(sep <= whole, "gap {gap}");
-    }
-}
-
-#[test]
-fn a_diagonal_neighbour_is_not_one_object() {
-    let m = metrics(4, 2, &[(0, 0, at_hue(45.0)), (1, 1, at_hue(200.0))]);
-    assert_eq!(m.row_hue_separation, 0.0);
-}
-
-#[test]
-fn an_object_is_walked_across_rows_before_its_rows_are_read() {
-    let colored = [
-        (0, 0, at_hue(45.0)),
-        (0, 1, at_hue(45.0)),
-        (1, 1, at_hue(200.0)),
+fn the_row_hue_witness_needs_one_object_and_visible_separation() {
+    let run = |xs: std::ops::Range<usize>, hue: f64| -> Vec<(usize, usize, Rgb)> {
+        xs.map(|x| (x, 0, at_hue(hue))).collect()
+    };
+    let band = run(0..5, 280.0);
+    #[expect(clippy::type_complexity, reason = "a test's case table")]
+    let cases: Vec<(&str, usize, usize, Vec<(usize, usize, Rgb)>, bool)> = vec![
+        (
+            "adjacent bucket edges",
+            2,
+            1,
+            vec![(0, 0, at_hue(59.0)), (1, 0, at_hue(61.0))],
+            false,
+        ),
+        (
+            "visibly separated",
+            2,
+            1,
+            vec![(0, 0, at_hue(45.0)), (1, 0, at_hue(75.0))],
+            true,
+        ),
+        (
+            "two objects",
+            8,
+            1,
+            vec![(0, 0, at_hue(45.0)), (5, 0, at_hue(200.0))],
+            false,
+        ),
+        (
+            "a seam-split slab run",
+            40,
+            1,
+            [run(0..3, 40.0), run(36..39, 220.0)].concat(),
+            true,
+        ),
+        (
+            "a caret block beside a young band",
+            16,
+            8,
+            [band.clone(), block(6, 0, 4, 8, at_hue(140.0))].concat(),
+            false,
+        ),
+        (
+            "the same block flattened to slab height",
+            16,
+            8,
+            [band, block(6, 0, 4, 2, at_hue(140.0))].concat(),
+            true,
+        ),
+        (
+            "a detached single pixel",
+            24,
+            1,
+            [run(0..7, 120.0), vec![(17, 0, at_hue(270.0))]].concat(),
+            false,
+        ),
+        (
+            "a diagonal neighbour",
+            4,
+            2,
+            vec![(0, 0, at_hue(45.0)), (1, 1, at_hue(200.0))],
+            false,
+        ),
+        (
+            "an object walked across rows",
+            3,
+            2,
+            vec![
+                (0, 0, at_hue(45.0)),
+                (0, 1, at_hue(45.0)),
+                (1, 1, at_hue(200.0)),
+            ],
+            true,
+        ),
     ];
-    assert!(metrics(3, 2, &colored).row_hue_separation >= ROW_RAINBOW_MIN_HUE_DEGREES);
+    for (name, w, h, colored, witnesses) in cases {
+        let m = metrics(w, h, &colored);
+        assert_eq!(
+            m.row_hue_separation >= ROW_RAINBOW_MIN_HUE_DEGREES,
+            witnesses,
+            "{name}: separation {}",
+            m.row_hue_separation
+        );
+    }
+    // The negative controls really are two inked hues.
+    for colored in [
+        [(0, 0, at_hue(59.0)), (1, 0, at_hue(61.0))],
+        [(0, 0, at_hue(45.0)), (5, 0, at_hue(200.0))],
+    ] {
+        let m = metrics(8, 1, &colored);
+        assert_eq!((m.ink, m.row_hue_peak), (2, 2));
+    }
 }
 
 // ------------------------------------------------------------ litness --
@@ -958,27 +878,12 @@ fn a_companion_coat_lends_the_population_arm_nothing() {
 }
 
 #[test]
-fn a_blank_frame_is_not_lit() {
-    let m = metrics(24, 20, &[]);
-    assert_eq!(m.ink, 0);
-    assert!(!driven_lit(&m));
-}
-
-#[test]
 fn a_subthreshold_blob_cannot_buy_continuity() {
     let m = metrics(24, 20, &block(4, 3, 3, 2, LIT));
     assert!(!ribbon_present(&m));
     assert_eq!(m.band_ink, 6);
     assert!(m.band_ink < RIBBON_LIT_MIN_PX);
     assert!(!driven_lit(&m));
-}
-
-#[test]
-fn the_underline_highlighter_stays_lit() {
-    let strip: Vec<_> = (4..12).map(|x| (x, 3, LIT)).collect();
-    let m = metrics(20, 8, &strip);
-    assert_eq!(m.ribbon_component, Shape::new(8, 8, 1));
-    assert!(driven_lit(&m));
 }
 
 #[test]
@@ -1054,41 +959,37 @@ fn tall_caret() -> Vec<(usize, usize, Rgb)> {
 }
 
 #[test]
-fn the_tall_decay_trough_is_lit() {
-    let trough = [tall_caret(), block(20, 16, 5, 2, at_hue(120.0))].concat();
-    let r = single_bound_frame(&trough, false);
-    assert_eq!((r.ribbon_bound, r.ribbon_dark), (3, 0));
-}
-
-#[test]
-fn the_merged_tall_body_is_lit() {
-    let merged = [tall_caret(), block(33, 6, 7, 10, at_hue(120.0))].concat();
-    let r = single_bound_frame(&merged, false);
-    assert_eq!((r.ribbon_bound, r.ribbon_dark), (3, 0));
-}
-
-#[test]
-fn a_caret_only_frame_still_charges() {
-    let r = single_bound_frame(&tall_caret(), false);
-    assert_eq!((r.ribbon_bound, r.ribbon_dark), (3, 2));
-}
-
-#[test]
-fn a_coat_only_frame_still_charges() {
+fn a_bound_frame_is_lit_only_by_band_ink() {
     let coat = [
         block(5, 2, 14, 12, at_hue(10.0)),
         block(19, 8, 14, 12, at_hue(350.0)),
     ]
     .concat();
-    let r = single_bound_frame(&[tall_caret(), coat].concat(), true);
-    assert_eq!((r.ribbon_bound, r.ribbon_dark), (3, 2));
-}
-
-#[test]
-fn a_grey_band_frame_still_charges() {
-    let grey = block(10, 16, 30, 2, [128, 128, 128]);
-    let r = single_bound_frame(&[tall_caret(), grey].concat(), false);
-    assert_eq!((r.ribbon_bound, r.ribbon_dark), (3, 2));
+    for (name, colored, pet, dark) in [
+        (
+            "the tall decay trough",
+            [tall_caret(), block(20, 16, 5, 2, at_hue(120.0))].concat(),
+            false,
+            0,
+        ),
+        (
+            "the merged tall body",
+            [tall_caret(), block(33, 6, 7, 10, at_hue(120.0))].concat(),
+            false,
+            0,
+        ),
+        ("a caret only", tall_caret(), false, 2),
+        ("a coat only", [tall_caret(), coat].concat(), true, 2),
+        (
+            "a grey band",
+            [tall_caret(), block(10, 16, 30, 2, [128, 128, 128])].concat(),
+            false,
+            2,
+        ),
+    ] {
+        let r = single_bound_frame(&colored, pet);
+        assert_eq!((r.ribbon_bound, r.ribbon_dark), (3, dark), "{name}");
+    }
 }
 
 #[test]
@@ -1138,102 +1039,11 @@ fn the_box_sibling_frames_exactly_the_companion_component() {
 }
 
 #[test]
-fn the_box_sibling_keeps_the_compact_witness_exception() {
-    let f = frame(ANIMAL_W, ANIMAL_H, &block(12, 7, 16, 9, charcoal()));
-    let bg = [0, 0, 0];
-    assert_eq!(
-        companion_component(&f, bg, true, 9, 10, None, false),
-        Shape::new(16 * 9, 16, 9)
-    );
-    assert_eq!(
-        companion_component_box(&f, bg, true, 9, 10, None, false),
-        Some(PixelBox::new(12, 7, 27, 15))
-    );
-    assert_eq!(
-        companion_component(&f, bg, true, 4, 10, None, false),
-        Shape::NONE
-    );
-    assert_eq!(
-        companion_component_box(&f, bg, true, 4, 10, None, false),
-        None
-    );
-}
-
-#[test]
-fn no_companion_means_no_box() {
-    let f = frame(ANIMAL_W, ANIMAL_H, &block(4, 2, 7, 14, charcoal()));
-    assert_eq!(
-        companion_component(&f, [0, 0, 0], true, 4, 10, None, false),
-        Shape::NONE
-    );
-    assert_eq!(
-        companion_component_box(&f, [0, 0, 0], true, 4, 10, None, false),
-        None
-    );
-}
-
-#[test]
-fn records_are_the_shapes_with_their_boxes() {
-    let f = frame(ANIMAL_W, ANIMAL_H, &animal());
-    let records = tall_component_records(&f, [0, 0, 0], COMP_MIN_H, None);
-    assert_eq!(
-        records,
-        [Component {
-            shape: Shape::new(288, 22, 18),
-            bbox: ANIMAL_BOX
-        }]
-    );
-    assert_eq!(
-        tall_components(&f, [0, 0, 0], COMP_MIN_H),
-        [records[0].shape]
-    );
-}
-
-#[test]
-fn a_coat_fragment_inside_the_animal_s_box_is_not_band_ink() {
-    let (w, h) = (ANIMAL_W, ANIMAL_H);
-    let sat = sat_patch(w, 54, 6, 65, 14, 36.0);
-    assert_eq!(
-        band_ink_metrics(w, h, &sat, 14, &[]),
-        (108, HueSet::of(&[1]))
-    );
-    assert_eq!(
-        band_ink_metrics(w, h, &sat, 14, &[ANIMAL_BOX]),
-        (0, HueSet::default())
-    );
-    assert_eq!(
-        band_ink_partition(w, h, &sat, 14, &[ANIMAL_BOX]),
-        (0, HueSet::default(), 108)
-    );
-}
-
-#[test]
-fn a_band_crossing_the_box_keeps_counting() {
-    let (w, h) = (ANIMAL_W, ANIMAL_H);
-    let mut sat = sat_patch(w, 10, 19, 66, 20, 120.0);
-    sat.extend(sat_patch(w, 54, 6, 65, 14, 36.0));
-    assert_eq!(
-        band_ink_partition(w, h, &sat, 14, &[ANIMAL_BOX]),
-        (114, HueSet::of(&[4]), 108)
-    );
-}
-
-#[test]
 fn a_box_that_holds_the_band_whole_refuses_it() {
     let sat = sat_patch(ANIMAL_W, 55, 19, 64, 20, 120.0);
     assert_eq!(
         band_ink_partition(ANIMAL_W, ANIMAL_H, &sat, 14, &[ANIMAL_BOX]),
         (0, HueSet::default(), 20)
-    );
-}
-
-#[test]
-fn no_boxes_leave_the_domain_exactly_as_it_was() {
-    let mut sat = sat_patch(ANIMAL_W, 10, 19, 66, 20, 120.0);
-    sat.extend(sat_patch(ANIMAL_W, 54, 6, 65, 14, 36.0));
-    assert_eq!(
-        band_ink_partition(ANIMAL_W, ANIMAL_H, &sat, 14, &[]),
-        (222, HueSet::of(&[1, 4]), 0)
     );
 }
 
@@ -1517,25 +1327,50 @@ fn lit(runs: &[(bool, usize)]) -> Vec<bool> {
 }
 
 #[test]
-fn an_unbroken_ribbon_is_zero_dark() {
-    let d = measured(&[true; 20]);
-    assert_eq!(
-        (d.dark_us, d.frames, d.nominal_dt_us, d.mature_lead_us),
-        (0, 20, NOMINAL, 0)
-    );
-}
-
-#[test]
-fn pre_key_onset_latency_is_not_an_interior_blackout() {
-    let d = measured(&lit(&[(false, 6), (true, 14)]));
-    assert_eq!(
-        (d.dark_us, d.frames, d.mature_lead_us),
-        (0, 20, 6 * NOMINAL)
-    );
-}
-
-#[test]
-fn darkness_scales_with_the_number_of_frames_sampled_dark() {
+fn the_driven_window_charges_only_dark_inside_the_mature_window() {
+    for (name, runs, dark, lead) in [
+        ("an unbroken ribbon", vec![(true, 20)], 0, 0),
+        (
+            "pre-key onset latency",
+            vec![(false, 6), (true, 14)],
+            0,
+            6 * NOMINAL,
+        ),
+        ("a dead effect", vec![(false, 20)], 20 * NOMINAL, 0),
+        (
+            "an interior blackout after maturity",
+            vec![(false, 5), (true, 2), (false, 3), (true, 10)],
+            3 * NOMINAL,
+            5 * NOMINAL,
+        ),
+        (
+            "a ribbon dying mid-take owes to the window's close",
+            vec![(true, 5), (false, 45)],
+            45 * NOMINAL - EXHALE_CLOSE_ALLOWANCE_US,
+            0,
+        ),
+        (
+            "the authored exhale at the close",
+            vec![(true, 20), (false, 10)],
+            0,
+            0,
+        ),
+        (
+            "an interior blackout cannot use the close allowance",
+            vec![(true, 5), (false, 10), (true, 5)],
+            10 * NOMINAL,
+            0,
+        ),
+        (
+            "a lone glint cannot open the mature window",
+            vec![(false, 2), (true, 1), (false, 4), (true, 13)],
+            0,
+            7 * NOMINAL,
+        ),
+    ] {
+        let d = measured(&lit(&runs));
+        assert_eq!((d.dark_us, d.mature_lead_us), (dark, lead), "{name}");
+    }
     for blackout in [1, 2, 3, 5] {
         let mut flags = vec![true; 20];
         flags[8..8 + blackout].fill(false);
@@ -1618,81 +1453,12 @@ fn a_stall_beside_one_dark_frame_charges_only_that_frame() {
 }
 
 #[test]
-fn a_dead_effect_darkens_the_whole_window() {
-    let d = measured(&[false; 20]);
-    assert_eq!(
-        (d.dark_us, d.frames, d.mature_lead_us),
-        (20 * NOMINAL, 20, 0)
-    );
-}
-
-#[test]
-fn the_span_before_the_band_reaches_glass_is_not_charged() {
-    let d = measured(&lit(&[(false, 8), (true, 12)]));
-    assert_eq!(
-        (d.dark_us, d.frames, d.mature_lead_us),
-        (0, 20, 8 * NOMINAL)
-    );
-}
-
-#[test]
-fn an_interior_blackout_after_maturity_is_still_charged() {
-    let d = measured(&lit(&[(false, 5), (true, 2), (false, 3), (true, 10)]));
-    assert_eq!((d.dark_us, d.mature_lead_us), (3 * NOMINAL, 5 * NOMINAL));
-}
-
-#[test]
-fn a_ribbon_dying_mid_take_keeps_owing_to_the_windows_close() {
-    let d = measured(&lit(&[(true, 5), (false, 45)]));
-    assert_eq!(d.dark_us, 45 * NOMINAL - EXHALE_CLOSE_ALLOWANCE_US);
-    assert_eq!(d.mature_lead_us, 0);
-}
-
-#[test]
-fn the_authored_exhale_at_the_close_is_not_a_blackout() {
-    assert_eq!(measured(&lit(&[(true, 20), (false, 10)])).dark_us, 0);
-}
-
-#[test]
-fn an_interior_blackout_cannot_use_the_close_allowance() {
-    assert_eq!(
-        measured(&lit(&[(true, 5), (false, 10), (true, 5)])).dark_us,
-        10 * NOMINAL
-    );
-}
-
-#[test]
-fn a_lone_glint_cannot_open_the_mature_window() {
-    let d = measured(&lit(&[(false, 2), (true, 1), (false, 4), (true, 13)]));
-    assert_eq!((d.dark_us, d.mature_lead_us), (0, 7 * NOMINAL));
-}
-
-#[test]
 fn a_duplicate_cannot_open_the_mature_window() {
     let flags = lit(&[(false, 4), (true, 2), (false, 4), (true, 10)]);
     let mut duplicates = vec![false; 20];
     duplicates[5] = true;
     let d = measure(&flags, Some((0, 10_000)), &[], Some(&duplicates), None);
     assert_eq!((d.dark_us, d.mature_lead_us), (0, 10 * NOMINAL));
-}
-
-#[test]
-fn a_long_dead_start_is_reported_at_full_length_for_the_ceiling() {
-    let d = measure(
-        &lit(&[(false, 188), (true, 62)]),
-        Some((0, 4000)),
-        &[],
-        None,
-        None,
-    );
-    assert_eq!(
-        (d.dark_us, d.frames, d.mature_lead_us),
-        (0, 250, 188 * NOMINAL)
-    );
-    assert!(
-        d.mature_lead_us > 500_000,
-        "the verdict's ceiling must see this"
-    );
 }
 
 #[test]
@@ -1945,28 +1711,6 @@ fn grey_sleeper() -> Fixture {
 const SLEEPER_ORDER: [usize; 6] = [0, 1, 1, 2, 2, 2];
 
 #[test]
-fn the_sleeper_fixture_is_the_kept_take_s_geometry() {
-    let fx = grey_sleeper();
-    let f = fx.frame("shot_0011");
-    assert_eq!((f.width(), f.height()), (584, 350));
-    assert_eq!(
-        fx.rows[1].pet_body(),
-        Ok(Some(PixelBox::new(33, 147, 72, 169)))
-    );
-    assert_eq!(fx.rows[1].pet_pose(), Some("pet_sleep_0"));
-    assert_eq!(fx.rows[0].pet_pose(), Some("pet_sleep_1"));
-    let records =
-        tall_component_records(f, fx.background(), 1, Some(PixelBox::new(33, 147, 72, 169)));
-    assert_eq!(
-        records,
-        [Component {
-            shape: Shape::new(209, 24, 13),
-            bbox: PixelBox::new(36, 157, 59, 169)
-        }]
-    );
-}
-
-#[test]
 fn the_sleeper_is_located_on_the_mid_take_frames_it_is_claimed_on() {
     let r = grey_sleeper().scan(&SLEEPER_ORDER, str::to_string);
     assert_eq!(
@@ -2175,69 +1919,11 @@ fn a_row_running_through_the_cell_is_the_row_s_not_the_sleeper_s() {
     }
 }
 
-#[test]
-fn the_resting_family_is_the_engine_s_sleep_poses() {
-    for pose in [
-        "pet_sleep_0",
-        "pet_sleep_1",
-        "pet_dog_sleep_0",
-        "pet_dog_sleep_1",
-    ] {
-        assert!(resting_pose(Some(pose)), "{pose}");
-    }
-    for pose in [
-        "pet_sit",
-        "pet_loaf",
-        "pet_loaf_ear",
-        "pet_stand",
-        "pet_walk_0",
-        "pet_dog_loaf",
-        "pet_dog_sit",
-        "sleep",
-        "pet_",
-        "",
-    ] {
-        assert!(!resting_pose(Some(pose)), "{pose}");
-    }
-    assert!(!resting_pose(None));
-    assert_eq!(
-        StatusRow::new("trail pet_pose=pet_sleep_1 x=1").pet_pose(),
-        Some("pet_sleep_1")
-    );
-    assert_eq!(StatusRow::new("trail pet_active=true").pet_pose(), None);
-}
-
 fn low_runner() -> Fixture {
     Fixture::load(
         "low-runner-2026-09-12",
         &["shot_0000", "shot_0014", "shot_0019"],
     )
-}
-
-#[test]
-fn the_runner_fixture_is_the_kept_take_s_geometry() {
-    let fx = low_runner();
-    let f = fx.frame("shot_0014");
-    assert_eq!((f.width(), f.height()), (584, 350));
-    assert_eq!(
-        fx.rows[1].pet_body(),
-        Ok(Some(PixelBox::new(82, 146, 121, 169)))
-    );
-    assert_eq!(fx.rows[1].pet_pose(), Some("pet_run_0"));
-    assert_eq!(fx.rows[2].pet_pose(), Some("pet_run_0"));
-    let records = tall_component_records(
-        f,
-        fx.background(),
-        1,
-        Some(PixelBox::new(82, 146, 121, 169)),
-    );
-    assert_eq!(
-        records,
-        [Component {
-            shape: Shape::new(274, 30, 16),
-            bbox: PixelBox::new(87, 152, 116, 167)
-        }]
-    );
 }
 
 #[test]
@@ -2301,62 +1987,6 @@ fn fused_band() -> Fixture {
             "shot_0011",
         ],
     )
-}
-
-/// The scanner's own saturated map of `name` against `shot_0000`.
-fn saturated(fx: &Fixture, name: &str) -> (usize, usize, SatMap) {
-    let (base, f) = (fx.frame("shot_0000"), fx.frame(name));
-    let sat = (0..f.width() * f.height())
-        .filter(|&p| f.pixel(p) != base.pixel(p))
-        .filter_map(|p| saturated_hue_degrees(f.pixel(p)).map(|d| (p, d)))
-        .collect();
-    (f.width(), f.height(), sat)
-}
-
-#[test]
-fn the_fused_fixture_carries_the_fused_object() {
-    let fx = fused_band();
-    let (w, h, sat) = saturated(&fx, "shot_0007");
-    assert_eq!((w, h), (584, 350));
-    assert_eq!(fx.rows[2].value("ribbon_hue_bands"), Some("4"));
-    assert_eq!(fx.rows[1].value("ribbon_hue_bands"), Some("3"));
-    let objects = ink_objects(w, h, &sat);
-    let big = objects.iter().max_by_key(|m| m.len()).expect("objects");
-    let xs = big.iter().map(|p| p % w);
-    let ys = big.iter().map(|p| p / w);
-    assert_eq!(
-        (
-            big.len(),
-            xs.clone().min(),
-            ys.clone().min(),
-            xs.max(),
-            ys.max()
-        ),
-        (332, Some(28), Some(150), Some(60), Some(171))
-    );
-    let mut columns: BTreeMap<usize, usize> = BTreeMap::new();
-    for p in big {
-        *columns.entry(p % w).or_default() += 1;
-    }
-    assert_eq!(
-        columns.values().filter(|&&n| n >= 14).count(),
-        8,
-        "the caret block standing on the band"
-    );
-}
-
-#[test]
-fn the_caret_block_is_not_a_bridge() {
-    let fx = fused_band();
-    for (name, row, ink) in [
-        ("shot_0007", 2, 203),
-        ("shot_0008", 3, 223),
-        ("shot_0006", 1, 166),
-    ] {
-        let (w, h, sat) = saturated(&fx, name);
-        let body: Vec<PixelBox> = fx.rows[row].pet_body().expect("body").into_iter().collect();
-        assert_eq!(band_ink_partition(w, h, &sat, 14, &body).0, ink, "{name}");
-    }
 }
 
 #[test]

@@ -13,7 +13,6 @@ pub(in crate::terminal) enum DcsType {
     /// DECRQSS - Request Selection or Setting.
     Decrqss,
     /// Sixel graphics (DCS q).
-    #[cfg(feature = "sixel")]
     Sixel,
     /// XTGETTCAP - xterm termcap/terminfo query (DCS + q).
     Xtgettcap,
@@ -58,7 +57,6 @@ impl DcsState {
 }
 
 /// Sixel decoding state: the decoder, the pending image and the ID counter.
-#[cfg(feature = "sixel")]
 pub(in crate::terminal) struct SixelState {
     /// Sixel graphics decoder.
     pub(in crate::terminal) decoder: crate::sixel::SixelDecoder,
@@ -68,7 +66,6 @@ pub(in crate::terminal) struct SixelState {
     pub(in crate::terminal) next_id: u64,
 }
 
-#[cfg(feature = "sixel")]
 impl SixelState {
     pub(in crate::terminal) fn new() -> Self {
         Self {

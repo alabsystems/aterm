@@ -3,333 +3,93 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-// write_ascii_blast content verification
-
-#[test]
-fn write_ascii_blast_content_matches_write_char() {
-    let mut grid_blast = Grid::new(5, 10);
-    let mut grid_char = Grid::new(5, 10);
-
-    let text = b"Hello!";
-    grid_blast.write_ascii_blast(text);
-    for &byte in text {
-        grid_char.write_char(byte as char);
-    }
-
-    for col in 0..text.len() as u16 {
-        let blast_char = grid_blast.cell(0, col).unwrap().char();
-        let char_char = grid_char.cell(0, col).unwrap().char();
-        assert_eq!(blast_char, char_char, "cell content mismatch at col {col}",);
-    }
-}
-
-#[test]
-fn write_ascii_blast_fills_exact_line() {
-    let mut grid = Grid::new(3, 5);
-    grid.write_ascii_blast(b"ABCDE");
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), 'B');
-    assert_eq!(grid.cell(0, 2).unwrap().char(), 'C');
-    assert_eq!(grid.cell(0, 3).unwrap().char(), 'D');
-    assert_eq!(grid.cell(0, 4).unwrap().char(), 'E');
-    // Deferred wrap: cursor at last col, not yet wrapped
-    assert_eq!(grid.cursor_row(), 0);
-    assert_eq!(grid.cursor_col(), 4);
-    assert!(grid.pending_wrap());
-}
-
-#[test]
-fn write_ascii_blast_wraps_and_verifies_content_across_lines() {
-    let mut grid = Grid::new(3, 4);
-    grid.write_ascii_blast(b"ABCDEFGH");
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 3).unwrap().char(), 'D');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'E');
-    assert_eq!(grid.cell(1, 3).unwrap().char(), 'H');
-    assert!(grid.row(1).unwrap().is_wrapped());
-}
-
-#[test]
-fn write_ascii_blast_returns_correct_written_count() {
-    let mut grid = Grid::new(2, 5);
-    let written = grid.write_ascii_blast(b"ABCDEFGHIJKLMNO");
-    assert_eq!(written, 15);
-}
-
-#[test]
-fn write_ascii_blast_empty_input() {
-    let mut grid = Grid::new(3, 10);
-    let written = grid.write_ascii_blast(b"");
-    assert_eq!(written, 0);
-    assert_eq!(grid.cursor_row(), 0);
-    assert_eq!(grid.cursor_col(), 0);
-}
-
-#[test]
-fn write_ascii_blast_single_byte() {
-    let mut grid = Grid::new(3, 10);
-    let written = grid.write_ascii_blast(b"X");
-    assert_eq!(written, 1);
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
-    assert_eq!(grid.cursor_col(), 1);
-}
-
-#[test]
-fn write_ascii_blast_at_cursor_offset() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(0, 5);
-    grid.write_ascii_blast(b"Hello");
-
-    assert_eq!(grid.cell(0, 5).unwrap().char(), 'H');
-    assert_eq!(grid.cell(0, 9).unwrap().char(), 'o');
-    assert_eq!(grid.cell(0, 0).unwrap().char(), ' ');
-    assert_eq!(grid.cell(0, 4).unwrap().char(), ' ');
-    // Deferred wrap: cursor stays at last col with pending_wrap flag
-    assert_eq!(grid.cursor_row(), 0);
-    assert_eq!(grid.cursor_col(), 9);
-    assert!(grid.pending_wrap());
-    // Resolving the wrap moves cursor to next line
-    grid.resolve_pending_wrap();
-    assert_eq!(grid.cursor_row(), 1);
-    assert_eq!(grid.cursor_col(), 0);
-}
-
-#[test]
-fn write_ascii_blast_scrolls_at_screen_bottom() {
-    let mut grid = Grid::new(2, 3);
-
-    let written = grid.write_ascii_blast(b"ABCDEF");
-    assert_eq!(written, 6);
-
-    // Deferred wrap: cursor at the last col of row 1, no scroll yet.
-    assert_eq!(grid.cursor_row(), 1);
-    assert_eq!(grid.cursor_col(), 2);
-    assert!(grid.pending_wrap());
-
-    // Resolve deferred wrap → triggers scroll_region_up(1)
-    grid.resolve_pending_wrap();
-    assert_eq!(grid.cursor_row(), 1);
-    assert_eq!(grid.cursor_col(), 0);
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'D');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), 'E');
-    assert_eq!(grid.cell(0, 2).unwrap().char(), 'F');
-    assert!(grid.row(1).unwrap().is_empty());
-}
-
-// Carriage return
-
-#[test]
-fn carriage_return_at_col_zero_is_noop() {
-    let mut grid = Grid::new(5, 10);
-    grid.set_cursor(2, 0);
-    grid.carriage_return();
-
-    assert_eq!(grid.cursor_col(), 0);
-    assert_eq!(grid.cursor_row(), 2);
-}
-
-#[test]
-fn carriage_return_then_line_feed_sequence() {
-    let mut grid = Grid::new(5, 10);
-    grid.set_cursor(2, 8);
-
-    grid.carriage_return();
-    assert_eq!(grid.cursor_col(), 0);
-    assert_eq!(grid.cursor_row(), 2);
-
-    grid.line_feed();
-    assert_eq!(grid.cursor_col(), 0);
-    assert_eq!(grid.cursor_row(), 3);
-}
-
-// Erase rect boundary conditions
-
-#[test]
-fn erase_rect_inverted_coordinates_is_noop() {
-    let mut grid = Grid::new(5, 10);
-    grid.set_cursor(0, 0);
-    grid.write_char('X');
-
-    grid.erase_rect(3, 0, 1, 5);
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
-
-    grid.erase_rect(0, 5, 2, 2);
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
-}
-
-// Backspace boundary
-
-#[test]
-fn backspace_from_mid_column() {
-    let mut grid = Grid::new(5, 10);
-    grid.set_cursor(1, 5);
-    grid.backspace();
-
-    assert_eq!(grid.cursor_col(), 4);
-    assert_eq!(grid.cursor_row(), 1);
-}
-
-// Row insert_chars/delete_chars boundary conditions
-
-/// insert_chars at the last column should only affect that column.
-#[test]
-fn insert_chars_at_last_column() {
-    let mut grid = Grid::new(3, 5);
-    grid.set_cursor(0, 0);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
-    }
-
-    if let Some(row) = grid.row_mut(0) {
-        row.insert_chars(4, 1);
-    }
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), 'B');
-    assert_eq!(grid.cell(0, 2).unwrap().char(), 'C');
-    assert_eq!(grid.cell(0, 3).unwrap().char(), 'D');
-    // Col 4: original 'E' shifted out, blank inserted
-    assert!(
-        grid.cell(0, 4).unwrap().is_empty(),
-        "last col should be blank after insert"
-    );
-}
-
-/// erase_chars at the end of content: should clear without affecting other cells.
-#[test]
-fn erase_chars_at_content_boundary() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(0, 0);
-    for c in "ABC".chars() {
-        grid.write_char(c);
-    }
-
-    if let Some(row) = grid.row_mut(0) {
-        row.erase_chars(2, 2);
-    }
-
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'A');
-    assert_eq!(grid.cell(0, 1).unwrap().char(), 'B');
-    assert!(
-        grid.cell(0, 2).unwrap().is_empty(),
-        "erased cell should be empty"
-    );
-    assert!(
-        grid.cell(0, 3).unwrap().is_empty(),
-        "cell past content should stay empty"
-    );
-}
-
-// ECH/ICH/DCH extras management
-//
-// The fixtures attach extras through `cell_extra_mut`, which sets the cell's
-// HAS_EXTRAS claim as every engine path does: an entry under a cell without it
-// is an orphan these operations drop (`Grid::drop_unclaimed_extras`).
-
 use crate::extra::CellCoord;
 
-/// ECH: Erasing characters clears extras at erased positions.
+/// The ASCII blast leaves the grid exactly as the same bytes written one at a
+/// time through `write_char_wrap` do: every cell, every row's wrap flag, the
+/// cursor and the deferred wrap — from the origin or mid-row, stopping short
+/// of, exactly at or past the line end, wrapping, and scrolling at the bottom.
 #[test]
-fn erase_chars_clears_extras() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(0, 0);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
+fn write_ascii_blast_matches_per_char_writes() {
+    #[expect(clippy::type_complexity, reason = "a test's case table")]
+    let cases: &[(u16, u16, (u16, u16), &[u8])] = &[
+        (3, 10, (0, 0), b""),
+        (3, 10, (0, 0), b"X"),
+        (5, 10, (0, 0), b"Hello!"),
+        (3, 5, (0, 0), b"ABCDE"),
+        (3, 4, (0, 0), b"ABCDEFGH"),
+        (2, 5, (0, 0), b"ABCDEFGHIJKLMNO"),
+        (3, 10, (0, 5), b"Hello"),
+        (2, 3, (0, 0), b"ABCDEF"),
+    ];
+    for &(rows, cols, (row, col), text) in cases {
+        let mut blast = Grid::new(rows, cols);
+        let mut per_char = Grid::new(rows, cols);
+        for grid in [&mut blast, &mut per_char] {
+            grid.set_cursor(row, col);
+        }
+        let at = format!(
+            "{:?} at ({row}, {col}) on {rows}x{cols}",
+            String::from_utf8_lossy(text)
+        );
+        assert_eq!(blast.write_ascii_blast(text), text.len(), "{at}");
+        for &byte in text {
+            per_char.write_char_wrap(char::from(byte));
+        }
+        for r in 0..rows {
+            let line = |g: &Grid| g.row(r).map(|row| (row.to_string(), row.is_wrapped()));
+            assert_eq!(line(&blast), line(&per_char), "{at}: row {r}");
+        }
+        assert_eq!(blast.cursor(), per_char.cursor(), "{at}");
+        assert_eq!(blast.pending_wrap(), per_char.pending_wrap(), "{at}");
+        blast.resolve_pending_wrap();
+        per_char.resolve_pending_wrap();
+        assert_eq!(
+            screen_rows(&blast),
+            screen_rows(&per_char),
+            "{at}: after the wrap resolves"
+        );
     }
-    for col in 1..4u16 {
-        grid.cell_extra_mut(0, col).add_combining('\u{0301}');
-    }
-    assert!(grid.extras().get(CellCoord::new(0, 1)).is_some());
-    assert!(grid.extras().get(CellCoord::new(0, 2)).is_some());
-    assert!(grid.extras().get(CellCoord::new(0, 3)).is_some());
-
-    // ECH 2 at col 2 → erases cols 2, 3
-    grid.set_cursor(0, 2);
-    grid.erase_chars(2);
-
-    assert!(
-        grid.extras().get(CellCoord::new(0, 1)).is_some(),
-        "col 1 extras preserved"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 2)).is_none(),
-        "col 2 extras cleared by ECH"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 3)).is_none(),
-        "col 3 extras cleared by ECH"
-    );
 }
 
-/// ICH: Inserting characters shifts extras right; blanks have no extras.
-#[test]
-fn insert_chars_shifts_extras_right() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(0, 0);
-    for c in "ABCDE".chars() {
-        grid.write_char(c);
-    }
-    grid.cell_extra_mut(0, 1).add_combining('\u{0301}');
-    grid.cell_extra_mut(0, 4).add_combining('\u{0302}');
-
-    // ICH 2 at col 2 → shifts cols 2+ right by 2
-    grid.set_cursor(0, 2);
-    grid.insert_chars(2);
-
-    assert!(
-        grid.extras().get(CellCoord::new(0, 1)).is_some(),
-        "col 1 extras preserved (before insert point)"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 4)).is_none(),
-        "col 4 extras shifted away"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 6)).is_some(),
-        "col 4 extras shifted to col 6"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 2)).is_none(),
-        "inserted blank col 2 has no extras"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 3)).is_none(),
-        "inserted blank col 3 has no extras"
-    );
+fn screen_rows(grid: &Grid) -> Vec<String> {
+    (0..grid.rows())
+        .map(|r| grid.row(r).map(ToString::to_string).unwrap_or_default())
+        .collect()
 }
 
-/// DCH: Deleting characters removes extras and shifts remaining left.
+/// ECH clears the extras of the cells it blanks, ICH shifts extras right with
+/// their cells (the inserted blanks carry none), DCH drops the deleted cells'
+/// extras and shifts the rest left. The fixtures attach extras through
+/// `cell_extra_mut`, which sets the cell's HAS_EXTRAS claim as every engine
+/// path does: an entry under a cell without it is an orphan these operations
+/// drop (`Grid::drop_unclaimed_extras`).
 #[test]
-fn delete_chars_shifts_extras_left() {
-    let mut grid = Grid::new(3, 10);
-    grid.set_cursor(0, 0);
-    for c in "ABCDEFGH".chars() {
-        grid.write_char(c);
+fn char_ops_carry_extras_with_their_cells() {
+    type Op = fn(&mut Grid, u16);
+    let cases: &[(&str, Op, &[u16], &[u16])] = &[
+        ("ECH 2 at col 2", |g, n| g.erase_chars(n), &[1, 2, 3], &[1]),
+        ("ICH 2 at col 2", |g, n| g.insert_chars(n), &[1, 4], &[1, 6]),
+        (
+            "DCH 2 at col 2",
+            |g, n| g.delete_chars(n),
+            &[1, 3, 6],
+            &[1, 4],
+        ),
+    ];
+    for &(name, op, before, after) in cases {
+        let mut grid = Grid::new(3, 10);
+        for c in "ABCDEFGH".chars() {
+            grid.write_char(c);
+        }
+        for &col in before {
+            grid.cell_extra_mut(0, col).add_combining('\u{0301}');
+        }
+        grid.set_cursor(0, 2);
+        op(&mut grid, 2);
+        let got: Vec<u16> = (0..10)
+            .filter(|&col| grid.extras().get(CellCoord::new(0, col)).is_some())
+            .collect();
+        assert_eq!(got, after, "{name}");
     }
-    grid.cell_extra_mut(0, 1).add_combining('\u{0301}');
-    grid.cell_extra_mut(0, 3).add_combining('\u{0302}');
-    grid.cell_extra_mut(0, 6).add_combining('\u{0303}');
-
-    // DCH 2 at col 2 → deletes cols 2-3, shifts cols 4+ left by 2
-    grid.set_cursor(0, 2);
-    grid.delete_chars(2);
-
-    assert!(
-        grid.extras().get(CellCoord::new(0, 1)).is_some(),
-        "col 1 extras preserved (before delete point)"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 3)).is_none(),
-        "col 3 extras deleted by DCH"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 6)).is_none(),
-        "col 6 extras shifted away"
-    );
-    assert!(
-        grid.extras().get(CellCoord::new(0, 4)).is_some(),
-        "col 6 extras shifted to col 4"
-    );
 }

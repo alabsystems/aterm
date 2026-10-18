@@ -6,7 +6,7 @@
 // offset (`aterm_render::band_offset`), and the leftover bands are painted theme bg in the same
 // blit pass. Drives the real blit pipeline (`vs_blit`/`fs_blit`, `BlitUniform`) via
 // `blit_to_sized_for_test` against the offscreen readback and the CPU twin
-// `aterm_render::place_frame_bands`. No GPU or no system font: no-op.
+// `aterm_render::place_frame_bands`. No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{DropOverlay, GpuRenderer, PresentCrop};

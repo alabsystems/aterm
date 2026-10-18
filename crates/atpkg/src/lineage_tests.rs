@@ -1,9 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `lineage` over synthetic trees: the scan's evidence classes (each with the prose or shape
-//! that must not count), compiler admission by content (the `-vV` probe injected, everything
-//! else real files), the SEED-MINT messages and the LINEAGE record's round trip.
+//! `lineage` over synthetic trees: the scan's evidence classes (each with the
+//! prose or shape that must NOT count), compiler admission by content (the `-vV`
+//! probe injected, everything else real files) and the SEED-MINT port's messages. The
+//! LINEAGE record's round trip and the tree scan are the producer's
+//! (`atpkg-publish`'s `tests/artifact/lineage.rs`).
 
 use super::*;
 
@@ -299,32 +301,7 @@ fn find_byte_agrees_with_a_linear_search() {
     assert_eq!(find_byte(&hay, b'r'), None);
 }
 
-#[test]
-fn scan_tree_reads_compiled_output_only() {
-    let (_dir, d) = tmp("tree");
-    std::fs::create_dir_all(d.join("bin")).expect("mkdir");
-    std::fs::create_dir_all(d.join("lib/rustlib/t/lib")).expect("mkdir");
-    let stock = format!("/rustc/{STOCK}/library/std/src/x.rs");
-    std::fs::write(d.join("bin/ay"), object(stock.as_bytes())).expect("write");
-    std::fs::write(d.join("bin/clean"), object(b"nothing foreign")).expect("write");
-    // A text file that quotes a stock path is documentation, not compiled output.
-    std::fs::write(d.join("README"), stock.as_bytes()).expect("write");
-    std::fs::write(
-        d.join("lib/rustlib/t/lib/libstd-1.rlib"),
-        [
-            b"!<arch>\n".as_slice(),
-            &metadata_header("rustc 1.97.1 (8bab26f4f 2026-07-14)"),
-        ]
-        .concat(),
-    )
-    .expect("write");
-    let report = scan_tree(&d, TRUST).expect("scan");
-    assert_eq!(report.objects, 3);
-    let files: Vec<&str> = report.findings.iter().map(|f| f.file.as_str()).collect();
-    assert_eq!(files, vec!["bin/ay", "lib/rustlib/t/lib/libstd-1.rlib"]);
-}
-
-// Compiler admission.
+// --- compiler admission ------------------------------------------------------------------
 
 fn trust_vv(commit: &str) -> String {
     format!(
@@ -413,22 +390,6 @@ fn seed_mint(root: &Path, commit: &str, kv: &[(&str, &str)]) {
         sha(&root.join("lib/librustc_driver-0123456789abcdef.dylib"))
     ));
     std::fs::write(root.join(SEED_MINT_FILE), text).expect("write SEED-MINT");
-}
-
-#[test]
-fn a_script_trustc_is_refused_before_it_runs() {
-    let (_dir, d) = tmp("script");
-    let bin = toolchain(&d, b"");
-    std::fs::write(
-        bin.join("trustc"),
-        b"#!/bin/sh\nexec \"$HOME/.cargo/bin/rustc\" \"$@\"\n",
-    )
-    .expect("write");
-    let err = check_compiler_with(&bin, LineagePolicy::Dormant, &never_run).expect_err("a script");
-    assert!(
-        err.iter().any(|l| l.contains("interpreter script")),
-        "{err:?}"
-    );
 }
 
 /// Sh wrappers named trustc/targo that exec rustup's stable and sed its identity into Trust's.
@@ -627,56 +588,45 @@ fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
         r.into_iter().next().unwrap_or_default()
     };
     assert_eq!(only(&[]), "");
-    assert!(only(&[("source_commit", "4444444444444444444444444444444444444444")])
-        .starts_with(&format!("SEED-MINT was minted for 4444444444444444444444444444444444444444, not for this seal's compiler {TRUST}")));
-    assert!(
-        only(&[("ddc_seed_relation", "reproducibility-control")])
-            .starts_with("SEED-MINT records a reproducibility control, not a double compile")
-    );
-    assert_eq!(
-        only(&[("ddc_seed_relation", "ddc")]),
-        "SEED-MINT records no double compile against another compiler (ddc_seed_relation 'ddc')"
-    );
-    assert!(
-        only(&[("ddc_verdict", "DIFFERENT")]).starts_with(
-            "SEED-MINT does not record byte-identical stage2 trees from the two seeds"
-        )
-    );
-    // The double compile's substance, not its verdict word: two seeds that built
-    // different stage2 trees are refused even beside `ddc_verdict=identical`, and so is a
-    // pair of equal digests that are no sha256.
+    // Each defect alone: one refusal, carrying the value that names it. The double
+    // compile's substance counts, not its verdict word: two seeds that built different
+    // stage2 trees are refused even beside `ddc_verdict=identical`, and so is a pair of
+    // equal digests that are no sha256.
     let other_tree = "b".repeat(64);
-    assert_eq!(
-        only(&[("stage2_tree_sha256_ddc_seed", other_tree.as_str())]),
-        format!(
-            "SEED-MINT does not record byte-identical stage2 trees from the two seeds (verdict \
-             'identical', pinned seed {}, DDC seed {other_tree})",
-            "a".repeat(64)
-        )
-    );
-    assert!(
-        only(&[
-            ("stage2_tree_sha256_pinned_seed", "tree"),
-            ("stage2_tree_sha256_ddc_seed", "tree")
-        ])
-        .starts_with("SEED-MINT does not record byte-identical stage2 trees from the two seeds")
-    );
-    assert!(
-        only(&[("repin_compiler_git_commit_hash", "")])
-            .starts_with("SEED-MINT records no re-pin of src/stage0 to this compiler")
-    );
-    assert!(
-        only(&[("schema", "v0")])
-            .starts_with("SEED-MINT is not a trust-seed-mint-v1 receipt (schema 'v0')")
-    );
+    for (kv, names) in [
+        (
+            &[("source_commit", "4444444444444444444444444444444444444444")][..],
+            "4444444444444444444444444444444444444444",
+        ),
+        (
+            &[("ddc_seed_relation", "reproducibility-control")][..],
+            "reproducibility",
+        ),
+        (&[("ddc_seed_relation", "ddc")][..], "'ddc'"),
+        (&[("ddc_verdict", "DIFFERENT")][..], "'DIFFERENT'"),
+        (
+            &[("stage2_tree_sha256_ddc_seed", other_tree.as_str())][..],
+            other_tree.as_str(),
+        ),
+        (
+            &[
+                ("stage2_tree_sha256_pinned_seed", "tree"),
+                ("stage2_tree_sha256_ddc_seed", "tree"),
+            ][..],
+            "stage2",
+        ),
+        (&[("repin_compiler_git_commit_hash", "")][..], "stage0"),
+        (&[("schema", "v0")][..], "'v0'"),
+    ] {
+        let refusal = only(kv);
+        assert!(refusal.contains(names), "{kv:?}: {refusal}");
+    }
     // A compared file that is not the seal's.
     seed_mint(&d, TRUST, &[]);
     std::fs::write(d.join("bin/trustc"), object(b"swapped")).expect("write");
     let r = seed_mint_refusals(&d, TRUST);
-    assert_eq!(
-        r,
-        vec!["SEED-MINT does not describe this seal: 1 of its 2 compared entries are missing or differ here — bin/trustc".to_string()]
-    );
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(r[0].ends_with("bin/trustc"), "{r:?}");
     // A compared link repointed after the cut.
     #[cfg(unix)]
     {
@@ -702,135 +652,5 @@ fn each_seed_mint_defect_alone_is_one_refusal_naming_it() {
     );
     // No receipt at all.
     std::fs::remove_file(d.join(SEED_MINT_FILE)).expect("rm");
-    assert!(seed_mint_refusals(&d, TRUST)[0].starts_with("the seal carries no SEED-MINT"));
-}
-
-/// The bundle's round trip: a seal admitted by SEED-MINT is staged, its bytes change, LINEAGE
-/// is stamped over the shipped bytes and admits them, and an edit to the record or a byte it
-/// names is refused.
-#[test]
-fn a_stamped_lineage_admits_the_shipped_bytes_and_refuses_an_edit() {
-    let (_dir, d) = tmp("stamp");
-    let seal = d.join("seal");
-    let seal_bin = toolchain(&seal, b"");
-    seed_mint(&seal, TRUST, &[]);
-    let stage = d.join("stage");
-    toolchain(&stage, b"stripped");
-    std::fs::copy(seal.join(SEED_MINT_FILE), stage.join(SEED_MINT_FILE)).expect("copy receipt");
-    let probe = probe_says(trust_vv(TRUST));
-    // Before the stamp, the stripped bytes are not what SEED-MINT compared.
-    assert!(check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe).is_err());
-    // The stamp vouches only for the source's own compiler and receipt: a staged trustc of
-    // another commit, or a staged SEED-MINT other than the source's, stamps nothing.
-    let other = "4444444444444444444444444444444444444444";
-    let staged = |p: &Path| p.components().any(|c| c.as_os_str() == "stage");
-    let stage_says_other = |p: &Path| Ok(trust_vv(if staged(p) { other } else { TRUST }));
-    let err = stamp_with(&stage, &seal_bin, &stage_says_other).expect_err("another commit");
-    assert!(
-        err.iter()
-            .any(|l| l.contains(&format!("the staged bin/trustc reports {other}"))),
-        "{err:?}"
-    );
-    seed_mint(&stage, TRUST, &[("pinned_seed_commit", other)]);
-    let err = stamp_with(&stage, &seal_bin, &probe).expect_err("another staged receipt");
-    assert!(
-        err.iter().any(|l| l.contains("the staged SEED-MINT is")),
-        "{err:?}"
-    );
-    assert!(!stage.join(LINEAGE_FILE).exists());
-    std::fs::copy(seal.join(SEED_MINT_FILE), stage.join(SEED_MINT_FILE)).expect("restore");
-    let text = stamp_with(&stage, &seal_bin, &probe).expect("stamp");
-    assert!(
-        text.contains(&format!("trustc_sha256={}", sha(&stage.join("bin/trustc")))),
-        "{text}"
-    );
-    let admitted =
-        check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe).expect("admitted");
-    assert!(matches!(admitted.lineage, LineageProof::Lineage { .. }));
-
-    // Tamper with the record.
-    let rec = std::fs::read_to_string(stage.join(LINEAGE_FILE)).expect("read");
-    std::fs::write(
-        stage.join(LINEAGE_FILE),
-        rec.replace(
-            "ddc_seed_relation=pin-ancestor",
-            "ddc_seed_relation=lineage-disjoint",
-        ),
-    )
-    .expect("write");
-    let err = check_compiler_with(&stage.join("bin"), LineagePolicy::Dormant, &probe)
-        .expect_err("edited record");
-    assert!(
-        err.iter().any(|l| l.contains("ddc_seed_relation")),
-        "{err:?}"
-    );
-    std::fs::write(stage.join(LINEAGE_FILE), &rec).expect("restore");
-    // Tamper with a byte it names.
-    std::fs::write(stage.join("bin/targo"), object(b"targo swapped")).expect("write");
-    let err = check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
-        .expect_err("edited bytes");
-    assert!(err.iter().any(|l| l.contains("bin/targo")), "{err:?}");
-    std::fs::write(stage.join("bin/targo"), object(b"targo stripped")).expect("restore");
-    check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
-        .expect("the restored tree is admitted again");
-    // Swap the driver: nothing but the record's digest names the driver a stamped tree runs.
-    let driver = stage.join("lib/librustc_driver-0123456789abcdef.dylib");
-    let shipped_driver = std::fs::read(&driver).expect("read driver");
-    std::fs::write(&driver, object(b"driver swapped")).expect("write");
-    let err = check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
-        .expect_err("swapped driver");
-    assert!(
-        err.iter().any(|l| l.contains("records the driver as")),
-        "{err:?}"
-    );
-    std::fs::write(&driver, shipped_driver).expect("restore");
-    // Replace SEED-MINT with another receipt of the same commit that passes every check of
-    // its own: the record is bound to the receipt it was stamped against.
-    let stamped_mint = std::fs::read(stage.join(SEED_MINT_FILE)).expect("read receipt");
-    seed_mint(
-        &stage,
-        TRUST,
-        &[(
-            "pinned_seed_commit",
-            "4444444444444444444444444444444444444444",
-        )],
-    );
-    let err = check_compiler_with(&stage.join("bin"), LineagePolicy::Dormant, &probe)
-        .expect_err("another receipt");
-    assert!(
-        err.iter()
-            .any(|l| l.contains("but the tree's SEED-MINT is")),
-        "{err:?}"
-    );
-    std::fs::write(stage.join(SEED_MINT_FILE), &stamped_mint).expect("restore");
-    // …and the record's own digest of it, edited.
-    let receipt = format!(
-        "lineage_receipt_sha256={}",
-        aterm_codec::hex::encode_lower(&Sha256::digest(&stamped_mint))
-    );
-    assert!(rec.contains(&receipt), "{rec}");
-    std::fs::write(
-        stage.join(LINEAGE_FILE),
-        rec.replace(
-            &receipt,
-            &format!("lineage_receipt_sha256={}", "0".repeat(64)),
-        ),
-    )
-    .expect("write");
-    let err = check_compiler_with(&stage.join("bin"), LineagePolicy::Dormant, &probe)
-        .expect_err("edited receipt digest");
-    assert!(
-        err.iter()
-            .any(|l| l.contains(&format!("names SEED-MINT {}", "0".repeat(64)))),
-        "{err:?}"
-    );
-    std::fs::write(stage.join(LINEAGE_FILE), &rec).expect("restore");
-    check_compiler_with(&stage.join("bin"), LineagePolicy::Require, &probe)
-        .expect("the restored tree is admitted again");
-
-    // A source whose lineage is unproven stamps nothing.
-    std::fs::remove_file(seal.join(SEED_MINT_FILE)).expect("rm");
-    let _ = std::fs::remove_file(stage.join(LINEAGE_FILE));
-    assert!(stamp_with(&stage, &seal_bin, &probe).is_err());
-    assert!(!stage.join(LINEAGE_FILE).exists());
+    assert_eq!(seed_mint_refusals(&d, TRUST).len(), 1);
 }

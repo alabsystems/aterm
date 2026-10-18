@@ -33,7 +33,7 @@ fn char_width(c: char, cjk: bool) -> usize {
         1
     } else if (0x4E00..0xA000).contains(&cp) {
         // Uniformly East Asian Wide in both modes (checked exhaustively by
-        // `fast_path_width_matches_table_cjk_block`).
+        // `fast_path_width_matches_table`).
         2
     } else if (0x3000..0x4E00).contains(&cp) {
         // U+3000-U+4DFF (CJK symbols, kana, bopomofo, compatibility jamo, Yijing
@@ -125,16 +125,16 @@ impl TerminalHandler<'_> {
     /// Write a character to the grid with the current style: the altscreen
     /// model's `WriteMain` or `Scribble`, depending on the active buffer.
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "alt_screen",
             action = "WriteMain",
             project = "aterm_core::terminal::project_altscreen"
         )
     )]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "alt_screen",
             action = "Scribble",
             project = "aterm_core::terminal::project_altscreen"
@@ -494,6 +494,11 @@ impl TerminalHandler<'_> {
         // overstrikes the margin column (re-armed by the no-wrap advance below).
         if self.modes.auto_wrap {
             self.grid.resolve_pending_wrap();
+            // A cursor past a double-width row's half wraps first, as the run writers do;
+            // the wide branch below pre-wraps on its own.
+            if width == 1 {
+                self.grid.wrap_if_past_print_edge();
+            }
         } else {
             self.grid.set_pending_wrap(false);
         }
@@ -824,6 +829,9 @@ impl TerminalHandler<'_> {
         // drop the extras they carried (`Grid::drop_unclaimed_extras`).
         self.grid
             .drop_unclaimed_extras(row, cont_col..cont_col.saturating_add(2));
+        // It drops the replaced cell's dense-RGB-ring bytes too: reads consult them
+        // before the map entry the mirror below writes.
+        self.grid.clear_rgb_ring_cells(row, cont_col, 1);
 
         // The spacer also inherits the base's rendition values (truecolor fg/bg,
         // SGR 58 underline colour): the base was written narrow, so its extras
@@ -1159,23 +1167,6 @@ mod tests {
         );
     }
 
-    /// The cell-under-cursor fallback applies only when there is no cell to the
-    /// left; otherwise the left cell wins.
-    #[test]
-    fn a_combining_mark_still_prefers_the_cell_to_its_left() {
-        let mut term = Terminal::new(1, 8);
-        term.process("ab\u{301}".as_bytes());
-        assert_eq!(
-            term.grid().cell_extra(0, 1).map(|e| e.combining()),
-            Some(['\u{301}'].as_slice()),
-            "the mark attaches to 'b', the cell left of the cursor"
-        );
-        assert!(
-            term.grid().cell_extra(0, 0).is_none(),
-            "and not to the cell under the cursor, which is past the text"
-        );
-    }
-
     /// England: 🏴 + gbeng + CANCEL TAG is one two-cell grapheme whose six
     /// tags all attach to the lead cell (well under `MAX_COMBINING`).
     #[test]
@@ -1196,17 +1187,6 @@ mod tests {
         }
     }
 
-    /// VS16 keeps its own arm: a zero-width selector that also widens the base.
-    #[test]
-    fn vs16_widening_is_unchanged() {
-        for term in whole_and_fragmented("\u{2764}\u{FE0F}X") {
-            let grid = term.grid();
-            assert!(grid.cell(0, 0).is_some_and(|c| c.is_wide()));
-            assert_eq!(grid.cell(0, 2).map(|c| c.char()), Some('X'));
-            assert_eq!(term.cursor().col, 3);
-        }
-    }
-
     /// VS16 widens exactly the bases Unicode gives an emoji presentation
     /// sequence (`Emoji=Yes`, `Emoji_Presentation=No`): `⬆️` is two cells, as
     /// `wcwidth`, `string-width` and every other terminal count it, so the
@@ -1215,7 +1195,8 @@ mod tests {
     #[test]
     fn vs16_widens_exactly_the_text_default_emoji() {
         for (text, wide, x_col) in [
-            ("\u{2B06}\u{FE0F}X", true, 2u16),
+            ("\u{2764}\u{FE0F}X", true, 2u16),
+            ("\u{2B06}\u{FE0F}X", true, 2),
             ("\u{2B05}\u{FE0F}X", true, 2),
             ("\u{2713}\u{FE0F}X", false, 1),
             ("\u{2605}\u{FE0F}X", false, 1),
@@ -1231,26 +1212,6 @@ mod tests {
                 assert_eq!(grid.cell(0, x_col).map(|c| c.char()), Some('X'), "{text:?}");
                 assert_eq!(term.cursor().col, x_col + 1, "{text:?}");
             }
-        }
-    }
-
-    /// Exhaustive parity guard for the CJK fast path over U+3000..U+A000:
-    /// `char_width` agrees with the `aterm_grapheme` table in both ambiguous-width
-    /// modes, since reflow/materialize/fill recompute width from the table.
-    #[test]
-    fn fast_path_width_matches_table_cjk_block() {
-        for cp in 0x3000u32..0xA000 {
-            let c = char::from_u32(cp).expect("U+3000..U+A000 are all BMP scalar values");
-            assert_eq!(
-                char_width(c, false),
-                aterm_grapheme::char_width(c),
-                "non-CJK (ambiguous=narrow) width mismatch at U+{cp:04X}"
-            );
-            assert_eq!(
-                char_width(c, true),
-                aterm_grapheme::char_width_cjk(c),
-                "CJK (ambiguous=wide) width mismatch at U+{cp:04X}"
-            );
         }
     }
 
@@ -1274,17 +1235,30 @@ mod tests {
         }
     }
 
-    /// Exhaustive parity guard for the hardcoded `(0xAC00..0xD7A4) => 2` Hangul
-    /// arm against the table: catches its width drifting from 2 and its bound
-    /// widening past U+D7A3 (U+D7A4..U+D7AF is narrow; Jamo Extended-B's vowels
-    /// U+D7B0..U+D7C6 and finals U+D7CB..U+D7FB are zero-width). Hangul Jamo
-    /// (U+1100..U+11FF) is swept too. Parity cannot catch the arm narrowing (the
-    /// generic tail uses the same table), hence the absolute pins below.
+    /// Exhaustive parity guard for the width fast paths: `char_width` must
+    /// agree with the `aterm_grapheme` table for every codepoint of each block
+    /// it special-cases, in both ambiguous-width modes, since
+    /// reflow/materialize/fill recompute width from the table.
+    ///
+    /// The CJK sweep (U+3000..U+A000) covers the Yijing hexagrams, U+303F, the
+    /// ambiguous run U+3248-U+324F, the tone marks U+302E/U+302F and the narrow
+    /// gaps. The Hangul sweep catches the hardcoded `(0xAC00..0xD7A4) => 2`
+    /// arm's width drifting from 2 and its upper bound widening past U+D7A3
+    /// (U+D7A4..U+D7AF is narrow; Jamo Extended-B's vowels and finals are
+    /// zero-width). The Miscellaneous Symbols and Dingbats sweep
+    /// (U+2600..U+27BF, the `BMP_EMOJI_WIDTH2` bitmap) holds 80 East Asian
+    /// Ambiguous symbols a bitmap miss once measured narrow in wide mode too.
+    ///
+    /// Parity holds vacuously if the table itself drifted, hence the absolute
+    /// pins below. The `write_unicode_bulk` copies of the literals decide
+    /// batching, not width, and are not covered.
     #[test]
-    fn fast_path_width_matches_table_hangul_blocks() {
-        // (block, half-open range) — Jamo, Jamo Extended-A, the Syllables plus
-        // the unassigned tail U+D7A4..U+D7AF, and Jamo Extended-B.
+    fn fast_path_width_matches_table() {
+        // (block, half-open range); the Hangul Syllables range includes the
+        // unassigned tail U+D7A4..U+D7AF.
         let blocks: &[(&str, std::ops::Range<u32>)] = &[
+            ("Misc Symbols and Dingbats", 0x2600..0x27C0),
+            ("CJK", 0x3000..0xA000),
             ("Hangul Jamo", 0x1100..0x1200),
             ("Hangul Jamo Extended-A", 0xA960..0xA980),
             ("Hangul Syllables", 0xAC00..0xD7B0),
@@ -1292,7 +1266,7 @@ mod tests {
         ];
         for (block, range) in blocks {
             for cp in range.clone() {
-                let c = char::from_u32(cp).expect("all four blocks are BMP scalar values");
+                let c = char::from_u32(cp).expect("every block is BMP scalar values");
                 assert_eq!(
                     char_width(c, false),
                     aterm_grapheme::char_width(c),
@@ -1305,9 +1279,10 @@ mod tests {
                 );
             }
         }
-        // Parity holds vacuously if the table itself went narrow, so pin the
-        // absolute width at both ends and the middle of the syllable range, in
-        // both ambiguous-width modes.
+        // Absolute pins: ★ (EAW A) and ✨ (EAW W, a bitmap hit), and both ends
+        // and the middle of the syllable range in both ambiguous-width modes.
+        assert_eq!((char_width('★', false), char_width('★', true)), (1, 2));
+        assert_eq!((char_width('✨', false), char_width('✨', true)), (2, 2));
         for c in ['\u{AC00}', '\u{D55C}', '\u{AD6D}', '\u{C5B4}', '\u{D7A3}'] {
             assert_eq!(
                 char_width(c, false),
@@ -1356,31 +1331,6 @@ mod tests {
         assert_eq!(char_width('\u{3040}', false), 1); // unassigned -> narrow
         assert_eq!(char_width('\u{4E00}', false), 2); // CJK ideograph
         assert_eq!(char_width('\u{9FFF}', false), 2); // end of ideograph block
-    }
-
-    /// Exhaustive parity guard for the Miscellaneous Symbols and Dingbats arm
-    /// (U+2600..U+27BF, the `BMP_EMOJI_WIDTH2` bitmap) in both ambiguous-width
-    /// modes; its 80 East Asian Ambiguous symbols (★ ☆ ♠ ♥ ♪ ☎ ❶ …) must
-    /// measure wide in wide mode on a bitmap miss.
-    #[test]
-    fn fast_path_width_matches_table_misc_symbols_and_dingbats() {
-        for cp in 0x2600u32..0x27C0 {
-            let c = char::from_u32(cp).expect("U+2600..U+27BF are all BMP scalar values");
-            assert_eq!(
-                char_width(c, false),
-                aterm_grapheme::char_width(c),
-                "non-CJK (ambiguous=narrow) width mismatch at U+{cp:04X}"
-            );
-            assert_eq!(
-                char_width(c, true),
-                aterm_grapheme::char_width_cjk(c),
-                "CJK (ambiguous=wide) width mismatch at U+{cp:04X}"
-            );
-        }
-        // Parity alone holds if the table went narrow: pin ★ (EAW A) and ✨
-        // (EAW W, a bitmap hit) absolutely.
-        assert_eq!((char_width('★', false), char_width('★', true)), (1, 2));
-        assert_eq!((char_width('✨', false), char_width('✨', true)), (2, 2));
     }
 
     /// End to end with `ambiguous_width = "wide"`: an EAW=A symbol from U+2600..

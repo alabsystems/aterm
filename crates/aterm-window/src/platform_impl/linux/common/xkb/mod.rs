@@ -4,7 +4,9 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/common/xkb/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
+// Modified by the aterm project in 2026; see the repository NOTICE. (libxkbcommon's entry
+// points, types and keysyms are first-party aterm-xkb's, read at run time, where upstream
+// used xkbcommon-dl and xkeysym: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 use std::ops::Deref;
 use std::os::raw::c_char;
@@ -12,16 +14,10 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::keyboard::SmolStr;
-use crate::utils::Lazy;
-#[cfg(wayland_platform)]
-use std::os::unix::io::OwnedFd;
-use tracing::warn;
-use xkbcommon_dl::{
-    self as xkb, xkb_compose_status, xkb_context, xkb_context_flags, xkbcommon_compose_handle,
-    xkbcommon_handle, XkbCommon, XkbCommonCompose,
-};
 #[cfg(x11_platform)]
-use {x11_dl::xlib_xcb::xcb_connection_t, xkbcommon_dl::x11::xkbcommon_x11_handle};
+use aterm_xkb::XcbConnection as xcb_connection_t;
+use aterm_xkb::{self as xkb, compose_status, Xkb as XkbCommon, XkbCompose as XkbCommonCompose};
+use tracing::warn;
 
 use crate::event::{ElementState, KeyEvent};
 use crate::keyboard::{Key, KeyLocation};
@@ -41,10 +37,22 @@ pub use state::XkbState;
 // TODO: Wire this up without using a static `AtomicBool`.
 static RESET_DEAD_KEYS: AtomicBool = AtomicBool::new(false);
 
-static XKBH: Lazy<&'static XkbCommon> = Lazy::new(xkbcommon_handle);
-static XKBCH: Lazy<&'static XkbCommonCompose> = Lazy::new(xkbcommon_compose_handle);
+/// libxkbcommon's table. aterm-xkb loads it once per process; a missing library panics, as
+/// upstream's `xkbcommon_handle` did, and `Context::new` checks first.
+fn xkbh() -> &'static XkbCommon {
+    xkb::xkb().expect("Library libxkbcommon.so could not be loaded.")
+}
+
+/// libxkbcommon's compose table.
+fn xkbch() -> &'static XkbCommonCompose {
+    xkb::compose().expect("Library libxkbcommon.so could not be loaded.")
+}
+
+/// libxkbcommon-x11's table.
 #[cfg(feature = "x11")]
-static XKBXH: Lazy<&'static xkb::x11::XkbCommonX11> = Lazy::new(xkbcommon_x11_handle);
+fn xkbxh() -> &'static xkb::XkbX11 {
+    xkb::x11().expect("Library libxkbcommon-x11.so could not be loaded.")
+}
 
 #[inline(always)]
 pub fn reset_dead_keys() {
@@ -73,7 +81,7 @@ pub struct Context {
 
 impl Context {
     pub fn new() -> Result<Self, Error> {
-        if xkb::xkbcommon_option().is_none() {
+        if xkb::xkb().is_err() || xkb::compose().is_err() {
             return Err(Error::XKBNotFound);
         }
 
@@ -105,11 +113,11 @@ impl Context {
     #[cfg(feature = "x11")]
     pub fn from_x11_xkb(xcb: *mut xcb_connection_t) -> Result<Self, Error> {
         let result = unsafe {
-            (XKBXH.xkb_x11_setup_xkb_extension)(
+            (xkbxh().setup_xkb_extension)(
                 xcb,
                 1,
                 2,
-                xkbcommon_dl::x11::xkb_x11_setup_xkb_extension_flags::XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS,
+                xkb::X11_SETUP_NO_FLAGS,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -122,7 +130,7 @@ impl Context {
         }
 
         let mut this = Self::new()?;
-        this.core_keyboard_id = unsafe { (XKBXH.xkb_x11_get_core_keyboard_device_id)(xcb) };
+        this.core_keyboard_id = unsafe { (xkbxh().get_core_keyboard_device_id)(xcb) };
         this.set_keymap_from_x11(xcb);
         Ok(this)
     }
@@ -135,9 +143,10 @@ impl Context {
         self.keymap.as_mut()
     }
 
+    /// Compile the keymap a compositor sent (its text, as aterm-wayland's seat read it).
     #[cfg(wayland_platform)]
-    pub fn set_keymap_from_fd(&mut self, fd: OwnedFd, size: usize) {
-        let keymap = XkbKeymap::from_fd(&self.context, fd, size);
+    pub fn set_keymap_from_text(&mut self, text: &[u8]) {
+        let keymap = XkbKeymap::from_text(&self.context, text);
         let state = keymap.as_ref().and_then(XkbState::new_wayland);
         if keymap.is_none() || state.is_none() {
             warn!("failed to update xkb keymap");
@@ -216,7 +225,7 @@ impl KeyContext<'_> {
         self.scratch_buffer.reserve(8);
         loop {
             let bytes_written = unsafe {
-                (XKBH.xkb_keysym_to_utf8)(
+                (xkbh().keysym_to_utf8)(
                     keysym,
                     self.scratch_buffer.as_mut_ptr().cast(),
                     self.scratch_buffer.capacity(),
@@ -268,7 +277,7 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
             Err(undefined) => undefined,
         };
 
-        if let ComposeStatus::Accepted(xkb_compose_status::XKB_COMPOSE_COMPOSING) = self.compose {
+        if let ComposeStatus::Accepted(compose_status::COMPOSING) = self.compose {
             let compose_state = self.context.compose_state2.as_mut().unwrap();
             // When pressing a dead key twice, the non-combining variant of that character will
             // be produced. Since this function only concerns itself with a single keypress, we
@@ -338,13 +347,13 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
     fn composed_text(&mut self) -> Result<Option<SmolStr>, ()> {
         match self.compose {
             ComposeStatus::Accepted(status) => match status {
-                xkb_compose_status::XKB_COMPOSE_COMPOSED => {
+                compose_status::COMPOSED => {
                     let state = self.context.compose_state1.as_mut().unwrap();
                     Ok(state.get_string(self.context.scratch_buffer))
                 },
-                xkb_compose_status::XKB_COMPOSE_COMPOSING
-                | xkb_compose_status::XKB_COMPOSE_CANCELLED => Ok(None),
-                xkb_compose_status::XKB_COMPOSE_NOTHING => Err(()),
+                compose_status::COMPOSING | compose_status::CANCELLED => Ok(None),
+                // NOTHING, and any status a later libxkbcommon adds.
+                _ => Err(()),
             },
             _ => Err(()),
         }
@@ -353,12 +362,12 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
 
 #[derive(Debug)]
 pub struct XkbContext {
-    context: NonNull<xkb_context>,
+    context: NonNull<xkb::XkbContext>,
 }
 
 impl XkbContext {
     pub fn new() -> Result<Self, Error> {
-        let context = unsafe { (XKBH.xkb_context_new)(xkb_context_flags::XKB_CONTEXT_NO_FLAGS) };
+        let context = unsafe { (xkbh().context_new)(xkb::context_flags::NO_FLAGS) };
 
         let context = match NonNull::new(context) {
             Some(context) => context,
@@ -372,13 +381,13 @@ impl XkbContext {
 impl Drop for XkbContext {
     fn drop(&mut self) {
         unsafe {
-            (XKBH.xkb_context_unref)(self.context.as_ptr());
+            (xkbh().context_unref)(self.context.as_ptr());
         }
     }
 }
 
 impl Deref for XkbContext {
-    type Target = NonNull<xkb_context>;
+    type Target = NonNull<xkb::XkbContext>;
 
     fn deref(&self) -> &Self::Target {
         &self.context

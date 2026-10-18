@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use aterm_spec::derive::{Model, atpkg_full_pass_rule_model};
+use aterm_models_atpkg::atpkg_full_pass_rule_model;
+use aterm_spec::derive::Model;
 use aterm_update_core::pkg_check::{FULL_PASS_INTERVAL_SECS, PassOutcome, Stamps};
 
 type State = std::collections::BTreeMap<&'static str, i64>;

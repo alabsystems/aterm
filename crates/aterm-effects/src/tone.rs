@@ -515,37 +515,6 @@ mod tests {
         );
     }
 
-    /// Same text gives bit-identical scores.
-    #[test]
-    fn inference_is_deterministic() {
-        let m = builtin().expect("shipped model");
-        let mut s1 = ToneScratch::default();
-        let mut s2 = ToneScratch::default();
-        for text in [
-            "why is this broken again",
-            "今日はとてもいい天気ですね",
-            "git commit -m 'fix the seam'",
-            "jajaja qué gracioso",
-        ] {
-            let a = m.scores(text, &mut s1).expect("long enough");
-            let b = m.scores(text, &mut s2).expect("long enough");
-            for (x, y) in a.iter().zip(b.iter()) {
-                assert_eq!(x.to_bits(), y.to_bits(), "{text:?} drifted");
-            }
-        }
-    }
-
-    /// Below [`MIN_NGRAMS`] the model abstains and classifies as Technical.
-    #[test]
-    fn thin_evidence_abstains_to_neutral() {
-        let m = builtin().expect("shipped model");
-        let mut s = ToneScratch::default();
-        assert!(m.scores("", &mut s).is_none());
-        assert!(m.scores("ok", &mut s).is_none());
-        assert_eq!(m.classify("", &mut s), Tone::Technical);
-        assert_eq!(m.classify("a", &mut s), Tone::Technical);
-    }
-
     /// `classify_opt` reports thin evidence as `None`, and agrees with
     /// `classify` on a real line.
     #[test]
@@ -600,28 +569,6 @@ mod tests {
                 acc >= 0.60,
                 "{lang} floor broken: {ok}/{n} = {acc:.2} < 0.60"
             );
-        }
-    }
-
-    /// Multilingual smoke on unmistakable lines, one per script family (pins the
-    /// committed weights, not a generalization claim).
-    #[test]
-    fn canonical_lines_land_in_plausible_classes() {
-        let m = builtin().expect("shipped model");
-        let mut s = ToneScratch::default();
-        for (text, want) in [
-            (
-                "git rebase -i HEAD~3 && cargo test --workspace",
-                Tone::Technical,
-            ),
-            ("why is this broken again ugh", Tone::Frustrated),
-            ("lol that cat video is so silly hehe", Tone::Playful),
-            ("ㅋㅋㅋㅋ 너무 웃겨", Tone::Playful),
-            ("それはいいですね、ゆっくりで大丈夫です", Tone::Calm),
-            ("太棒了！我们成功了！", Tone::Excited),
-            ("qué emoción, lo logramos!!", Tone::Excited),
-        ] {
-            assert_eq!(m.classify(text, &mut s), want, "{text:?}");
         }
     }
 

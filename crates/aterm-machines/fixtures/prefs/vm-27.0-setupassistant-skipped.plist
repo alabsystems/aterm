@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>DidSeeAccessibility</key>
+	<true/>
+	<key>DidSeeActivationLock</key>
+	<true/>
+	<key>DidSeeAppStore</key>
+	<true/>
+	<key>DidSeeAppearance</key>
+	<true/>
+	<key>DidSeeAppearanceSetup</key>
+	<true/>
+	<key>DidSeeApplePaySetup</key>
+	<true/>
+	<key>DidSeeAutoUpdatePrompt</key>
+	<true/>
+	<key>DidSeeAvatarSetup</key>
+	<true/>
+	<key>DidSeeCloudSetup</key>
+	<true/>
+	<key>DidSeeLockdownMode</key>
+	<true/>
+	<key>DidSeeNewFeaturesProductVersion</key>
+	<string>27.0</string>
+	<key>DidSeePrivacy</key>
+	<true/>
+	<key>DidSeeScreenTime</key>
+	<true/>
+	<key>DidSeeSiriSetup</key>
+	<true/>
+	<key>DidSeeSyncSetup</key>
+	<true/>
+	<key>DidSeeSyncSetup2</key>
+	<true/>
+	<key>DidSeeTermsOfAddress</key>
+	<true/>
+	<key>DidSeeTouchIDSetup</key>
+	<true/>
+	<key>DidSeeiCloudLoginForStorageServices</key>
+	<true/>
+	<key>LastSeenAgeRangeSelectionProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeenBuddyBuildVersion</key>
+	<string>26A428</string>
+	<key>LastSeenCloudProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeenDiagnosticsProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeenGlassTintUpsellProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeenIntelligenceProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeenSiriProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeenStorageServicesProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeenSyncProductVersion</key>
+	<string>27.0</string>
+	<key>LastSeeniCloudStorageServicesProductVersion</key>
+	<string>27.0</string>
+</dict>
+</plist>

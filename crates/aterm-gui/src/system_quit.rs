@@ -21,8 +21,17 @@
 //! start. The mark is now the generation of the `terminate:` it came with
 //! (`menu`'s arbiter mints it), and every cancel of that generation forgets it
 //! (`menu::cancel_native_termination`, `menu::cancel_current_native_termination`).
+//!
+//! THE WINDOW SYSTEM GOING AWAY IS ONE TOO (COMPOSITOR-GONE, the Linux lane,
+//! 2026-10-16). When the display connection fails under a running window (a
+//! Wayland compositor or an X server that crashed or restarted), the event
+//! loop ends with an error, and the run ends the way a logout ends it: the
+//! ordinary quit, its manifest keeping the agents
+//! ([`note_window_system_gone`]), then exit status
+//! [`EXIT_WINDOW_SYSTEM_GONE`]. Nothing cancels it: there is no window left to
+//! answer a Cancel in.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// `keyAEQuitReason`, `'why?'`. The quit reason is read only off macOS's quit
 /// Apple Event (`menu::terminate_is_the_systems`).
@@ -38,6 +47,14 @@ const SYSTEM_REASONS: [[u8; 4]; 6] = [*b"logo", *b"rlgo", *b"rrst", *b"rest", *b
 /// The generation of the quit the system asked for, or `0` for none (the
 /// arbiter mints generations from `1`).
 static SYSTEM_QUIT: AtomicU64 = AtomicU64::new(0);
+
+/// The window system went away under this process ([`note_window_system_gone`]).
+static WINDOW_SYSTEM_GONE: AtomicBool = AtomicBool::new(false);
+
+/// The exit status of a run whose window system went away under it:
+/// `EX_UNAVAILABLE` (sysexits), nonzero, so whatever started aterm sees an end
+/// nobody chose.
+pub(crate) const EXIT_WINDOW_SYSTEM_GONE: i32 = 69;
 
 /// Whether quit reason `code` is a logout, a restart or a shutdown.
 #[cfg(any(target_os = "macos", test))]
@@ -63,9 +80,16 @@ pub(crate) fn forget(generation: u64) {
     let _ = SYSTEM_QUIT.compare_exchange(generation, 0, Ordering::SeqCst, Ordering::SeqCst);
 }
 
-/// Whether the system asked this process to quit, by a quit nobody cancelled.
+/// The window system went away under this process: its quit is the
+/// system's, as a logout's is, for the rest of the run.
+pub(crate) fn note_window_system_gone() {
+    WINDOW_SYSTEM_GONE.store(true, Ordering::SeqCst);
+}
+
+/// Whether the system asked this process to quit, by a quit nobody cancelled,
+/// or its window system went away.
 pub(crate) fn asked() -> bool {
-    SYSTEM_QUIT.load(Ordering::SeqCst) != 0
+    SYSTEM_QUIT.load(Ordering::SeqCst) != 0 || WINDOW_SYSTEM_GONE.load(Ordering::SeqCst)
 }
 
 /// Whether the quit of `generation` is the system's.
@@ -79,6 +103,7 @@ pub(crate) fn asked_for(generation: u64) -> bool {
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
     SYSTEM_QUIT.store(0, Ordering::SeqCst);
+    WINDOW_SYSTEM_GONE.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -144,6 +169,26 @@ mod tests {
         forget(person);
         assert!(asked_for(person + 100));
         forget(person + 100);
+        assert!(!asked());
+    }
+
+    /// A WINDOW SYSTEM THAT WENT AWAY MAKES THE QUIT THE SYSTEM'S, so the
+    /// manifest keeps the agents as a logout's does, and no cancel of any
+    /// generation unmarks it: no window is left to answer a Cancel in.
+    #[test]
+    fn a_gone_window_system_marks_the_quit_and_no_cancel_unmarks_it() {
+        use crate::menu::{NativeTerminateDecision, admit_native_terminate};
+        let _serial = crate::menu::terminate_test_serial();
+        assert!(!asked());
+        note_window_system_gone();
+        assert!(asked());
+        let NativeTerminateDecision::Dispatch(generation) = admit_native_terminate(false) else {
+            panic!("a first request dispatches");
+        };
+        assert!(crate::menu::cancel_current_native_termination());
+        forget(generation);
+        assert!(asked(), "a cancel unmarked a gone window system's quit");
+        clear_for_test();
         assert!(!asked());
     }
 }

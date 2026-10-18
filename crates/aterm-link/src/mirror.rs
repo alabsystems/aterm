@@ -1,0 +1,403 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! THE BUS MIRROR, BRIDGE HALF, its pure parts (`docs/DESIGN-session-log-2026-10-15.md`
+//! §5.5, session log phase 4): the `[fabric] log` mode, a take's slots as the
+//! endpoint frames them, the PIN that holds one batch across a crash, the
+//! landing line and its answer, the rate bucket and the node's alias key
+//! (minted once and kept in the pin, [`Pin::key`]). The bridge's wiring
+//! (`bridge_mirror.rs`) does the I/O.
+//!
+//! ONE BATCH IN FLIGHT. A take (`log-take`) is pinned before a byte of it is
+//! sent: each slot gets a producer sequence from the bridge's reserved block,
+//! and the pin (`logpin`, 0600, replaced atomically) names each slot's
+//! sequence, session, cursor and body. A bridge killed at any point after the
+//! pin republishes exactly the pinned bytes at exactly the pinned sequences,
+//! which the broker answers with the original offsets, and a deduped answer
+//! is read back and compared before it counts (ruling Q3): a foreign record
+//! at a pinned sequence is a collision, never a landing. Only when every slot
+//! is on the bus does the bridge say `log-landed`, and only once every
+//! session has answered for its pairs is the pin emptied. Readers dedupe by
+//! the body's `(node, sid, ep, seq)` (ruling Q0), so what the pin buys is a
+//! duplicate-free bus in the ordinary case, not a correctness claim.
+
+use std::fmt::Write as _;
+
+use aterm_slog::BusCursor;
+
+/// `[fabric] log`: whether the bridge mirrors the session logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogMode {
+    /// The default (owner decision D4 is open): nothing is asked, taken,
+    /// pinned or published; the bridge's lanes carry the bytes they did.
+    #[default]
+    Off,
+    /// The bus class of every session log is mirrored onto its session's
+    /// `ev` face.
+    Turns,
+}
+
+impl LogMode {
+    /// The mode a `--log`/`[fabric] log` word names.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<LogMode> {
+        match word {
+            "off" => Some(LogMode::Off),
+            "turns" => Some(LogMode::Turns),
+            _ => None,
+        }
+    }
+
+    /// The word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            LogMode::Off => "off",
+            LogMode::Turns => "turns",
+        }
+    }
+}
+
+/// The most slots one batch takes: half the publisher's pipeline window, so
+/// a batch never fills it and another publish never waits behind it in line
+/// (ruling Q10).
+pub const BATCH_MAX: usize = 32;
+/// The rate bucket's sustained records a second, before retention exists in
+/// the broker (§8.1): past it records wait in their rings and become exact
+/// covers if evicted.
+pub const RATE_PER_SEC: u64 = 10;
+/// The rate bucket's burst.
+pub const RATE_BURST: u64 = 2048;
+/// THE NODE'S TOTAL of mirrored body bytes before the broker retains
+/// anything (ruling Q13): past it the mirror stops, said in `fabric status`
+/// (`mirror=capped`). 256 MiB of bodies is about two million records, some
+/// two hundred days of a busy agent node at the sustained rate's typical use.
+pub const TOTAL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// One slot of a take: its session, its cursor and its `v=2` body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TakeSlot {
+    /// The session's sid.
+    pub sid: String,
+    /// Where the session lands once this slot and those before it are on the bus.
+    pub at: BusCursor,
+    /// The body.
+    pub body: String,
+}
+
+/// A `log-take` reply read: `OK <nbytes> slots=<k>[ more=1]` (or `OK 0
+/// slots=0 stale=1`) and its body of `<sid> <ep>:<seq>:<ms> <body>` lines.
+/// Answers the slots and whether the endpoint holds more.
+///
+/// # Errors
+///
+/// A header without its count, a line that does not read, or a count that
+/// is not the lines'.
+pub fn parse_take(header: &str, body: &[u8]) -> Result<(Vec<TakeSlot>, bool), String> {
+    let mut toks = header.split_whitespace();
+    if toks.next() != Some("OK") {
+        return Err(format!("log-take answered {header:?}"));
+    }
+    let _bytes = toks.next();
+    let mut want: Option<usize> = None;
+    let mut more = false;
+    for t in toks {
+        if let Some(k) = t.strip_prefix("slots=") {
+            want = k.parse().ok();
+        } else if t == "more=1" {
+            more = true;
+        }
+    }
+    let want = want.ok_or_else(|| format!("log-take header without slots=: {header:?}"))?;
+    let text = std::str::from_utf8(body).map_err(|_| "log-take body is not text".to_string())?;
+    let mut slots = Vec::with_capacity(want);
+    for line in text.lines() {
+        let mut p = line.splitn(3, ' ');
+        let (Some(sid), Some(at), Some(body)) = (p.next(), p.next(), p.next()) else {
+            return Err(format!("log-take line does not read: {line:?}"));
+        };
+        let at = BusCursor::parse(at).ok_or_else(|| format!("log-take cursor: {line:?}"))?;
+        slots.push(TakeSlot {
+            sid: sid.to_string(),
+            at,
+            body: body.to_string(),
+        });
+    }
+    if slots.len() != want {
+        return Err(format!(
+            "log-take said {want} slots and sent {}",
+            slots.len()
+        ));
+    }
+    Ok((slots, more))
+}
+
+/// One pinned slot: the producer sequence it is published at, and the take's slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinSlot {
+    /// The producer sequence.
+    pub pseq: u64,
+    /// The session.
+    pub sid: String,
+    /// Its cursor.
+    pub at: BusCursor,
+    /// Its body, exactly as published.
+    pub body: String,
+}
+
+/// THE PIN: the one batch in flight, the node's running total of mirrored
+/// body bytes (ruling Q13) and the node's ALIAS KEY (ruling Q6), as `logpin`
+/// holds them.
+///
+/// ```text
+/// logpin v=1 inc=<inc> n=<k> total=<bytes> key=<32 hex>
+/// <pseq> <sid> <ep>:<seq>:<ms> <body>        (k lines)
+/// ```
+///
+/// `n=0` is a bridge between batches. A pin that does not read stops the
+/// mirror for this bridge's life and is never deleted. `key=` is minted once,
+/// 16 random bytes, the first time a bridge of this state dir mirrors, and
+/// kept by every rewrite of the pin: never derived from the node's caps (a
+/// renewed cap, a changed grant set, an unguarded broker's empty ring), so an
+/// edge's alias on the bus is the same for the node's life, and nobody
+/// holding the fleet's mint secret can recompute it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pin {
+    /// The incarnation the sequences were reserved under.
+    pub inc: u64,
+    /// Body bytes this node mirrored, all batches.
+    pub total: u64,
+    /// The node's alias key (`None`: a pin written before it, or none minted).
+    pub key: Option<[u8; 16]>,
+    /// The batch.
+    pub slots: Vec<PinSlot>,
+}
+
+/// A fresh alias key: 16 bytes from the one audited entropy helper, `None`
+/// when it fails (the mirror then names every edge `-`, never its sid).
+#[must_use]
+pub fn mint_alias_key() -> Option<[u8; 16]> {
+    let bytes = crate::enable::random_bytes(16).ok()?;
+    let mut key = [0u8; 16];
+    key.copy_from_slice(bytes.get(..16)?);
+    Some(key)
+}
+
+impl Pin {
+    /// The file's text.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let key = self.key.map_or_else(String::new, |k| {
+            format!(" key={}", aterm_codec::hex::encode_lower(&k))
+        });
+        let mut out = format!(
+            "logpin v=1 inc={} n={} total={}{key}\n",
+            self.inc,
+            self.slots.len(),
+            self.total
+        );
+        for s in &self.slots {
+            let _ = writeln!(out, "{} {} {} {}", s.pseq, s.sid, s.at.word(), s.body);
+        }
+        out
+    }
+
+    /// The file read back.
+    ///
+    /// # Errors
+    ///
+    /// Anything that does not read: a header of another version, a slot line
+    /// that does not parse, a count that is not the lines'.
+    pub fn parse(text: &str) -> Result<Pin, String> {
+        let mut lines = text.lines();
+        let head = lines.next().ok_or("an empty logpin")?;
+        let mut toks = head.split(' ');
+        if (toks.next(), toks.next()) != (Some("logpin"), Some("v=1")) {
+            return Err(format!("a logpin of another version: {head:?}"));
+        }
+        let mut field = |k: &str| -> Result<u64, String> {
+            toks.next()
+                .and_then(|t| t.strip_prefix(k))
+                .and_then(|v| v.strip_prefix('='))
+                .and_then(|v| v.parse().ok())
+                .ok_or_else(|| format!("a logpin header without {k}=: {head:?}"))
+        };
+        let inc = field("inc")?;
+        let n = field("n")?;
+        let total = field("total")?;
+        // Past the total, a newer writer's words are read past; `key=` is
+        // read, and refused when it does not.
+        let key = match toks.find_map(|t| t.strip_prefix("key=")) {
+            None => None,
+            Some(hex) => {
+                let mut key = [0u8; 16];
+                if hex.len() != 32 || !aterm_codec::hex::decode_into(hex.as_bytes(), &mut key) {
+                    return Err(format!("a logpin's key: {head:?}"));
+                }
+                Some(key)
+            }
+        };
+        let mut slots = Vec::new();
+        for line in lines {
+            let mut p = line.splitn(4, ' ');
+            let (Some(pseq), Some(sid), Some(at), Some(body)) =
+                (p.next(), p.next(), p.next(), p.next())
+            else {
+                return Err(format!("a logpin slot that does not read: {line:?}"));
+            };
+            slots.push(PinSlot {
+                pseq: pseq
+                    .parse()
+                    .map_err(|_| format!("a logpin slot's sequence: {line:?}"))?,
+                sid: sid.to_string(),
+                at: BusCursor::parse(at)
+                    .ok_or_else(|| format!("a logpin slot's cursor: {line:?}"))?,
+                body: body.to_string(),
+            });
+        }
+        if slots.len() as u64 != n {
+            return Err(format!("a logpin of {n} slots holds {}", slots.len()));
+        }
+        Ok(Pin {
+            inc,
+            total,
+            key,
+            slots,
+        })
+    }
+}
+
+/// Each session's last cursor IN EACH SEQ SPACE of `slots`, in the order
+/// they first appear: what one `log-landed` names. A take can hold two spaces
+/// of one session (an uncarried update's old-space `why=reset` cover, then
+/// the new space's records, ruling Q7); each lands, or the old space's cover
+/// is owed again on every take.
+#[must_use]
+pub fn landed_pairs(slots: &[PinSlot]) -> Vec<(String, BusCursor)> {
+    let mut out: Vec<(String, BusCursor)> = Vec::new();
+    for s in slots {
+        match out
+            .iter_mut()
+            .find(|(sid, at)| *sid == s.sid && at.ep == s.at.ep)
+        {
+            Some(slot) => slot.1 = s.at,
+            None => out.push((s.sid.clone(), s.at)),
+        }
+    }
+    out
+}
+
+/// The `log-landed` request for `pairs`.
+#[must_use]
+pub fn landed_line(pairs: &[(String, BusCursor)]) -> String {
+    let mut out = String::from("log-landed");
+    for (sid, at) in pairs {
+        let _ = write!(out, " {sid} {}", at.word());
+    }
+    out
+}
+
+/// What the endpoint answered for one pair of a `log-landed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LandedWord {
+    /// The cursor moved.
+    Ok,
+    /// Already there, or another seq space: on the bus already.
+    Stale,
+    /// A closed session's tail is all on the bus and forgotten: its `ev` face
+    /// may be retired (ruling Q8).
+    Done,
+    /// An update's export holds the cursor: keep the slots, land again later.
+    Fenced,
+    /// A seamless successor has not adopted the session yet: keep them.
+    Adopting,
+    /// No such session (after adoption): the slots are on the bus; nothing
+    /// more is owed.
+    Gone,
+    /// Past anything the session's log numbered: nothing to land on.
+    Ahead,
+}
+
+impl LandedWord {
+    /// Whether the pair is settled: nothing more is owed for its slots.
+    #[must_use]
+    pub const fn settled(self) -> bool {
+        !matches!(self, LandedWord::Fenced | LandedWord::Adopting)
+    }
+}
+
+/// A `log-landed` reply read: one word a pair, or `OK stale=1` from a lane
+/// that no longer owns the link (`None`: nothing landed, keep the pin).
+///
+/// # Errors
+///
+/// An `ERR`, or a word count that is not the pairs'.
+pub fn parse_landed(reply: &str, pairs: usize) -> Result<Option<Vec<LandedWord>>, String> {
+    let rest = reply
+        .strip_prefix("OK")
+        .ok_or_else(|| format!("log-landed answered {reply:?}"))?;
+    if rest.trim() == "stale=1" {
+        return Ok(None);
+    }
+    let words: Vec<LandedWord> = rest
+        .split_whitespace()
+        .map(|w| match w {
+            "ok" => Ok(LandedWord::Ok),
+            "stale" => Ok(LandedWord::Stale),
+            "done" => Ok(LandedWord::Done),
+            "fenced" => Ok(LandedWord::Fenced),
+            "adopting" => Ok(LandedWord::Adopting),
+            "gone" => Ok(LandedWord::Gone),
+            "ahead" => Ok(LandedWord::Ahead),
+            other => Err(format!("log-landed word {other:?}")),
+        })
+        .collect::<Result<_, _>>()?;
+    if words.len() != pairs {
+        return Err(format!(
+            "log-landed answered {} words for {pairs} pairs",
+            words.len()
+        ));
+    }
+    Ok(Some(words))
+}
+
+/// THE RATE BUCKET (§8.1): [`RATE_PER_SEC`] records a second sustained, a
+/// [`RATE_BURST`] burst, on a clock the caller passes (milliseconds), so a
+/// test steps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bucket {
+    /// Thousandths of a record.
+    milli: u64,
+    at_ms: u64,
+}
+
+impl Bucket {
+    /// A full bucket at `now_ms`.
+    #[must_use]
+    pub const fn full(now_ms: u64) -> Bucket {
+        Bucket {
+            milli: RATE_BURST * 1000,
+            at_ms: now_ms,
+        }
+    }
+
+    /// Refill to `now_ms` and answer how many whole records may go.
+    pub fn room(&mut self, now_ms: u64) -> u64 {
+        let elapsed = now_ms.saturating_sub(self.at_ms);
+        self.at_ms = self.at_ms.max(now_ms);
+        self.milli = self
+            .milli
+            .saturating_add(elapsed.saturating_mul(RATE_PER_SEC))
+            .min(RATE_BURST * 1000);
+        self.milli / 1000
+    }
+
+    /// Spend `n` records.
+    pub fn spend(&mut self, n: u64) {
+        self.milli = self.milli.saturating_sub(n.saturating_mul(1000));
+    }
+}
+
+#[cfg(test)]
+#[path = "mirror_tests.rs"]
+mod tests;

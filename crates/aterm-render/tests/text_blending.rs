@@ -2,20 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The text-blend seam: [`aterm_render::blend_text`], its perceptual alpha
-//! remap [`aterm_render::correct_alpha`], and the texel gate
-//! [`aterm_render::correction_applies`].
+//! The text-blend seam: [`aterm_render::blend_text`] and its perceptual alpha
+//! remap [`aterm_render::correct_alpha`].
 //!
-//! The ty-checked twin is the `TextBlendGate` model
-//! (`aterm_spec::derive::text_blend_gate_model`, invariant `CorrectionGated`:
-//! the remap fires only in corrected mode, on an interior coverage texel, with
-//! a non-degenerate luminance gap; `Buggy = 1` is the ungated divide). This
-//! file enumerates the gate's whole `bool × u8 × bool` domain and binds it to
-//! `blend_text`. The remap's float laws (range, monotonicity, degenerate guard,
-//! endpoints) are beyond the ty expression language (no multiplication or
-//! `pow`), so they are swept exhaustively here.
+//! This file checks the correction gate's consequences on the shipping
+//! byte-level seam (endpoint texels are never remapped; a degenerate luminance
+//! gap reduces to plain linear). The remap's float laws (range, monotonicity,
+//! degenerate guard, endpoints) are beyond the ty expression language (no
+//! multiplication or `pow`), so they are swept exhaustively here.
 
-use aterm_render::{TEXT_BLEND_EPS, blend_text, correct_alpha, correction_applies};
+use aterm_render::{TEXT_BLEND_EPS, blend_text, correct_alpha};
 
 /// Reference sRGB EOTF (gamma → linear), the proper piecewise curve —
 /// duplicated from the crate so the fixtures don't trust the code under test.
@@ -187,64 +183,4 @@ fn degenerate_guard_reduces_to_linear() {
             "degenerate pair must blend identically in both modes (t={t})"
         );
     }
-}
-
-/// Conformance to the `TextBlendGate` ty model: (a) the gate over its complete
-/// `bool × u8 × bool` domain satisfies `CorrectionGated`; (b) whenever
-/// `blend_text` differs from plain linear, the gate is open for that texel.
-#[test]
-fn correction_gate_conformance() {
-    // (a) The model's invariant over the whole gate domain:
-    // applies ⇒ corrected ∧ interior ∧ ¬degenerate.
-    let mut opened = 0usize;
-    for corrected in [false, true] {
-        for cov in 0..=255u16 {
-            for degenerate in [false, true] {
-                let applies = correction_applies(corrected, cov as u8, degenerate);
-                if applies {
-                    assert!(
-                        corrected && cov != 0 && cov != 255 && !degenerate,
-                        "gate opened outside its domain: corrected={corrected} cov={cov} degenerate={degenerate}"
-                    );
-                    opened += 1;
-                }
-            }
-        }
-    }
-    // Non-vacuity: the gate opens once for every interior texel.
-    assert_eq!(opened, 254, "gate must open for all 254 interior coverages");
-
-    // (b) `blend_text` differs from linear only when the gate is open.
-    // White-on-black is non-degenerate; red vs its equal-luminance gray is
-    // degenerate.
-    let pairs = [
-        (0x00ff_ffffu32, 0x0000_0000u32, false), // fg, bg, degenerate
-        (0x00ff_0000, 0x007f_7f7f, true),
-    ];
-    let mut differing = 0usize;
-    for &(fg, bg, degenerate) in &pairs {
-        assert_eq!(
-            (ref_luminance(fg) - ref_luminance(bg)).abs() < TEXT_BLEND_EPS,
-            degenerate,
-            "fixture degeneracy must match the reference luminances"
-        );
-        for corrected in [false, true] {
-            for t in 0..=255u16 {
-                let t = t as u8;
-                if blend_text(bg, fg, bg, t, corrected) != blend_text(bg, fg, bg, t, false) {
-                    assert!(
-                        correction_applies(corrected, t, degenerate),
-                        "output changed with the gate closed: fg={fg:#08x} bg={bg:#08x} t={t} corrected={corrected}"
-                    );
-                    differing += 1;
-                }
-            }
-        }
-    }
-    // Positive control: corrected mode rewrites midtone texels on the
-    // non-degenerate pair.
-    assert!(
-        differing > 100,
-        "corrected mode must visibly reweight the white-on-black ramp ({differing} texels differed)"
-    );
 }

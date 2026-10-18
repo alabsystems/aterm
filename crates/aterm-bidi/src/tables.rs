@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // GENERATED — do not edit by hand. Regenerate with
-//     python3 crates/aterm-bidi/tables/gen.py <DerivedBidiClass.txt> <BidiBrackets.txt>
+//     targo --unverified run -p aterm-bidi --example gen_tables -- tables <DerivedBidiClass.txt> <BidiBrackets.txt>
 // from the Unicode Character Database, whose data is under the Unicode License v3
 // (UNICODE-LICENSE.txt at the repo root).
 
@@ -10,7 +10,7 @@ use crate::BidiClass;
 use crate::BidiClass::*;
 
 // Generated from the Unicode Character Database 18.0.0 (extracted/DerivedBidiClass.txt,
-// including its @missing defaults) by crates/aterm-bidi/tables/gen.py. Every code point
+// including its @missing defaults) by crates/aterm-bidi/examples/gen_tables.rs. Every code point
 // not inside a listed range is `L`. Sorted, non-overlapping, binary-searched.
 pub(crate) const BIDI_CLASS_RANGES: &[(u32, u32, BidiClass)] = &[
     (0x0000, 0x0008, BN),

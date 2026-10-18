@@ -186,189 +186,6 @@ fn a_lone_single_select_is_answered_by_the_long_term_text() {
     let _ = std::fs::remove_dir_all(&ldir);
 }
 
-/// A still screen over [`Mock`] (which moves its screen on every read): the screen moves only
-/// when a `key` or `send` was written since the last read, an `await seq` runs out its whole
-/// timeout, and `await idle <ms>` sleeps `ms` first, as the real server does on a quiescent
-/// surface. From the first Enter on it is the mock's own again.
-struct Still<'m> {
-    mock: &'m mut Mock,
-    /// A `key` or `send` was written since the last read.
-    moved: bool,
-    last: Option<CtlReply>,
-    entered: bool,
-    /// Every request with when it went, from the first.
-    at: Vec<(String, Duration)>,
-    started: Instant,
-}
-
-impl<'m> Still<'m> {
-    fn new(mock: &'m mut Mock) -> Self {
-        Self {
-            mock,
-            moved: true,
-            last: None,
-            entered: false,
-            at: Vec::new(),
-            started: Instant::now(),
-        }
-    }
-}
-
-impl Ctl for Still<'_> {
-    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
-        let line = args.join(" ");
-        self.at.push((line.clone(), self.started.elapsed()));
-        let verb = verb_of(&line).to_string();
-        if self.entered {
-            return self.mock.call(args);
-        }
-        let ms_after = |word: &str| {
-            let words: Vec<&str> = line.split_whitespace().collect();
-            words
-                .iter()
-                .position(|w| *w == word)
-                .and_then(|k| words.get(k + 1))
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(Duration::from_millis)
-        };
-        match verb.as_str() {
-            "text" if !self.moved => {
-                if let Some(r) = &self.last {
-                    return Ok(r.clone());
-                }
-            }
-            "await" if args.get(1) == Some(&"seq") && !self.moved => {
-                std::thread::sleep(ms_after("timeout").unwrap_or_default());
-                return Ok(timeout());
-            }
-            "await" if args.get(1) == Some(&"idle") => {
-                std::thread::sleep(ms_after("idle").unwrap_or_default());
-            }
-            _ => {}
-        }
-        let r = self.mock.call(args)?;
-        match verb.as_str() {
-            "text" => {
-                self.moved = false;
-                self.last = Some(r.clone());
-            }
-            "key" | "send" => {
-                self.moved = true;
-                self.entered = line.ends_with(" enter");
-            }
-            _ => {}
-        }
-        Ok(r)
-    }
-}
-
-/// The read-back decides the Enter: the text read back exactly after the screen held still for
-/// the read's settle (`await idle 500`) is the read the Enter is decided on, with no second read
-/// or box settle (the typed text opens no dialog, and 500 ms still is longer than
-/// [`BOX_SETTLE`]). The Enter costs `status`, `meta` and the fenced key. Negative control: a
-/// read-back whose settle ran out is decided on a fresh look.
-#[test]
-fn the_enter_on_a_read_back_text_costs_status_meta_and_the_key() {
-    let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
-    let run = |idle_never: bool| {
-        let mut m = texting(vec![
-            opt1.clone(),
-            opt2.clone(),
-            free.clone(),
-            typed.clone(),
-            busy_screen(),
-            idle_screen(),
-        ]);
-        m.vanish_after = Some(1);
-        m.idle_never = idle_never;
-        let mut still = Still::new(&mut m);
-        {
-            let mut s = Session::new(&mut still, None);
-            s.set_approval_env(owner_env());
-            s.set_clock(TEST_NOW, PDT);
-            s.set_zone_lookup(test_zones);
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let _ = s.run_hosted(&hosted_by(LONG), stop, &mut Vec::new());
-        }
-        let at = std::mem::take(&mut still.at);
-        drop(still);
-        (m, at)
-    };
-    let (m, at) = run(false);
-    assert_eq!(
-        m.writes(),
-        [
-            "down".to_string(),
-            "down".to_string(),
-            format!("text:{LONG_TERM_TEXT}"),
-            "enter".to_string()
-        ],
-        "{at:#?}"
-    );
-    let send = at
-        .iter()
-        .position(|(r, _)| r.starts_with("send "))
-        .expect("the send");
-    let back = send
-        + at[send..]
-            .iter()
-            .position(|(r, _)| r.starts_with("text "))
-            .expect("the read-back");
-    let enter = at
-        .iter()
-        .position(|(r, _)| r.starts_with("key ") && r.ends_with(" enter"))
-        .expect("the enter");
-    let between: Vec<&str> = at[back + 1..enter]
-        .iter()
-        .map(|(r, _)| r.as_str())
-        .collect();
-    assert_eq!(between, ["status", "meta"], "{at:#?}");
-    let took = at[enter].1.saturating_sub(at[back].1);
-    eprintln!(
-        "read-back #{back} → enter #{enter}: {} requests, {} ms",
-        enter - back - 1,
-        took.as_millis()
-    );
-    // The Enter is fenced on the read-back's own generation and row.
-    let (enter_line, _) = &at[enter];
-    let typed_row = typed
-        .iter()
-        .find(|r| r.starts_with("❯ 3. "))
-        .expect("the field's row");
-    assert!(
-        enter_line.starts_with("key if-human=0 if-gen=1.")
-            && enter_line.ends_with(&format!(" if={} enter", guarded(typed_row))),
-        "{enter_line}"
-    );
-
-    // Negative control: a screen that never holds still gets a fresh look.
-    let (m, at) = run(true);
-    assert_eq!(
-        m.writes().last().map(String::as_str),
-        Some("enter"),
-        "{at:#?}"
-    );
-    let send = at
-        .iter()
-        .position(|(r, _)| r.starts_with("send "))
-        .expect("the send");
-    let back = send
-        + at[send..]
-            .iter()
-            .position(|(r, _)| r.starts_with("text "))
-            .expect("the read-back");
-    let enter = at
-        .iter()
-        .position(|(r, _)| r.starts_with("key ") && r.ends_with(" enter"))
-        .expect("the enter");
-    assert!(
-        at[back + 1..enter]
-            .iter()
-            .any(|(r, _)| r.starts_with("text ")),
-        "an unsettled read-back is read again before the Enter: {at:#?}"
-    );
-}
-
 /// The lone multi-select question (c3): the focus on option 1 as the vendor
 /// opens it, moved down to options 2 and 3, on the pristine free-text row
 /// (c3-04); `text` typed there, the row ticked, the focus kept (c3-05);
@@ -393,7 +210,7 @@ fn multi_screens(text: &str) -> Vec<Vec<String>> {
 /// tabs, with or without the review, single- or multi-select.
 fn text_model(tabs: i64, review: i64, multi: i64) -> aterm_spec::derive::Model {
     aterm_spec::interp::with_consts(
-        &aterm_spec::derive::supervisor_question_text_model(),
+        &aterm_models_harness::supervisor_question_text_model(),
         &[("Multi", multi), ("Tabs", tabs), ("Review", review)],
     )
 }
@@ -521,15 +338,168 @@ fn badge(m: &Mock) -> Option<String> {
         .map(str::to_string)
 }
 
-/// A lone multi-select: the text, then `↓` off the field onto `Submit` and Enter there, then
-/// the review's Enter; never an Enter in the field (it unticks the row), never a Tab.
+/// A 2.1.302 frame's dialog (its top rule to its footer) as a fresh session draws it in a
+/// pane `pane` rows tall: from row 7, under the launch card's rows (blank here), blank rows
+/// under it to the pane's last.
+fn in_fresh_pane(rows: &[String], pane: usize) -> Vec<String> {
+    let last = rows
+        .iter()
+        .rposition(|r| !r.trim().is_empty())
+        .expect("the footer");
+    let mut out = vec![String::new(); 7];
+    out.extend_from_slice(&rows[..=last]);
+    assert!(out.len() <= pane, "the dialog fits the pane");
+    out.resize(pane, String::new());
+    out
+}
+
+/// The review of round 21 (measured on Claude Code 2.1.302 at 41x67 in the real-Claude lab,
+/// its local stub; built here by [`in_fresh_pane`] from the 41x60 captures drawn from row 7):
+/// a fresh multi-select drawn from row 7 of a pane `7 + 11 + N + 40` rows tall, the long-term
+/// text `N` rows once the focus leaves it. The text is typed (it keeps its rows at 41
+/// columns), `down` moves the focus to `❯    Submit` on row 27, and the 40-row tail the loop
+/// reads begins AT that row, the cursor on it. That read is the dialog with its head off the
+/// screen, so it is read again whole, where `Submit` is focused under the loop's own text, and
+/// Enter goes on it: never a question named by its footer alone with its head on the screen,
+/// which stood as the read, made `down` come back "not the question it was" and handed the box
+/// to the manager. The scripted server serves the next screen to each read, so every screen
+/// whose tail misses the live rows is scripted twice: its tail, then the grid whole.
 #[test]
-fn a_lone_multi_select_is_typed_moved_off_and_submitted_by_its_button() {
-    let mut m = texting(multi_screens(LONG_TERM_TEXT));
+fn a_tail_cut_at_the_focused_submit_is_read_whole_and_submitted() {
+    use aterm_phase::prompt::fixtures as f;
+    let (cols, pristine) = f::QUESTION_MULTI_PRISTINE_2_1_302[1];
+    let (kept_cols, kept) = f::QUESTION_MULTI_REFLOW_LONG_KEPT_2_1_302[1];
+    assert_eq!((cols, kept_cols), (41, 41));
+    let pane = 67;
+    let pristine = q(pristine);
+    let typed = in_fresh_pane(&q(f::QUESTION_MULTI_TYPED_41X60_2_1_302), pane);
+    let button = in_fresh_pane(&q(kept), pane);
+    let submit = button
+        .iter()
+        .position(|r| r == "❯    Submit")
+        .expect("the focused button");
+    assert_eq!(
+        submit,
+        pane - 40,
+        "PRECONDITION: the tail begins at `Submit`"
+    );
+    let tail = aterm_phase::parse_prompt_v2(&button[submit..]).expect("a box");
+    assert_eq!(tail.kind, aterm_phase::PromptKind::Question);
+    let mut screens = Vec::new();
+    for option in ["1. [ ] Unit", "2. [ ] Lint", "3. [ ] Fuzz", "4. [ ] Type"] {
+        let rows = in_fresh_pane(&focused_on(&pristine, option), pane);
+        screens.push(rows.clone());
+        screens.push(rows);
+    }
+    for rows in [typed, button] {
+        screens.push(rows.clone());
+        screens.push(rows);
+    }
+    screens.push(idle_screen());
+    let mut m = texting(screens);
+    m.pane_cols = Some(41);
+    m.cursor_on_caret = true;
     let mut s = session(&mut m, None);
     s.set_approval_env(owner_env());
     s.supervise(&answering_by(LONG, None)).expect("supervise");
     drop(s);
+    assert_eq!(badge(&m), None, "handed over: {:#?}", m.requests);
+    assert_eq!(
+        m.writes(),
+        [
+            "down".to_string(),
+            "down".to_string(),
+            "down".to_string(),
+            format!("text:{LONG_TERM_TEXT}"),
+            "down".to_string(),
+            "enter".to_string(),
+        ],
+        "{:#?}",
+        m.requests
+    );
+    let enter = m.presses()[4];
+    assert!(
+        enter.contains(&guarded("❯    Submit")) && enter.ends_with(" enter"),
+        "the Enter is on the button: {enter}"
+    );
+}
+
+/// `frame`, a multi-select with its free-text row ticked and the focus on
+/// `❯    Submit`, as 2.1.300 draws a text that overflows its row once the
+/// focus left it (ATERM-KI-1015-1 F2): the checkbox without its space
+/// (`[✔]Decide`) and every wrap row one cell left, at column 8. SYNTHETIC:
+/// measured at 38 to 51 columns, drawn here on c3-06's 120; the reader asks
+/// no width. `wraps_too`: false moves the first row only.
+fn against_its_checkbox(frame: &[String], wraps_too: bool) -> Vec<String> {
+    let free = frame
+        .iter()
+        .position(|r| r.starts_with("  4. [✔] "))
+        .expect("the ticked free-text row, unfocused");
+    let button = frame
+        .iter()
+        .position(|r| r.trim_end() == "❯    Submit")
+        .expect("the focused button");
+    frame
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if i == free {
+                r.replacen("[✔] ", "[✔]", 1)
+            } else if wraps_too && (free..button).contains(&i) {
+                r.strip_prefix(' ').expect("a wrap row").to_string()
+            } else {
+                r.clone()
+            }
+        })
+        .collect()
+}
+
+/// ATERM-KI-1015-1 F2, the move across the column change: the decision read
+/// has the focus in the field, its text at column 9 (`❯ 4. [✔] Decide`); the
+/// `↓` lands on a frame whose text 2.1.300 drew against its checkbox, at
+/// column 8 (`  4. [✔]Decide`). The Enter goes on `Submit` only because the
+/// field as the landed read joins it equals the field as the decision read
+/// joined it (`field_of`: text, pristine, tick — never a column), so the
+/// dialog is submitted as at column 9: `[down×3, text, down, enter,
+/// enter]`. On the base reader the landed frame read `Unknown`: no Enter on
+/// `Submit`, and the dialog, still up, was handed over with the text in.
+/// NEGATIVE CONTROLS, each landed frame left up: a word of the text not the
+/// loop's ("the free-text row changed since the decision read"), and only
+/// its first row moved, its wraps left at 9 ("could not read whole"), get no
+/// Enter after the `↓` and are handed over.
+#[test]
+fn a_multi_select_text_that_moves_against_its_checkbox_is_still_submitted_by_its_button() {
+    let screens = multi_screens(LONG_TERM_TEXT);
+    let typed_at_9 = format!("❯ 4. [✔] {}", &LONG_TERM_TEXT[..16]);
+    assert!(
+        screens[4].iter().any(|r| r.starts_with(&typed_at_9)),
+        "the decision read's text at column 9: {:#?}",
+        screens[4]
+    );
+    let landed = against_its_checkbox(&screens[5], true);
+    assert!(
+        landed.iter().any(|r| r.starts_with("  4. [✔]Decide")),
+        "{landed:#?}"
+    );
+    // `stands`: the landed frame is the last served, as a frame the loop
+    // presses nothing on stays up.
+    let run = |landed: Vec<String>, stands: bool| {
+        let mut screens = screens.clone();
+        screens[5] = landed;
+        if stands {
+            screens.truncate(6);
+        }
+        let (dir, notes) = notes_file("text-against-checkbox");
+        let mut m = texting(screens);
+        let lines = supervised(
+            &mut m,
+            &answering_by(LONG, Some(notes.clone())),
+            &dir,
+            &notes,
+        );
+        (m, lines)
+    };
+    let (m, _) = run(landed.clone(), false);
     assert_eq!(
         m.writes(),
         [
@@ -553,22 +523,37 @@ fn a_lone_multi_select_is_typed_moved_off_and_submitted_by_its_button() {
         enters[0].contains(&guarded("❯    Submit")),
         "the first Enter is on the button: {enters:#?}"
     );
-    assert!(
-        enters[1].contains(&guarded("❯ 1. Submit answers")),
-        "{enters:#?}"
-    );
-    // The `↓` off the field is guarded on the field's first row as drawn.
-    let down = m.presses()[3];
-    assert!(
-        down.contains("if=^❯\\x204\\.\\x20\\[✔\\]\\x20Decide\\x20yourself:")
-            && down.ends_with(" down"),
-        "{down}"
-    );
-    assert!(
-        !m.presses().iter().any(|p| p.ends_with(" tab")),
-        "{:#?}",
-        m.presses()
-    );
+
+    // Negative controls: a field that changed, a frame never read whole.
+    let person = landed
+        .iter()
+        .map(|r| r.replacen("[✔]Decide yourself", "[✔]Decide myself", 1))
+        .collect();
+    let skewed = against_its_checkbox(&screens[5], false);
+    for (frame, why) in [
+        (person, "the free-text row changed since the decision read"),
+        (skewed, "a question aterm could not read whole"),
+    ] {
+        let (m, lines) = run(frame, true);
+        assert_eq!(
+            m.writes(),
+            [
+                "down".to_string(),
+                "down".to_string(),
+                "down".to_string(),
+                format!("text:{LONG_TERM_TEXT}"),
+                "down".to_string(),
+            ],
+            "{why}: {:#?}",
+            m.requests
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(&format!("handed to the manager ({why}"))),
+            "{why}: {lines:#?}"
+        );
+    }
 }
 
 /// Two questions and the review: each tab's text written once, the multi-select tab moved onto
@@ -784,6 +769,127 @@ fn a_question_asked_again_after_its_dialog_went_is_written_afresh() {
     assert_eq!(sends(&m).len(), 2, "{:#?}", m.requests);
 }
 
+/// `typed` with its key-hint footer row blanked: the loop's text still in a
+/// dialog still up, which the reader reads neither as a dialog nor at its
+/// composer — a reader hole for one frame.
+fn unread_dialog(typed: &[String]) -> Vec<String> {
+    let unread: Vec<String> = typed
+        .iter()
+        .map(|r| {
+            if r.contains("Enter to select") {
+                String::new()
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+    assert_ne!(worker_phase(&unread), Phase::Prompt, "{unread:#?}");
+    {
+        use aterm_phase::ScreenReader as _;
+        assert!(aterm_phase::ClaudeReader.composer(&unread).is_none());
+    }
+    unread
+}
+
+/// The premise of the two tests below: a settled look took a missed frame
+/// before the dialog was told. That frame reads the worker idle, so the look
+/// says `EVENT idle` with its last line (not the closing idle screen's `⏺
+/// Done.`); a press's own reads say nothing. A press can use the missed
+/// frames up, and then no look takes one and nothing is under test.
+fn a_look_took_a_missed_frame(lines: &[String]) {
+    let missed = lines
+        .iter()
+        .position(|l| l.starts_with("EVENT idle ") && !l.ends_with("⏺ Done."));
+    let told = lines.iter().position(|l| l.starts_with("CHOSE "));
+    assert!(
+        missed.is_some() && missed < told,
+        "no look took a missed frame before the dialog was told: {lines:#?}"
+    );
+}
+
+/// ATERM-KI-1015-1 F4's forget, held to its evidence: a dialog ends at a look
+/// that reads the worker at its COMPOSER with no dialog up, never at one that
+/// reads no dialog only. Here the loop's Enter is skipped (`reason=changed`)
+/// and a whole settled look takes a frame of the same dialog the reader
+/// misses; the dialog then reads again with the loop's text in it. Kept, the
+/// memory knows the text for the loop's own: the Enter is pressed again and
+/// the dialog told once (`CHOSE … policy=long-term`). Forgotten at the missed
+/// frame, the text read as a person's and the dialog was handed over ("a
+/// question a person has begun answering (text in its free-text row the
+/// supervisor did not write)"). `continue_policy` is off, so the missed frame
+/// gets no carry-on and only the memory is under test, and the test holds
+/// its premise ([`a_look_took_a_missed_frame`]). NEGATIVE CONTROLS:
+/// [`a_question_asked_again_after_its_dialog_went_is_written_afresh`] (the
+/// composer read still forgets) and scenario 7 (a text gone from the same
+/// dialog is still handed over).
+#[test]
+fn a_dialog_the_reader_misses_for_one_look_keeps_the_loops_text() {
+    let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
+    let unread = unread_dialog(&typed);
+    let mut m = texting(vec![
+        free,
+        typed.clone(),
+        unread.clone(),
+        unread.clone(),
+        unread.clone(),
+        unread.clone(),
+        typed,
+        busy_screen(),
+        idle_screen(),
+    ]);
+    // The loop's Enter skipped: its text in, no answer yet.
+    m.swap_at_key = Some(unread);
+    m.vanish_after = Some(1);
+    let mut opts = hosted_by(LONG);
+    opts.policy.continue_policy = false;
+    let lines = hosted_run(&mut m, &opts, None);
+    assert_eq!(badge(&m), None, "{:#?}", m.requests);
+    assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("CHOSE ") && l.contains("policy=long-term")),
+        "{lines:#?}"
+    );
+    a_look_took_a_missed_frame(&lines);
+}
+
+/// The same missed frame after the loop's Enter went (the dialog answered,
+/// its memory holding that answer): kept, the dialog is told once, at the
+/// worker's busy read, with no second Enter and nothing handed over.
+/// Forgotten at the missed frame, it was told early there and the text that
+/// read again was a person's: handed over. The premise held as above.
+#[test]
+fn a_dialog_the_reader_misses_after_the_loops_enter_is_told_once() {
+    let (_, _, free, typed) = single_screens(LONG_TERM_TEXT);
+    let unread = unread_dialog(&typed);
+    let mut m = texting(vec![
+        free,
+        typed.clone(),
+        unread.clone(),
+        unread.clone(),
+        unread.clone(),
+        unread,
+        typed,
+        busy_screen(),
+        idle_screen(),
+    ]);
+    m.vanish_after = Some(1);
+    let mut opts = hosted_by(LONG);
+    opts.policy.continue_policy = false;
+    let lines = hosted_run(&mut m, &opts, None);
+    assert_eq!(badge(&m), None, "{:#?}", m.requests);
+    assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
+    let enters = m.presses().iter().filter(|p| p.ends_with(" enter")).count();
+    assert_eq!(enters, 1, "{:#?}", m.requests);
+    let chose: Vec<&String> = lines.iter().filter(|l| l.starts_with("CHOSE ")).collect();
+    assert!(
+        chose.len() == 1 && chose[0].contains("policy=long-term"),
+        "{lines:#?}"
+    );
+    a_look_took_a_missed_frame(&lines);
+}
+
 /// A text the field never shows (after the worker's reaction and after the screen held still):
 /// one `send`, no Enter, handed over.
 #[test]
@@ -907,52 +1013,6 @@ fn a_window_that_cannot_fence_a_typed_answer_gets_the_recommended_option_said() 
     let _ = s.supervise(&answering_by(LONG, None));
     drop(s);
     assert_eq!(sends(&m).len(), 1, "{:#?}", m.requests);
-}
-
-/// A person the server sees at the send (its person count moved past the read's): `send
-/// if-human=0` is skipped `reason=person`, and the loop yields, waits out their quiet, and
-/// writes the text once on the new count (`if-human=1`), then presses Enter.
-#[test]
-fn a_person_the_server_sees_at_the_send_gets_the_question_first_then_one_text() {
-    let (opt1, opt2, free, typed) = single_screens(LONG_TERM_TEXT);
-    let mut m = texting(vec![
-        opt1,
-        opt2,
-        free.clone(),
-        free.clone(),
-        free,
-        typed,
-        idle_screen(),
-    ]);
-    m.human = vec!["null", "null", "null", "200", "15000"];
-    m.person_at_send = 1;
-    let (ldir, ledger) = ledger_file("text-person-at-send");
-    let mut s = session(&mut m, None);
-    s.set_approval_env(owner_env());
-    s.set_approval_ledger(Some(ledger.clone()));
-    s.supervise(&answering_by(LONG, None)).expect("supervise");
-    drop(s);
-    let text = format!("text:{LONG_TERM_TEXT}");
-    assert_eq!(
-        m.writes(),
-        ["down", "down", &text, &text, "enter"],
-        "the first send skipped, the second written: {:#?}",
-        m.requests
-    );
-    let sent = sends(&m);
-    assert!(
-        sent[0].starts_with("send if-human=0 ") && sent[1].starts_with("send if-human=1 "),
-        "each send names the count of the read it was decided on: {sent:#?}"
-    );
-    assert_eq!(m.person_skipped.len(), 1, "{:#?}", m.requests);
-    let rows = ledger_rows(&ledger);
-    assert!(
-        rows.iter().any(|r| r.contains("\"decision\":\"skipped\"")
-            && r.contains("a person gave the session input while the answer was keyed")),
-        "{rows:#?}"
-    );
-    assert!(badge(&m).is_none(), "never handed over: {:#?}", m.requests);
-    let _ = std::fs::remove_dir_all(&ldir);
 }
 
 /// Tier-1 for the person fence on the text: a person keys between the loop's read and its
@@ -1269,41 +1329,6 @@ fn a_checked_option_hands_a_multi_select_over_under_a_text_priority() {
     assert!(
         badge.contains("option 1 is checked, and the long-term policy answers this question"),
         "{badge}"
-    );
-}
-
-/// A pane too short for the text (its growth would cut the dialog's head off): that tab is
-/// answered with its recommended option (`↑ ↑`, Enter on `Red (Recommended)`), and told so.
-#[test]
-fn a_tab_too_short_for_the_text_falls_back_to_its_recommended_option() {
-    let (opt1, opt2, free, _) = single_screens(LONG_TERM_TEXT);
-    let dialog = |rows: &[String]| -> Vec<String> {
-        let top = rows
-            .iter()
-            .position(|r| !r.is_empty() && r.chars().all(|c| c == '─'))
-            .expect("the top rule");
-        let last = rows
-            .iter()
-            .rposition(|r| !r.trim().is_empty())
-            .expect("the footer");
-        rows[top..=last].to_vec()
-    };
-    let mut m = texting(vec![
-        dialog(&free),
-        dialog(&opt2),
-        dialog(&opt1),
-        busy_screen(),
-        idle_screen(),
-    ]);
-    m.vanish_after = Some(1);
-    let lines = hosted_run(&mut m, &hosted_by(LONG), None);
-    assert_eq!(m.writes(), ["up", "up", "enter"], "{:#?}", m.requests);
-    let told: Vec<&String> = lines.iter().filter(|l| l.starts_with("CHOSE ")).collect();
-    assert!(
-        told.len() == 1
-            && told[0]
-                .ends_with("→ Red (Recommended) (recommended: the answer would not fit the pane)"),
-        "{lines:#?}"
     );
 }
 
@@ -1820,41 +1845,9 @@ fn cx(text: &str) -> Vec<String> {
     rows[rows.len().saturating_sub(40)..].to_vec()
 }
 
-/// The measured question with its `›` cursor on answer `n` (`  › N.`), the
-/// rest at the answers' column.
-fn codex_focus(rows: &[String], n: u8) -> Vec<String> {
-    let want = format!("{n}. ");
-    rows.iter()
-        .map(|r| match r.strip_prefix("  › ") {
-            Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("    {rest}"),
-            _ => match r.strip_prefix("    ") {
-                Some(rest) if rest.starts_with(&want) => format!("  › {rest}"),
-                _ => r.clone(),
-            },
-        })
-        .collect()
-}
-
-/// `rows` (the notes field open) with the field holding `text` on one row.
-fn codex_noted(rows: &[String], text: &str) -> Vec<String> {
-    let mut out = rows.to_vec();
-    let at = out
-        .iter()
-        .rposition(|r| r.as_str() == "  › Add notes")
-        .expect("the empty notes field");
-    out[at] = format!("  › {text}");
-    out
-}
-
-/// A scripted Codex host for the note: every fence a typed answer rests on.
-fn codex_texting(screens: Vec<Vec<String>>) -> Mock {
-    let mut m = texting(screens);
-    m.program = "codex";
-    m
-}
-
-/// The hosted loop over `m` under `opts`, its ledger at `ledger`.
-fn codex_hosted(m: &mut Mock, opts: &SuperviseOpts, ledger: &Path) {
+/// The hosted loop over `m` under `opts`, its ledger at `ledger`: the lines
+/// it printed.
+fn codex_hosted(m: &mut Mock, opts: &SuperviseOpts, ledger: &Path) -> Vec<String> {
     let mut out: Vec<u8> = Vec::new();
     let mut s = session(m, None);
     s.set_approval_env(owner_env());
@@ -1863,38 +1856,55 @@ fn codex_hosted(m: &mut Mock, opts: &SuperviseOpts, ledger: &Path) {
     s.set_zone_lookup(test_zones);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _ = s.run_hosted(opts, stop, &mut out);
+    String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
-/// CODEX'S QUESTION UNDER `long-term` (gap #11, measured on 0.163.0): the
-/// loop moves the focus from the recommended answer onto `None of the
-/// above` with two ARROWS (never its digit, which would answer at once),
-/// presses Tab there, writes the long-term text into the empty notes field
-/// with one fenced `send` guarded on `  › Add notes`, and presses Enter only
-/// on the next read, the field holding exactly that text: `[down, down, tab,
-/// text, enter]`, every key `key if-human=0 if-gen=…`, ledgered under
-/// `answer-long-term@v1`. NEGATIVE CONTROLS: under `recommended` the same
-/// question is answered by its recommended digit alone; and where the read
-/// after the text shows the field holding other words, no Enter is pressed
-/// and the question is handed over.
+/// The `CHOSE` lines of a loop's output.
+fn chose_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| l.starts_with("CHOSE "))
+        .cloned()
+        .collect()
+}
+
+/// MUSE CODE'S QUESTION UNDER `long-term` THROUGH THE WINDOW'S LOOP (the
+/// screens measured on 1.4.10): two arrows from `Red (Recommended)` onto
+/// `None of the above`, Tab, the long-term text written into the empty note
+/// with one fenced `send`, Enter only on the next read, the note holding
+/// exactly that text — then, on the REVIEW the note draws, Enter on `⟩ Submit
+/// answers`: `[down, down, tab, text, enter, enter]`, every key `key
+/// if-human=0 if-gen=…`. Told once as the latched word's choice: `CHOSE …
+/// policy=long-term <question> → None of the above (the long-term policy
+/// text as its note)`. NEGATIVE CONTROL: a review holding other words than
+/// the loop's note is handed over — its Enter never pressed — and nothing is
+/// told.
 #[test]
-fn a_codex_question_is_answered_by_a_note_under_none_of_the_above() {
-    use aterm_phase::codex::fixtures as f;
-    let dialog = cx(f::QUESTION_0_163);
-    let open = cx(f::QUESTION_NOTES_OPEN_0_163);
-    let screens = |last: Vec<String>| {
+fn a_muse_question_is_answered_by_a_note_and_its_review_sent() {
+    use aterm_phase::muse::fixtures as u;
+    let screens = |review: &str| {
         vec![
-            dialog.clone(),
-            codex_focus(&dialog, 2),
-            cx(f::QUESTION_NONE_FOCUSED_0_163),
-            open.clone(),
-            last,
-            cx(f::QUESTION_NOTES_SUBMITTED_0_163),
+            cx(u::QUESTION),
+            cx(u::QUESTION_DOWN),
+            cx(u::QUESTION_NONE),
+            cx(u::QUESTION_NOTE_OPEN),
+            cx(u::QUESTION_NOTE_LONG),
+            cx(review),
+            cx(u::QUESTION_NOTE_LONG_ANSWERED),
         ]
     };
-    let (ldir, ledger) = ledger_file("codex-note");
-    let mut m = codex_texting(screens(codex_noted(&open, LONG_TERM_TEXT)));
-    m.vanish_after = Some(1);
-    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
+    let muse_texting = |screens: Vec<Vec<String>>| {
+        let mut m = texting(screens);
+        m.program = "muse";
+        m.vanish_after = Some(1);
+        m
+    };
+    let (ldir, ledger) = ledger_file("muse-note");
+    let mut m = muse_texting(screens(u::QUESTION_NOTE_LONG_REVIEW));
+    let lines = codex_hosted(&mut m, &hosted_by(LONG), &ledger);
     assert_eq!(
         m.writes(),
         [
@@ -1902,7 +1912,8 @@ fn a_codex_question_is_answered_by_a_note_under_none_of_the_above() {
             "down".to_string(),
             "tab".to_string(),
             format!("text:{LONG_TERM_TEXT}"),
-            "enter".to_string()
+            "enter".to_string(),
+            "enter".to_string(),
         ],
         "{:#?}",
         m.requests
@@ -1910,117 +1921,42 @@ fn a_codex_question_is_answered_by_a_note_under_none_of_the_above() {
     for p in m.presses() {
         assert!(p.starts_with("key if-human=0 if-gen=1."), "{p}");
     }
-    let send = sends(&m)[0].clone();
+    let presses = m.presses();
     assert!(
-        send.starts_with("send if-human=0 if-gen=1.")
-            && send.contains(&format!(" if={} -- ", guarded("  › Add notes"))),
-        "{send}"
+        presses
+            .last()
+            .is_some_and(|p| p.ends_with(&format!(" if={} enter", guarded("  ⟩ Submit answers")))),
+        "{presses:#?}"
     );
-    let rows = ledger_rows(&ledger);
+    let told = chose_lines(&lines);
+    assert_eq!(told.len(), 1, "{lines:#?}");
     assert!(
-        rows.iter().any(|r| {
-            r.contains(&format!("\"rule_id\":\"{RULE_ANSWER_LONG_TERM}\""))
-                && r.contains("\"decision\":\"approved\"")
-        }),
-        "{rows:#?}"
+        told[0].contains(&format!(" rule={RULE_ANSWER_LONG_TERM} policy=long-term "))
+            && told[0].ends_with(
+                "Which color should the probe use? → None of the above (the long-term policy text \
+                 as its note)"
+            ),
+        "{}",
+        told[0]
     );
     let _ = std::fs::remove_dir_all(&ldir);
 
-    // The control: `recommended` presses the recommended answer's digit.
-    let (ldir, ledger) = ledger_file("codex-note-recommended");
-    let mut m = codex_texting(vec![dialog.clone(), cx(f::QUESTION_NOTES_SUBMITTED_0_163)]);
-    m.vanish_after = Some(1);
-    codex_hosted(&mut m, &hosted_by(QuestionPriority::Recommended), &ledger);
-    assert_eq!(m.writes(), ["1".to_string()], "{:#?}", m.requests);
-    let _ = std::fs::remove_dir_all(&ldir);
-
-    // The control: the field reads other words after the text: no Enter.
-    let (ldir, ledger) = ledger_file("codex-note-other");
-    let mut m = codex_texting(screens(codex_noted(&open, "a person's own words")));
-    m.vanish_after = Some(1);
-    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
-    let writes = m.writes();
-    assert_eq!(
-        writes,
-        [
-            "down".to_string(),
-            "down".to_string(),
-            "tab".to_string(),
-            format!("text:{LONG_TERM_TEXT}"),
-        ],
-        "{:#?}",
-        m.requests
-    );
-    let _ = std::fs::remove_dir_all(&ldir);
-}
-
-/// CODEX'S QUESTION WHOSE NOTES FIELD NEVER READS OPEN FALLS BACK TO ITS
-/// RECOMMENDED ANSWER (gap #11): the loop's Tab on `None of the above` is
-/// waited on, and when no read shows the field open, the question's fallback
-/// is latched (`QuestionMemory::fell_back`, `NOTES_UNREAD`) and it is
-/// decided again — its recommended answer's digit, ledgered under the word's
-/// rule with the fallback said (`(recommended: its notes field did not read
-/// open after Tab)`). Never a second Tab, never the text. NEGATIVE CONTROL:
-/// the same script whose Tab does open the field writes the text and no
-/// digit.
-#[test]
-fn a_codex_question_whose_notes_never_open_falls_back_to_its_recommended_answer() {
-    use crate::supervise::policy::question::NOTES_UNREAD;
-    use aterm_phase::codex::fixtures as f;
-    let dialog = cx(f::QUESTION_0_163);
-    let focused = cx(f::QUESTION_NONE_FOCUSED_0_163);
-    let submitted = cx(f::QUESTION_DIGIT_SUBMITS_0_163);
-    let (ldir, ledger) = ledger_file("codex-note-unread");
-    // `None of the above` stands, its field closed, until a fourth key (the
-    // two arrows and the Tab are three) reaches the dialog.
-    let mut m = codex_texting(vec![
-        dialog.clone(),
-        codex_focus(&dialog, 2),
-        focused.clone(),
-        submitted.clone(),
-    ]);
-    m.key_gates = vec![(2, 3)];
-    m.vanish_after = Some(1);
-    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
+    // The control: a review of other words is a person's.
+    let (ldir, ledger) = ledger_file("muse-note-other");
+    let mut m = muse_texting(screens(u::QUESTION_NOTE_REVIEW));
+    let lines = codex_hosted(&mut m, &hosted_by(LONG), &ledger);
     assert_eq!(
         m.writes(),
         [
             "down".to_string(),
             "down".to_string(),
             "tab".to_string(),
-            "1".to_string()
+            format!("text:{LONG_TERM_TEXT}"),
+            "enter".to_string(),
         ],
         "{:#?}",
         m.requests
     );
-    let rows = ledger_rows(&ledger);
-    assert!(
-        rows.iter().any(|r| {
-            r.contains(&format!("\"rule_id\":\"{RULE_ANSWER_LONG_TERM}\""))
-                && r.contains("\"decision\":\"approved\"")
-                && r.contains(&format!("(recommended: {NOTES_UNREAD})"))
-        }),
-        "{rows:#?}"
-    );
-    let _ = std::fs::remove_dir_all(&ldir);
-
-    // The control: the Tab opens the field, and the text goes in.
-    let (ldir, ledger) = ledger_file("codex-note-read");
-    let open = cx(f::QUESTION_NOTES_OPEN_0_163);
-    let mut m = codex_texting(vec![
-        dialog.clone(),
-        codex_focus(&dialog, 2),
-        focused,
-        open.clone(),
-        codex_noted(&open, LONG_TERM_TEXT),
-        cx(f::QUESTION_NOTES_SUBMITTED_0_163),
-    ]);
-    m.vanish_after = Some(1);
-    codex_hosted(&mut m, &hosted_by(LONG), &ledger);
-    let writes = m.writes();
-    assert!(
-        writes.contains(&format!("text:{LONG_TERM_TEXT}")) && !writes.contains(&"1".to_string()),
-        "the control: {writes:?}"
-    );
+    assert!(chose_lines(&lines).is_empty(), "{lines:#?}");
     let _ = std::fs::remove_dir_all(&ldir);
 }

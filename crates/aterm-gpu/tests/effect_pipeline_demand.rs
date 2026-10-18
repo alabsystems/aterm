@@ -6,7 +6,7 @@
 // effect stream compiles nothing, and the first frame carrying one builds only
 // what it needs. Prints the per-slot compile cost.
 //
-// No GPU / no system font: no-op.
+// No GPU or no font: COULD NOT RUN.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{GlowQuad, Theme};

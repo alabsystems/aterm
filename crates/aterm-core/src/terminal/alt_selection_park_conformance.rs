@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for `AltSelectionPark`
-//! (`aterm_spec::derive::alt_selection_park_model`): the alt-screen selection park,
+//! (`aterm_models_misc::alt_selection_park_model`): the alt-screen selection park,
 //! driven on the real [`Terminal`].
 //!
 //! Selections go through [`Terminal::text_selection_mut`] as a host's drag does;
@@ -24,7 +24,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aterm_spec::derive::{Model, alt_selection_park_model};
+use aterm_models_misc::alt_selection_park_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, admits, bmc, with_buggy};
 
 use super::{Terminal, TerminalCheckpoint};

@@ -1,0 +1,17 @@
+# gemini-cli 0.46.0 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Gemini CLI outside the lab's jail, against a local fake backend: launched by path with a scratch `HOME` whose settings select the API-key auth, a fake `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:<port>` and every proxy variable pointed at that backend, with its per-tool macOS seatbelt on (`security.toolSandboxing`, no `GEMINI_SANDBOX`: each shell command run under `sandbox-exec` with its own profile, outbound network denied) · a fresh session, before any key: the footer's sandbox column says `all tools`
+
+ ▝▜▄     Gemini CLI v0.46.0
+   ▝▜▄
+  ▗▟▀    Authenticated with gemini-api-key /auth
+ ▝▀
+
+
+
+                                                                                                                                ? for shortcuts
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Shift+Tab to accept edits
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ >   Type your message or @path/to/file
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+ workspace (/directory)                                                     sandbox                                                      /model
+ ~/sb-tools                                                                 all tools                                                      Auto

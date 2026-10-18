@@ -1,0 +1,51 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (60x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the network box in a 60-column tab (the stub's `muse.web_fetch` of a long loopback URL): the full URL broken at the row's edge, its tail indented two; the session grant's destination cut at the edge, and the always grant's `(http)` wrapped onto a row of its own at column 0 · the lab's random project dir is spelled /private/tmp/at.lab0 here
+◆ Tool call done. Result: Scheduled 109c3489 (Every day at
+  3:07 AM, once)
+
+❯ toolstart
+
+◆ Unscheduled 109c3489
+└ Removed scheduled job 109c3489.
+
+◆ Tool call done. Result: Removed scheduled job 109c3489.
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-approved — 404
+
+◆ Tool call done. Result: tool failed: web_fetch failed:
+  HTTP 404 Not Found
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-guard — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed:
+  network access denied
+
+❯ toolstart
+
+◆ Fetched http://127.0.0.1:50581/lab-probe-guard2 — denied
+
+◆ Tool call done. Result: tool failed: web_fetch failed:
+  network access denied
+
+❯ toolstart
+
+◈ Calling tools (24s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────
+Would you like to allow this network access?
+
+  network: 127.0.0.1:50581 http
+  full URL: http://127.0.0.1:50581/lab-probe-a-rather-long-p
+  ath-for-the-narrow-tab
+
+⟩ 1. Yes, proceed (y)
+  2. Yes, don't ask again this session (p)  127.0.0.1:50581
+  3. Always allow this network destination  127.0.0.1:50581
+(http)
+  4. No, and tell Muse Code what to do differently (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

@@ -124,11 +124,11 @@ impl From<u64> for WindowId {
 /// Attributes used when creating a window.
 ///
 /// LOCAL PATCH (aterm), 2026-10-16 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
-/// the builders below are the ones aterm and accesskit_winit call, and the fields are the crate's
-/// own. Upstream's other fifteen builders (`with_resizable`, `with_fullscreen`,
-/// `with_decorations`, `with_parent_window` and the rest) had no caller, so every field they set
-/// holds its [`Default`] for good; the backends that still read one are carved with their own
-/// steps.
+/// the builders below are the ones aterm calls (and accesskit_winit did, until A11Y.4), and
+/// the fields are the crate's own. Upstream's other fifteen builders (`with_resizable`,
+/// `with_fullscreen`, `with_decorations`, `with_parent_window` and the rest) had no caller,
+/// so every field they set holds its [`Default`] for good; the backends that still read one
+/// are carved with their own steps.
 #[derive(Debug, Clone)]
 pub struct WindowAttributes {
     pub(crate) inner_size: Option<Size>,
@@ -793,7 +793,8 @@ impl Window {
     /// ## Platform-specific
     ///
     /// - **Android / iOS / X11 / Web / Windows:** Unsupported.
-    /// - **Wayland:** Needs org_kde_kwin_blur_manager and the `wayland-kwin-blur` feature (aterm).
+    /// - **Wayland:** Unsupported (aterm, LW.7: the kwin blur protocol left with the
+    ///   `wayland-kwin-blur` feature).
     #[cfg(not(macos_platform))]
     #[inline]
     pub fn set_blur(&self, blur: bool) {
@@ -1459,6 +1460,23 @@ impl Window {
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
         let _span = tracing::debug_span!("winit::Window::primary_monitor",).entered();
         self.window.maybe_wait_on_main(|w| w.primary_monitor().map(|inner| MonitorHandle { inner }))
+    }
+}
+
+// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6, the
+// Linux half): the window's X11 or Wayland handles through first-party
+// `aterm_types::native_window::HasNativeWindow`, so the GL arm (aterm-gpu) and aterm-gui's CPU
+// presenters reach them without `raw-window-handle`, which leaves the Linux graph. The opt-in
+// `rwh_06` handles below wrap this same answer.
+//
+// SAFETY: the display is the event loop's connection, which every window holds a reference to
+// (X11's `Arc<XConnection>`, Wayland's `Arc<Connection>`), so it stays open while `self` lives;
+// the X11 window is destroyed and the `wl_surface` released only when `self` drops.
+#[cfg(free_unix)]
+unsafe impl aterm_types::native_window::HasNativeWindow for Window {
+    #[inline]
+    fn native_window(&self) -> Option<aterm_types::native_window::NativeWindow> {
+        Some(self.window.native_window())
     }
 }
 

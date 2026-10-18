@@ -23,11 +23,10 @@
 //! judges the tab natively) is repaired once: the stand-in read the short size
 //! and then the true one, the engine's rows never moved, its debt is gone, the
 //! kernel's size ends at the engine's, and the ledger closed the epoch
-//! `by=nudge`. NEGATIVE CONTROLS: the same stand-in adopted with NO debt (a
-//! debt-free predecessor, an older one, an emacs-shaped program whose pulse
-//! answer is zero bytes) is never held short; mode `log` holds nothing and
-//! says what it would have done; a program that is not Claude Code is never
-//! held; and a stand-in that never answers is let go at the engine's size.
+//! `by=nudge`. NEGATIVE CONTROL: a stand-in that never answers is let go at
+//! the engine's size. The gates that hold nothing (no debt, mode `log`, a
+//! program that is not Claude Code) are pinned deterministically by
+//! `app_nudge`'s unit tests.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -277,53 +276,6 @@ fn an_adopted_tab_that_owes_rows_is_repainted_by_the_closed_loop_once() {
     assert!(
         reply.contains(" total=0 "),
         "the nudge booked no resize: {reply}"
-    );
-    // Once: more time, no second hold.
-    let again = rig.until(Duration::from_secs(4), |r| r.sizes.len() > 2);
-    assert!(!again, "a second attempt: {:?}", rig.sizes);
-}
-
-/// NEGATIVE CONTROL: a debt-free predecessor (or one from before the field, or
-/// an emacs-shaped program whose pulse answer is zero bytes) hands over no
-/// debt, and the identical stand-in is never held short.
-#[test]
-fn a_tab_adopted_with_no_debt_is_never_held_short() {
-    let mut rig = Rig::nudge_rig(Mode::On, false, true, Answer::Repaint);
-    let held = rig.until(Duration::from_secs(5), |r| !r.sizes.is_empty());
-    assert!(!held, "held short: {:?}", rig.sizes);
-    assert_eq!(rig.pty(), Some((ROWS, COLS)));
-    assert!(
-        rig.header().contains(" nudge=idle nudged=0"),
-        "{}",
-        rig.header()
-    );
-}
-
-/// Mode `log` runs the machine and holds nothing.
-#[test]
-fn mode_log_holds_no_pty_and_the_epoch_stays_at_risk() {
-    let mut rig = Rig::nudge_rig(Mode::Log, true, true, Answer::Repaint);
-    let held = rig.until(Duration::from_secs(6), |r| !r.sizes.is_empty());
-    assert!(!held, "held short in log mode: {:?}", rig.sizes);
-    assert_eq!(rig.debt(), (-1, 0), "nothing repaired it");
-    assert_eq!(rig.pty(), Some((ROWS, COLS)));
-    assert!(
-        rig.header().contains("verdict=desync-risk"),
-        "{}",
-        rig.header()
-    );
-}
-
-/// NEGATIVE CONTROL: not Claude Code, never held, whatever the mode.
-#[test]
-fn a_program_that_is_not_claude_code_is_never_held() {
-    let mut rig = Rig::nudge_rig(Mode::On, true, false, Answer::Repaint);
-    let held = rig.until(Duration::from_secs(6), |r| !r.sizes.is_empty());
-    assert!(!held, "held short: {:?}", rig.sizes);
-    assert!(
-        rig.header().contains("verdict=unjudged"),
-        "{}",
-        rig.header()
     );
 }
 

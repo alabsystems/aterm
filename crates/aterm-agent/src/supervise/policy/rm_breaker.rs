@@ -107,19 +107,21 @@
 //! operand (and in its last component after a trailing `/`), never the last
 //! component itself: with `/private/tmp/p/out -> /etc`, `rm -rf
 //! /private/tmp/p/out/x` removes `/etc/x`. So the operand's directories are
-//! resolved when the box is judged (`physical`), and the result must pass the
-//! same checks against the roots, the cwd and the home directory resolved the
-//! same way. A root is resolved only through links root owns (macOS's `/tmp`,
+//! resolved when the box is judged (through the policy's probe,
+//! [`PolicyProbe::rm_physical`], the one door the rule looks at the disk
+//! by), and the result must pass the same checks against the roots, the cwd
+//! and the home directory resolved the same way. A root is resolved only
+//! through links root owns (macOS's `/tmp`,
 //! `/var`), so a scratch directory swapped for a link to the home directory
 //! holds nothing. A glob in a directory (it may match a link), or a link the
 //! disk will not show (a permission refused, a loop), escalates. Not seen: a
 //! link made after the box is judged by a job the worker left running
 //! (nothing else on the line may write: `classify_except_rm`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
+use super::probe::{OnDisk, PolicyProbe};
 use crate::supervise::classify::{GLOB_CHARS, TEST_BINARY, TEST_UNARY, glob_match, numeric_format};
 
 /// The stand-in for the unique name `mktemp` makes: a component no deny rule
@@ -279,10 +281,6 @@ fn shell_name(name: &str) -> bool {
             .any(|p| name.starts_with(p))
 }
 
-/// How many symbolic links [`physical`] follows for one path before it gives
-/// up (the kernel's own limit is of this order: `MAXSYMLINKS` is 32 on macOS).
-const MAX_LINK_HOPS: usize = 32;
-
 /// One component of a [`ScratchRoot`] pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RootComp {
@@ -323,9 +321,9 @@ impl ScratchRoot {
         Some(root)
     }
 
-    /// The pattern as written (`/private/tmp/*`); tests read it to check a
-    /// root's shape.
-    #[cfg(test)]
+    /// The pattern as written (`/private/tmp/*`): how a policy probe's request
+    /// on a harness tape names the root (`super::probe`), and what tests read
+    /// to check a root's shape.
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
@@ -335,13 +333,18 @@ impl ScratchRoot {
     }
 
     /// This root where the disk leads it: its literal directories resolved
-    /// ([`physical`]; `/tmp/*` is `/private/tmp/*` on macOS), its glob kept.
-    /// `None` when they cannot be resolved, or lead through a symbolic link
-    /// root does not own (one the worker could have made or re-pointed). A
-    /// root whose directories are the session cwd (`<cwd>/target*`) is
-    /// resolved where the cwd leads (`cwd_real`, every link followed, as
-    /// [`Disk`] resolves the cwd).
-    fn on_disk(&self, cwd: &[String], cwd_real: Option<&[String]>) -> Option<Self> {
+    /// (`probe`'s [`PolicyProbe::rm_physical`]; `/tmp/*` is `/private/tmp/*`
+    /// on macOS), its glob kept. `None` when they cannot be resolved, or lead
+    /// through a symbolic link root does not own (one the worker could have
+    /// made or re-pointed). A root whose directories are the session cwd
+    /// (`<cwd>/target*`) is resolved where the cwd leads (`cwd_real`, every
+    /// link followed, as [`Disk`] resolves the cwd).
+    fn on_disk(
+        &self,
+        cwd: &[String],
+        cwd_real: Option<&[String]>,
+        probe: &dyn PolicyProbe,
+    ) -> Option<Self> {
         let lits: Vec<String> = self
             .comps
             .iter()
@@ -352,7 +355,13 @@ impl ScratchRoot {
             .collect();
         let real = match cwd_real {
             Some(real) if lits == cwd && lits.len() < self.comps.len() => real.to_vec(),
-            _ => physical(&lits).ok().filter(|p| !p.foreign_link)?.comps,
+            _ => {
+                probe
+                    .rm_physical(&lits)
+                    .ok()
+                    .filter(|p| !p.foreign_link)?
+                    .comps
+            }
         };
         let mut comps: Vec<RootComp> = real.into_iter().map(RootComp::Lit).collect();
         comps.extend(self.comps[lits.len()..].iter().cloned());
@@ -399,6 +408,10 @@ pub struct RmScope<'a> {
     /// proven, not even a directory the line's own `mktemp -d` made
     /// ([`Eval::fresh_dir`], which asks no root otherwise).
     pub roots: &'a [ScratchRoot],
+    /// How the disk is looked at: where a path's symbolic links lead
+    /// ([`PolicyProbe::rm_physical`]) — the approval context's probe, so a
+    /// harness tape holds each answer the rule judged by.
+    pub probe: &'a dyn PolicyProbe,
 }
 
 /// Resolve every `rm` on `cmd`: `Ok` with each operand's resolved path when
@@ -1032,15 +1045,16 @@ impl Disk {
         let home = scope
             .home
             .and_then(|h| abs_components(&h.to_string_lossy()));
+        let physical = |comps: &[String]| scope.probe.rm_physical(comps);
         let cwd_real = physical(cwd).map(|p| p.comps);
         let roots = scope
             .roots
             .iter()
-            .filter_map(|r| r.on_disk(cwd, cwd_real.as_deref().ok()))
+            .filter_map(|r| r.on_disk(cwd, cwd_real.as_deref().ok(), scope.probe))
             .collect();
         Self {
             cwd: cwd_real,
-            home: home.map(|h| physical(&h).map_or(h, |p| p.comps)),
+            home: home.map(|h| physical(&h).map_or(h, |p: OnDisk| p.comps)),
             roots,
         }
     }
@@ -2343,9 +2357,9 @@ impl Eval<'_> {
         Ok(shown)
     }
 
-    /// The operand's directories resolved on the disk ([`physical`]), and the
-    /// path they lead to checked again, against the cwd, the home directory
-    /// and the roots as the disk has them ([`Disk`]).
+    /// The operand's directories resolved on the disk ([`PolicyProbe::rm_physical`]),
+    /// and the path they lead to checked again, against the cwd, the home
+    /// directory and the roots as the disk has them ([`Disk`]).
     fn on_disk(&self, comps: &[String], follow_last: bool, shown: &str) -> Result<(), String> {
         let dirs = if follow_last {
             comps.len()
@@ -2358,7 +2372,11 @@ impl Eval<'_> {
                 clip(c, 30)
             ));
         }
-        let real = physical(&comps[..dirs]).map_err(|e| format!("{shown}: {e}"))?;
+        let real = self
+            .scope
+            .probe
+            .rm_physical(&comps[..dirs])
+            .map_err(|e| format!("{shown}: {e}"))?;
         let mut real = real.comps;
         real.extend(comps[dirs..].iter().cloned());
         let led = if real == comps {
@@ -2412,117 +2430,6 @@ fn inside(
     } else {
         Err(format!("{shown} is not strictly inside a scratch root"))
     }
-}
-
-/// An absolute path as the disk resolves it ([`physical`]).
-struct OnDisk {
-    comps: Vec<String>,
-    /// Whether a symbolic link on the way is not root's: the worker could
-    /// have made it, or re-pointed it.
-    foreign_link: bool,
-}
-
-/// Where the absolute path `comps` leads on the disk, walked as the kernel
-/// walks it: each component that is a symbolic link replaced by its target
-/// (an absolute target from `/`, a relative one from the link's directory, a
-/// `..` in it the physical parent) until one does not exist, and from there
-/// the rest as written, since nothing below a missing directory can be a
-/// link yet. `Err` when a link's target climbs out of a missing directory
-/// with `..`, when the links do not end ([`MAX_LINK_HOPS`]), or when the
-/// disk refuses the look (a permission, a file where a directory should be).
-///
-/// Not [`super::approval`]'s `real_components` (the Read rule's resolver):
-/// that one asks `canonicalize`, which does not say whose links led where,
-/// and a root reached through a link the worker could re-point is no root
-/// here ([`OnDisk::foreign_link`], [`ScratchRoot::on_disk`]); it follows the
-/// last component too, where rm removes a link itself and follows only the
-/// directories above it; and it gives up on a dangling link, where this walks
-/// on as written to where a directory made there later would put the rm.
-fn physical(comps: &[String]) -> Result<OnDisk, String> {
-    let mut todo: VecDeque<OsString> = comps.iter().map(OsString::from).collect();
-    let mut real = PathBuf::from("/");
-    let mut hops = 0usize;
-    let mut foreign_link = false;
-    while let Some(c) = todo.pop_front() {
-        if c.is_empty() || c == "." {
-            continue;
-        }
-        if c == ".." {
-            real.pop();
-            continue;
-        }
-        let path = real.join(&c);
-        match std::fs::symlink_metadata(&path) {
-            Ok(m) if m.file_type().is_symlink() => {
-                hops += 1;
-                if hops > MAX_LINK_HOPS {
-                    return Err(format!(
-                        "{} leads through more than {MAX_LINK_HOPS} symbolic links",
-                        path.display()
-                    ));
-                }
-                foreign_link |= !owned_by_root(&m);
-                let to = std::fs::read_link(&path).map_err(|e| {
-                    format!("the symbolic link {} cannot be read ({e})", path.display())
-                })?;
-                if to.has_root() {
-                    real = PathBuf::from("/");
-                }
-                for part in to.components().rev() {
-                    match part {
-                        Component::Normal(n) => todo.push_front(n.to_os_string()),
-                        Component::ParentDir => todo.push_front(OsString::from("..")),
-                        Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
-                    }
-                }
-            }
-            Ok(_) => real.push(&c),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                real.push(&c);
-                while let Some(rest) = todo.pop_front() {
-                    if rest == ".." {
-                        return Err(format!(
-                            "{} does not exist, and a symbolic link's `..` climbs out of it",
-                            path.display()
-                        ));
-                    }
-                    if !rest.is_empty() && rest != "." {
-                        real.push(&rest);
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(format!(
-                    "{} cannot be examined on the disk ({e})",
-                    path.display()
-                ));
-            }
-        }
-    }
-    let comps = real
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-    Ok(OnDisk {
-        comps,
-        foreign_link,
-    })
-}
-
-/// Whether root owns this link: then no one else made it or can re-point it
-/// (macOS's `/tmp -> private/tmp`, `/var -> private/var`).
-#[cfg(unix)]
-fn owned_by_root(m: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    m.uid() == 0
-}
-
-#[cfg(not(unix))]
-fn owned_by_root(_: &std::fs::Metadata) -> bool {
-    false
 }
 
 /// `mktemp -d [-q] [-t PREFIX]` → [`FRESH_DIR`] (under the Bash tool's

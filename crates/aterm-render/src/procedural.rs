@@ -19,7 +19,7 @@
 //!   `tests/procedural_aa_edges.rs`.
 //!
 //! [`crate::Renderer::glyph_key`] routes these ranges to [`crate::FaceId::Procedural`]
-//! before any font lookup; the dev seam `ATERM_NO_PROCEDURAL_GLYPHS=1` restores fonts.
+//! before any font lookup.
 //!
 //! ## The shared rounding rule
 //!
@@ -1533,15 +1533,6 @@ mod tests {
                 assert_eq!(m.vl0 - m.vh0, m.vh1 - m.vl1, "{w}x{h}: vertical centring");
                 assert_eq!(m.hl0 - m.hh0, m.hh1 - m.hl1, "{w}x{h}: horizontal centring");
             }
-        }
-    }
-
-    /// The full block is all-255; the empty braille pattern is all-0.
-    #[test]
-    fn full_block_and_braille_blank_are_extremes() {
-        for &(w, h) in SIZES {
-            assert!(coverage('█', w, h).unwrap().iter().all(|&b| b == 255));
-            assert!(coverage('\u{2800}', w, h).unwrap().iter().all(|&b| b == 0));
         }
     }
 

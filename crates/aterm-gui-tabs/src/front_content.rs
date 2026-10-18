@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Authoritative focused-content identity and optional terminal handles.
+//!
+//! A native tab must never inherit the terminal handles that happened to be
+//! active before it.  [`FrontContent`] names the focused leaf; a
+//! [`TerminalMirror`] exists if and only if that leaf is terminal. Terminal-only
+//! operations resolve through this optional capability; native content owns no
+//! placeholder terminal, invalid fd, sink, or session identity.
+
+use std::sync::{Arc, Mutex};
+
+use aterm_session::sink::SinkWriter;
+
+use crate::tab_model::{AppInstanceId, ViewId};
+use aterm_core::terminal::Terminal;
+
+/// Stable identity of the focused content leaf in one window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontContent {
+    Terminal {
+        view: ViewId,
+        session: u64,
+    },
+    Native {
+        instance: AppInstanceId,
+        view: ViewId,
+    },
+}
+
+impl FrontContent {
+    #[must_use]
+    pub const fn view(self) -> ViewId {
+        match self {
+            Self::Terminal { view, .. } | Self::Native { view, .. } => view,
+        }
+    }
+
+    #[must_use]
+    pub const fn native(self) -> Option<(AppInstanceId, ViewId)> {
+        match self {
+            Self::Native { instance, view } => Some((instance, view)),
+            Self::Terminal { .. } => None,
+        }
+    }
+
+    /// The terminal SESSION behind this front, or `None` for native content —
+    /// the identity half of [`Self::native`]. Callers that need the session id
+    /// without a capability (the DEC 1004 focus-report account, which must name
+    /// a session it can no longer reach through the window) read it here rather
+    /// than re-matching the enum.
+    #[must_use]
+    pub const fn terminal_session(self) -> Option<u64> {
+        match self {
+            Self::Terminal { session, .. } => Some(session),
+            Self::Native { .. } => None,
+        }
+    }
+}
+
+/// Handles for the focused terminal leaf only.
+///
+/// This is deliberately separate from [`FrontContent`]: identity is cheap and
+/// always available, while terminal handles are capability-bearing resources.
+#[derive(Clone)]
+pub struct TerminalMirror {
+    pub session: u64,
+    pub term: Arc<Mutex<Terminal>>,
+    pub master: i32,
+    pub sink: Arc<SinkWriter>,
+    /// The session's UI-waiter register (`SessionCtx::ui_waiting`), so the
+    /// redraw's blocking acquisitions can announce themselves to the reader.
+    pub ui_waiting: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl std::fmt::Debug for TerminalMirror {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalMirror")
+            .field("session", &self.session)
+            .field("master", &self.master)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Which window layer currently owns keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFocus {
+    Host,
+    Content(ViewId),
+}
+
+/// Explicit native-view lifecycle. Only adjacent, forward transitions are
+/// accepted; stale async work cannot remount a closing or closed view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewLifecycle {
+    #[default]
+    Created,
+    Mounted,
+    Suspended,
+    Closing,
+    Closed,
+}
+
+impl ViewLifecycle {
+    pub fn transition(&mut self, next: Self) -> bool {
+        let allowed = matches!(
+            (*self, next),
+            (Self::Created, Self::Mounted)
+                | (Self::Mounted, Self::Suspended | Self::Closing)
+                | (Self::Suspended, Self::Mounted | Self::Closing)
+                | (Self::Closing, Self::Closed)
+        );
+        if allowed {
+            *self = next;
+        }
+        allowed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_is_forward_only_and_suspend_is_reversible() {
+        let mut state = ViewLifecycle::Created;
+        assert!(state.transition(ViewLifecycle::Mounted));
+        assert!(state.transition(ViewLifecycle::Suspended));
+        assert!(state.transition(ViewLifecycle::Mounted));
+        assert!(state.transition(ViewLifecycle::Closing));
+        assert!(!state.transition(ViewLifecycle::Mounted));
+        assert!(state.transition(ViewLifecycle::Closed));
+        assert!(!state.transition(ViewLifecycle::Created));
+    }
+}

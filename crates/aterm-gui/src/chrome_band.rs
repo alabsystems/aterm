@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_core::terminal::RenderCell;
 use aterm_messages::ink::{AnsiHues, BarBase, ThemeInks};
+use aterm_messages::tokens::{AuthoredChrome, ChromeSeeds, ChromeTokens};
 use aterm_render::Theme;
 
 // ---- The OS-forced chrome palette (Windows High Contrast) ---------------------------
@@ -179,7 +180,7 @@ pub(crate) type BandColors = aterm_messages::ink::BandInks;
 // The chrome colour helpers live in the engine (one implementation for band, tab
 // strip, find bar, notices, Settings and presence), re-exported under local paths.
 #[cfg(test)]
-pub(crate) use aterm_messages::ink::{HOVER_RISE, PRIMARY_HOVER_LIFT, TRACK_TINT, hover_ink};
+pub(crate) use aterm_messages::ink::{PRIMARY_HOVER_LIFT, TRACK_TINT, hover_ink};
 pub(crate) use aterm_messages::ink::{contrast, ensure_contrast, forced_ink, mix3, warn_mark};
 
 /// A packed `0x00RRGGBB` theme colour as sRGB bytes.
@@ -191,40 +192,44 @@ fn rgb(c: u32) -> [u8; 3] {
     ]
 }
 
-/// The CSD headerbar fills the band sits under on Linux: sctk-adwaita's active
-/// `ColorMap::headerbar` values (`theme.rs` in the vendored winit's decoration crate),
-/// `(48, 48, 48)` dark and `(235, 235, 235)` light. Matching them exactly makes
-/// titlebar and band read as one header; even a 2-luma-step mismatch shows a seam.
+/// The Adwaita headerbar fills of the band on Linux, `(48, 48, 48)` dark and
+/// `(235, 235, 235)` light: sctk-adwaita's active `ColorMap::headerbar`, which the
+/// band had to match exactly while that crate drew a titlebar above it (even a
+/// 2-luma-step mismatch showed a seam). Since LW.5 the band IS the header of a
+/// window the compositor leaves undecorated (`crate::client_frame`, its window
+/// buttons included), and it keeps the headerbar's tones so it reads as a GNOME
+/// header.
 ///
-/// Active tones on purpose: the band does not repaint on focus change, and an
-/// active-matched band under an inactive titlebar is quieter than a flickering band.
+/// Active tones on purpose: the band does not repaint on focus change.
 ///
 /// # The band/page split is intended
 ///
 /// With a mid-tone terminal background the band and the native page rail below it
 /// separate visibly (e.g. `background = "#8A8A8A"`: band `#303030`, Settings rail
-/// `#797676`). This is correct: the band belongs to the header. The CSD titlebar above
-/// it only offers `light | dark` (winit exposes no colour), so of the two seams only
-/// one can close:
-///
-///  * band == titlebar, band != page: one solid header on a themed body, with the break
-///    at the chrome/content boundary, where GTK apps put it;
-///  * band == page, band != titlebar: three stacked tones with the break inside the
-///    header.
+/// `#797676`). This is correct: the band is the header, and the break sits at the
+/// chrome/content boundary, where GTK apps put it.
 ///
 /// The band follows the chrome-resolved palette (`App::chrome_palette_theme`), so
-/// `window_theme = dark` over a light terminal theme gives `#303030` in step with the
-/// CSD variant and native pages; only the terminal grid keeps its own palette.
+/// `window_theme = dark` over a light terminal theme gives `#303030` in step with
+/// native pages; only the terminal grid keeps its own palette.
 ///
-/// This holds only while the CSD titlebar is real: with server-side decorations (or a
-/// winit that can colour its headerbar) the band should follow the page.
-/// `linux_band_base_tone_is_the_exact_csd_headerbar_gray` pins the current choice.
+/// Under server-side decorations (or an X11 window manager's frame) the window
+/// system's titlebar sits above the band, which could then follow the page instead;
+/// it keeps these tones for now. `linux_band_base_tone_is_the_exact_csd_headerbar_gray`
+/// pins the choice.
 #[cfg(target_os = "linux")]
 pub(crate) const CSD_HEADERBAR_DARK: [u8; 3] = [0x30, 0x30, 0x30];
 #[cfg(target_os = "linux")]
 pub(crate) const CSD_HEADERBAR_LIGHT: [u8; 3] = [0xEB, 0xEB, 0xEB];
 
-/// Appearance-aware, theme-derived band tones with WCAG-AA text contrast.
+/// Appearance-aware, theme-derived band tones with WCAG-AA text contrast, over the
+/// chrome tokens of `p` ([`ChromePalette::tokens`]): where the theme's cursor is
+/// near-grey and the palette's ANSI hues are known, the accent and meter fill are the
+/// blue (or the cyan, where only the cyan carries the band's words), chosen by
+/// `aterm_messages::palette::MeterHue`; an authored accent or border wins. A hue the
+/// 3:1 floor would darken into brown keeps its pastel with a darker edge
+/// (`aterm_messages::palette::keeps_pastel`). A bare [`Theme`] converts with no
+/// palette and nothing authored.
 ///
 /// Under an OS-forced chrome palette (Windows High Contrast) this defers wholesale to
 /// `BandInks::forced`.
@@ -233,124 +238,186 @@ pub(crate) const CSD_HEADERBAR_LIGHT: [u8; 3] = [0xEB, 0xEB, 0xEB];
 /// ([`CSD_HEADERBAR_DARK`]/[`CSD_HEADERBAR_LIGHT`]), picked by
 /// [`crate::tab_bar::bg_is_light`]. The inks are contrast-floored against their
 /// surface, so theme foregrounds still clear AA on the fixed gray.
-pub(crate) fn band_colors(theme: Theme) -> BandColors {
-    band_colors_with(theme, None)
-}
-
-/// The theme's ANSI hues the band borrows: blue and cyan (slots 4 and 6) for
-/// a meter when the cursor is near-grey (ruling 250), red and yellow (slots 1
-/// and 3) as the seeds of its error and warn inks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct MeterAnsi {
-    pub red: [u8; 3],
-    pub yellow: [u8; 3],
-    pub blue: [u8; 3],
-    pub cyan: [u8; 3],
-}
-
-impl MeterAnsi {
-    /// A scheme's borrowed hues (the tests' builtin grounds; the app reads
-    /// its configured palette, [`Self::of_palette`]).
-    #[cfg(test)]
-    pub(crate) fn of_scheme(s: &aterm_types::ColorScheme) -> Self {
-        let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
-        Self {
-            red: rgb(s.ansi[1]),
-            yellow: rgb(s.ansi[3]),
-            blue: rgb(s.ansi[4]),
-            cyan: rgb(s.ansi[6]),
-        }
-    }
-
-    /// A terminal palette's borrowed hues.
-    pub(crate) fn of_palette(p: &aterm_types::ColorPalette) -> Self {
-        let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
-        Self {
-            red: rgb(p.get(1)),
-            yellow: rgb(p.get(3)),
-            blue: rgb(p.get(4)),
-            cyan: rgb(p.get(6)),
-        }
-    }
-}
-
-/// What the message band is painted from: the chrome theme and, when the host knows
-/// it, the terminal palette's blue and cyan. A bare [`Theme`] converts with no
-/// palette, and its meter keeps the cursor accent.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BandPalette {
-    pub theme: Theme,
-    pub ansi: Option<MeterAnsi>,
-}
-
-impl From<Theme> for BandPalette {
-    fn from(theme: Theme) -> Self {
-        Self { theme, ansi: None }
-    }
-}
-
-impl BandPalette {
-    /// The band's colours for this palette.
-    pub(crate) fn colors(self) -> BandColors {
-        band_colors_with(self.theme, self.ansi)
-    }
-}
-
-/// [`band_colors`], with the terminal palette's blue and cyan for the meter: where
-/// the theme's cursor is near-grey, the meter fill is the blue (or the cyan, where
-/// only the cyan carries the band's words), chosen by
-/// `aterm_messages::palette::MeterHue`. A hue the 3:1 floor would darken into brown
-/// keeps its pastel with a darker edge (`aterm_messages::palette::keeps_pastel`).
-///
-/// A pure mapping: the latch's forced palette, or `BandInks::derive` from the theme's
-/// background, foreground and cursor, the ANSI pair, and this platform's band base.
-pub(crate) fn band_colors_with(theme: Theme, ansi: Option<MeterAnsi>) -> BandColors {
+pub(crate) fn band_colors(p: impl Into<ChromePalette>) -> BandColors {
     if let Some(hc) = forced_chrome() {
         return BandColors::forced(hc);
     }
-    let inks = ThemeInks {
-        bg: rgb(theme.bg),
-        fg: rgb(theme.fg),
-        cursor: rgb(theme.cursor),
-    };
-    let hues = ansi.map(|a| AnsiHues {
-        red: a.red,
-        yellow: a.yellow,
-        blue: a.blue,
-        cyan: a.cyan,
-    });
-    // The tones are a pure function of these two and the platform's base, and
+    let p = p.into();
+    let inks = p.inks();
+    let seeds = p.seeds();
+    // The tones are a pure function of the seeds (the base among them), and
     // the paint paths ask for them again every frame — the Claude Code
     // footer's splice and its lights' block each frame a pane shows one —
     // while each derivation floors a dozen inks by WCAG contrast (`powf`
-    // per channel): the last answer is kept for the same inks and hues, per
-    // thread (owner, 2026-10-15: "the user experince must be extremely
-    // smooth and zero latency!").
+    // per channel): the last answer is kept for the same seeds, per thread
+    // (owner, 2026-10-15: "the user experince must be extremely smooth and
+    // zero latency!").
     std::thread_local! {
-        static LAST: std::cell::Cell<Option<(ThemeInks, Option<AnsiHues>, BandColors)>> =
+        static LAST: std::cell::Cell<Option<(ChromeSeeds, ThemeInks, BandColors)>> =
             const { std::cell::Cell::new(None) };
     }
     LAST.with(|last| match last.get() {
-        Some((was, was_hues, colors)) if was == inks && was_hues == hues => colors,
+        Some((was, was_inks, colors)) if was == seeds && was_inks == inks => colors,
         _ => {
             #[cfg(test)]
             crate::work_counts::band_derived();
-            let colors = BandColors::derive(inks, hues, PLATFORM_BAR_BASE);
-            last.set(Some((inks, hues, colors)));
+            let colors = BandColors::from_tokens(inks, &p.tokens());
+            last.set(Some((seeds, inks, colors)));
             colors
         }
     })
 }
 
+/// The theme's ANSI hues the band borrows: blue and cyan (slots 4 and 6) for
+/// a meter when the cursor is near-grey (ruling 250), red and yellow (slots 1
+/// and 3) as the seeds of its error and warn inks, and red and green (slot 2)
+/// as the chrome's danger and success hues.
+pub(crate) type MeterAnsi = AnsiHues;
+
+/// A scheme's borrowed hues (the tests' builtin grounds; the app reads its
+/// configured palette, [`ansi_of_palette`]).
+#[cfg(test)]
+pub(crate) fn ansi_of_scheme(s: &aterm_types::ColorScheme) -> MeterAnsi {
+    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+    AnsiHues {
+        red: rgb(s.ansi[1]),
+        green: rgb(s.ansi[2]),
+        yellow: rgb(s.ansi[3]),
+        blue: rgb(s.ansi[4]),
+        cyan: rgb(s.ansi[6]),
+    }
+}
+
+/// A terminal palette's borrowed hues.
+pub(crate) fn ansi_of_palette(p: &aterm_types::ColorPalette) -> MeterAnsi {
+    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+    AnsiHues {
+        red: rgb(p.get(1)),
+        green: rgb(p.get(2)),
+        yellow: rgb(p.get(3)),
+        blue: rgb(p.get(4)),
+        cyan: rgb(p.get(6)),
+    }
+}
+
+/// What every chrome surface paints from: the theme its surface draws on
+/// ([`crate::app_render::ChromeSurface`]), the terminal palette's hues when the host
+/// knows them, and the chrome colours the theme or the config authored. A bare
+/// [`Theme`] converts with neither, and derives every token from the theme alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ChromePalette {
+    pub theme: Theme,
+    pub ansi: Option<MeterAnsi>,
+    pub authored: AuthoredChrome,
+}
+
+impl From<Theme> for ChromePalette {
+    fn from(theme: Theme) -> Self {
+        Self {
+            theme,
+            ansi: None,
+            authored: AuthoredChrome::NONE,
+        }
+    }
+}
+
+impl ChromePalette {
+    /// The band's colours for this palette ([`band_colors`]).
+    pub(crate) fn colors(self) -> BandColors {
+        band_colors(self)
+    }
+
+    /// The theme's background, foreground and cursor as bytes.
+    pub(crate) fn inks(&self) -> ThemeInks {
+        ThemeInks {
+            bg: rgb(self.theme.bg),
+            fg: rgb(self.theme.fg),
+            cursor: rgb(self.theme.cursor),
+        }
+    }
+
+    /// What the tokens derive from, on this thread's band base ([`bar_base`]: the
+    /// platform's, or a test's choice), so the kept tones and tokens are keyed on it too.
+    pub(crate) fn seeds(&self) -> ChromeSeeds {
+        let inks = self.inks();
+        ChromeSeeds {
+            bg: inks.bg,
+            fg: inks.fg,
+            cursor: inks.cursor,
+            ansi: self.ansi,
+            authored: self.authored,
+            base: bar_base(),
+        }
+    }
+
+    /// The chrome tokens of this palette (`aterm_messages::tokens`). Kept for the
+    /// last seeds asked for, per thread, as [`band_colors`] keeps its tones: every
+    /// surface asks per paint.
+    pub(crate) fn tokens(&self) -> ChromeTokens {
+        let seeds = self.seeds();
+        std::thread_local! {
+            static LAST: std::cell::Cell<Option<(ChromeSeeds, ChromeTokens)>> =
+                const { std::cell::Cell::new(None) };
+        }
+        LAST.with(|last| match last.get() {
+            Some((was, tokens)) if was == seeds => tokens,
+            _ => {
+                let tokens = ChromeTokens::derive(&seeds);
+                last.set(Some((seeds, tokens)));
+                tokens
+            }
+        })
+    }
+}
+
+/// A theme's authored chrome colours as the tokens take them.
+pub(crate) fn authored_of(c: &aterm_types::scheme::ChromeColors) -> AuthoredChrome {
+    let bytes = |c: Option<aterm_types::Rgb>| c.map(|c| [c.r, c.g, c.b]);
+    AuthoredChrome {
+        accent: bytes(c.accent),
+        active_tab: bytes(c.active_tab),
+        border: bytes(c.border),
+        search_match: bytes(c.search_match),
+    }
+}
+
+/// The base this thread's bands are derived on: the platform's
+/// ([`PLATFORM_BAR_BASE`]), or in a test the one
+/// [`lay_bands_on_the_theme_blend_for_test`] chose.
+fn bar_base() -> BarBase {
+    #[cfg(test)]
+    if let Some(base) = BAR_BASE_FOR_TEST.get() {
+        return base;
+    }
+    PLATFORM_BAR_BASE
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// This test thread's band base in place of the platform's ([`bar_base`]).
+    static BAR_BASE_FOR_TEST: std::cell::Cell<Option<BarBase>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Derive this test thread's bands on the theme blend, the web module's base
+/// (`aterm_wasm`'s `BandInks::derive(.., BarBase::Blend)`), in place of the
+/// platform's: Linux's band sits on its CSD headerbar grey instead
+/// ([`PLATFORM_BAR_BASE`]), so a host test of the band the web module must
+/// match draws it on the blend there too.
+#[cfg(test)]
+pub(crate) fn lay_bands_on_the_theme_blend_for_test() {
+    BAR_BASE_FOR_TEST.set(Some(BarBase::Blend));
+}
+
 /// Where this platform's band ground comes from: on Linux the CSD headerbar grey
 /// ([`CSD_HEADERBAR_DARK`]/[`CSD_HEADERBAR_LIGHT`]), elsewhere the theme blend.
 #[cfg(target_os = "linux")]
-const PLATFORM_BAR_BASE: BarBase = BarBase::Fixed {
+pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Fixed {
     light: CSD_HEADERBAR_LIGHT,
     dark: CSD_HEADERBAR_DARK,
 };
 #[cfg(not(target_os = "linux"))]
-const PLATFORM_BAR_BASE: BarBase = BarBase::Blend;
+pub(crate) const PLATFORM_BAR_BASE: BarBase = BarBase::Blend;
 
 /// The presence tones: the rim's three hues and the story dot
 /// (`aterm_messages::presence::PresenceTones`).
@@ -360,14 +427,16 @@ pub(crate) use aterm_messages::presence::PresenceTones;
 /// [`presence_tones`]' hues held to the AA 4.5:1 text floor against the band. Used by
 /// [`crate::message_band::paint_presence_row`] for the hand and phase slots; the rim
 /// keeps the 3:1 tones.
-pub(crate) fn presence_inks(theme: Theme) -> PresenceTones {
-    aterm_messages::presence::inks(presence_tones(theme), band_colors(theme).bar_bg)
+pub(crate) fn presence_inks(p: impl Into<ChromePalette>) -> PresenceTones {
+    let p = p.into();
+    aterm_messages::presence::inks(presence_tones(p), band_colors(p).bar_bg)
 }
 
 /// The presence tones for `theme` on its band, or the High Contrast vocabulary's own
 /// words for them under an OS-forced palette (`aterm_messages::presence::tones`).
-pub(crate) fn presence_tones(theme: Theme) -> PresenceTones {
-    aterm_messages::presence::tones(rgb(theme.bg), &band_colors(theme), forced_chrome())
+pub(crate) fn presence_tones(p: impl Into<ChromePalette>) -> PresenceTones {
+    let p = p.into();
+    aterm_messages::presence::tones(rgb(p.theme.bg), &band_colors(p), forced_chrome())
 }
 
 /// Build one render cell for compact chrome — the renderer's (`aterm_render::band`,
@@ -376,8 +445,8 @@ pub(crate) use aterm_render::band::cell;
 
 /// A theme-derived blank band cell with a top seam.
 #[must_use]
-pub(crate) fn blank_cell(theme: Theme) -> RenderCell {
-    let colors = band_colors(theme);
+pub(crate) fn blank_cell(p: impl Into<ChromePalette>) -> RenderCell {
+    let colors = band_colors(p);
     cell(' ', colors.label, colors.bar_bg, false, true)
 }
 
@@ -673,9 +742,9 @@ mod tests {
         assert_eq!(published_forced_chrome(), None);
     }
 
-    /// On Linux the band's base tone equals the CSD headerbar it sits under
-    /// (`#303030` dark, `#EBEBEB` light) for every theme of that appearance; a near miss
-    /// reads as two stacked headers.
+    /// On Linux the band's base tone is the Adwaita headerbar's (`#303030` dark,
+    /// `#EBEBEB` light) for every theme of that appearance: the band is the header of
+    /// a window the compositor leaves undecorated.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_band_base_tone_is_the_exact_csd_headerbar_gray() {
@@ -742,7 +811,7 @@ mod tests {
         }
     }
 
-    /// THE TONES ARE KEPT FOR THE SAME THEME (`band_colors_with`): asked again
+    /// THE TONES ARE KEPT FOR THE SAME THEME (`band_colors`): asked again
     /// for the theme last asked for, nothing is derived and the tones are the
     /// derivation's exactly; every other theme, the same theme with the
     /// meter's hues, and the first theme again each derive anew, their tones
@@ -757,12 +826,7 @@ mod tests {
                     fg: rgb(theme.fg),
                     cursor: rgb(theme.cursor),
                 },
-                ansi.map(|a| AnsiHues {
-                    red: a.red,
-                    yellow: a.yellow,
-                    blue: a.blue,
-                    cyan: a.cyan,
-                }),
+                ansi,
                 PLATFORM_BAR_BASE,
             )
         };
@@ -773,6 +837,7 @@ mod tests {
         assert!(themes.len() > 2, "CONTROL: themes to tell apart");
         let ansi = MeterAnsi {
             red: [200, 40, 40],
+            green: [40, 200, 40],
             yellow: [200, 200, 40],
             blue: [40, 40, 200],
             cyan: [40, 200, 200],
@@ -794,12 +859,26 @@ mod tests {
                 0,
                 "kept, not derived"
             );
-            let hued = band_colors_with(theme, Some(ansi));
+            let hued = band_colors(ChromePalette {
+                theme,
+                ansi: Some(ansi),
+                authored: AuthoredChrome::NONE,
+            });
             assert_eq!(
                 hued,
                 derive(theme, Some(ansi)),
                 "the hues are the key's too"
             );
+            assert_eq!(crate::work_counts::take_band_derives(), 1);
+            // So is what the theme authored.
+            let _ = band_colors(ChromePalette {
+                theme,
+                ansi: Some(ansi),
+                authored: AuthoredChrome {
+                    border: Some([0x80; 3]),
+                    ..AuthoredChrome::NONE
+                },
+            });
             assert_eq!(crate::work_counts::take_band_derives(), 1);
         }
         assert_ne!(

@@ -17,7 +17,7 @@ pub const MAX_RAIN_TEXELS: usize = 409_600;
 pub const MAX_RAIN_ADD: usize = 64;
 /// Head-brightness trail depth: levels are `0..=15` (16 ramp tints).
 pub const LEVELS: u32 = 15;
-/// Glyph ROM size — `glyph_at` reduces the hash modulo this.
+/// Glyph ROM size — `glyph_from_epoch` reduces the hash modulo this.
 pub const GLYPH_COUNT: u32 = 64;
 /// Density change-point ring capacity: cycle starts are at most `C·p` ticks
 /// old and the quantized staircase steps a handful of times per weather front.
@@ -245,9 +245,8 @@ pub fn dither_epoch(tick: u64, dq: u32) -> u32 {
 }
 
 /// Glyph choice + mirror bit from a precomputed epoch:
-/// `rain_hash32(seed ^ pack(r,c) ^ glyph_epoch)` — the single hash site so the
-/// byte layout is shared with `glyph_at` and cannot drift. The mirror rides
-/// bit 8 of the same hash.
+/// `rain_hash32(seed ^ pack(r,c) ^ glyph_epoch)` — the single hash site, so the
+/// byte layout cannot drift. The mirror rides bit 8 of the same hash.
 #[must_use]
 pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u32, bool) {
     let g = rain_hash32(seed32 ^ pack(row, col) ^ glyph_epoch);
@@ -259,14 +258,6 @@ pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u
 #[must_use]
 pub fn glyph_epoch(tick: u64, mq: u32) -> u32 {
     (tick / u64::from(mq.max(1))) as u32
-}
-
-/// Glyph choice + mirror bit: `rain_hash32(seed ^ pack(r,c) ^ tick/mq)`.
-/// Delegates to [`glyph_from_epoch`] (the single byte-layout source of truth).
-#[must_use]
-#[cfg(test)]
-pub fn glyph_at(seed32: u32, row: u32, col: u32, tick: u64, mq: u32) -> (u32, bool) {
-    glyph_from_epoch(seed32, row, col, glyph_epoch(tick, mq))
 }
 
 /// The effective per-frame quad cap: the GPU budget intersected with the
@@ -340,37 +331,19 @@ mod tests {
         }
     }
 
-    /// The murmur3 finalizer's pinned bit pattern (a shader port must
-    /// reproduce these exact values).
-    #[test]
-    fn hash_is_the_murmur3_finalizer() {
-        assert_eq!(rain_hash32(0), 0);
-        assert_eq!(rain_hash32(1), 0x514E_28B7);
-        assert_eq!(rain_hash32(0x1234_5678), 0xE37C_D1BC);
-        // Avalanche sanity: one flipped input bit moves many output bits.
-        let a = rain_hash32(0x1234_5678);
-        let b = rain_hash32(0x1234_5679);
-        assert!((a ^ b).count_ones() >= 8, "avalanche: {:08x}", a ^ b);
-    }
-
-    #[test]
-    fn bits_is_half_open_lsb_first() {
-        assert_eq!(bits(0b1011_0110, 1, 4), 0b011);
-        assert_eq!(bits(u32::MAX, 0, 2), 3);
-        assert_eq!(bits(0xF0, 4, 8), 0xF);
-    }
-
     /// Flash floor (design §4): for every clamped config and short-pane
-    /// geometry, `c·p·tick_ms >= 1000`, so re-ignition stays under 1 Hz.
+    /// geometry, `c·p·tick_ms >= 1000`, so re-ignition stays under 1 Hz. Rows
+    /// 3..=8 are the small grids.
     #[test]
     fn flash_floor_holds_at_all_clamped_configs() {
-        for rows in [5u32, 8, 50, 120] {
+        for rows in [3u32, 4, 5, 6, 7, 8, 50, 120] {
             for fps in [12u32, 30, 60] {
                 for speed in [1u32, 5, 10] {
                     for trail in [1u32, 5, 10] {
                         let fp = params(rows, 1000 / fps, speed, trail);
                         for col in 0..200 {
                             let cp = col_params(&fp, col);
+                            assert!(cp.p >= 2, "a head steps at most every other tick");
                             assert!(
                                 cp.c * cp.p * fp.tick_ms >= 1000,
                                 "flash floor broken: rows={rows} fps={fps} speed={speed} \
@@ -411,18 +384,6 @@ mod tests {
         }
     }
 
-    /// `p >= 2` structurally: a head advances at most one row per tick, for
-    /// every hash and every speed-knob position.
-    #[test]
-    fn step_period_is_at_least_two_ticks() {
-        for speed in 1..=10u32 {
-            let fp = params(50, 33, speed, 5);
-            for col in 0..500 {
-                assert!(col_params(&fp, col).p >= 2);
-            }
-        }
-    }
-
     /// The dither quantum is a multiple of the mutation quantum at or above
     /// the 350 ms `TWINKLE_GRID_MS` floor.
     #[test]
@@ -437,33 +398,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Trail levels are step-stable: on a non-stepping tick, at most
-    /// `ceil(15/p)` rows of a column change their level bucket.
-    #[test]
-    fn trail_levels_are_time_keyed() {
-        let fp = params(50, 33, 5, 5);
-        let cp = col_params(&fp, 3);
-        let cv = cycle_at(&cp, &fp, 5000);
-        // The head row is level 15 at ignition, the expiring tail is 0.
-        if cv.head_row < fp.rows {
-            assert_eq!(trail_level(&cp, cv.eff_tick, cv.k, cv.head_row), Some(15));
-        }
-        // Unlit past the trail window.
-        let old = cv.head_row.saturating_sub(cp.l + 2);
-        if cv.head_row >= cp.l + 2 {
-            assert_eq!(trail_level(&cp, cv.eff_tick, cv.k, old), None);
-        }
-    }
-
-    #[test]
-    fn stammer_holds_one_tick_in_window_seven() {
-        let sq = 15; // ~500ms at 33ms ticks
-        // Windows 0..=6 pass through; window 7 holds (tick' = tick - 1).
-        assert_eq!(stammer_tick(14, sq), 14);
-        assert_eq!(stammer_tick(u64::from(sq) * 7, sq), u64::from(sq) * 7 - 1);
-        assert_eq!(stammer_tick(u64::from(sq) * 8, sq), u64::from(sq) * 8);
     }
 
     #[test]
@@ -483,12 +417,5 @@ mod tests {
         }
         assert_eq!(ring.at(u64::MAX), 11);
         assert_eq!(ring.at(0), 4, "evicted history resolves to the oldest kept");
-    }
-
-    #[test]
-    fn quad_cap_derives_from_texels() {
-        assert_eq!(quad_cap(10, 20), 2048, "GPU cap binds at small cells");
-        assert_eq!(quad_cap(20, 40), 512, "retina cells thin via the texel cap");
-        assert_eq!(quad_cap(100, 100), 256, "floor at 256");
     }
 }

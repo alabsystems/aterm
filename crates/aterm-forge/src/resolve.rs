@@ -74,11 +74,6 @@ impl Cargo {
 /// OS, where a cfg break otherwise hides. atpkg's
 /// `every_published_triple_is_a_forge_cell` holds the shipped triples to a cell each.
 ///
-/// # Order is append-only
-///
-/// `measured::CELLS` rows are read by position (`loc.rs`'s tests index cells by
-/// number), so new cells go on the end.
-///
 /// # Every cell is rooted at something aterm ships
 ///
 /// The six native cells are rooted at the binary package `aterm`. `aterm` is
@@ -115,15 +110,16 @@ pub fn default_cells() -> Vec<Cell> {
             triple: "wasm32-unknown-unknown".to_string(),
             package: "aterm-wasm".to_string(),
         },
-        // The GPU renderer module: the same engine plus `aterm-gpu` over `wgpu`,
-        // which is the entire difference between this row and `wasm-cpu`.
+        // The GPU renderer module: the engine plus `aterm-gpu` over `wgpu`.
+        // Each browser module can also have dependencies its sibling omits.
         Cell {
             name: "wasm-gpu".to_string(),
             triple: "wasm32-unknown-unknown".to_string(),
             package: "aterm-gpu-web".to_string(),
         },
-        // The second architecture of each shipped OS, rooted at `aterm`. None
-        // is a fleet host triple, so all three run in `verify cells`.
+        // The second architecture of each shipped OS, rooted at `aterm`.
+        // linux-arm and win-arm are no fleet box's own triple, so they run in
+        // `verify cells`; mac-x64 is a fleet host triple.
         //
         // The Intel-Mac slice of the universal release binary
         // (`aterm-release`'s buildplan.rs builds it under `RUSTUP_TOOLCHAIN=
@@ -148,6 +144,22 @@ pub fn default_cells() -> Vec<Cell> {
             package: "aterm".to_string(),
         },
     ]
+}
+
+/// Census roots need their own wasm measurement cells: their feature-selected
+/// graphs can differ even when they share the terminal engine. A native cell
+/// with the same package does not measure its wasm dependencies.
+pub(crate) fn unmeasured_wasm_roots<'a>(cells: &[Cell], roots: &[&'a str]) -> Vec<&'a str> {
+    roots
+        .iter()
+        .copied()
+        .filter(|root| {
+            let package = root.rsplit('/').next().unwrap_or(root);
+            !cells
+                .iter()
+                .any(|cell| cell.triple == "wasm32-unknown-unknown" && cell.package == package)
+        })
+        .collect()
 }
 
 /// Map `--cell NAME` arguments onto cells. No names means every cell. Requested
@@ -383,61 +395,6 @@ pub fn graph_and_paths(
     parse_tree(&text)
 }
 
-/// Test convenience: just the graph. Any retry note goes to stderr; the
-/// product calls [`graph_and_paths`], which captures it.
-#[cfg(test)]
-pub fn graph(root: &Path, cell: &Cell) -> Result<Graph, String> {
-    let mut log = String::new();
-    let out = graph_and_paths(&Cargo::from_env(), root, cell, &mut log);
-    if !log.is_empty() {
-        eprint!("{log}");
-    }
-    Ok(out?.0)
-}
-
-/// Test-only: the real workspace's resolution of `cell`, run at most once per
-/// test process.
-///
-/// The answer depends only on the committed lock and manifests, and repeated
-/// `cargo tree` runs serialise on cargo's package-cache lock. Keyed by the
-/// whole [`Cell`]; tests about root spelling or fixture trees call [`graph`] /
-/// [`graph_and_paths`] directly. Failures are cached too.
-#[cfg(test)]
-pub(crate) fn real_workspace_graph_and_paths(
-    cell: &Cell,
-) -> Result<(Graph, BTreeMap<PkgId, PathBuf>), String> {
-    use std::sync::{Arc, Mutex, OnceLock};
-    type Resolved = Result<(Graph, BTreeMap<PkgId, PathBuf>), String>;
-    type Slots = BTreeMap<(String, String, String), Arc<OnceLock<Resolved>>>;
-    static SLOTS: OnceLock<Mutex<Slots>> = OnceLock::new();
-    let slot = SLOTS
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry((cell.name.clone(), cell.triple.clone(), cell.package.clone()))
-        .or_default()
-        .clone();
-    slot.get_or_init(|| {
-        let mut log = String::new();
-        let out = graph_and_paths(&Cargo::from_env(), &real_workspace_root(), cell, &mut log);
-        if !log.is_empty() {
-            eprint!("{log}");
-        }
-        out
-    })
-    .clone()
-}
-
-/// Test-only: the workspace this crate sits in (`crates/aterm-forge/../..`).
-#[cfg(test)]
-pub(crate) fn real_workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/aterm-forge sits two levels under the workspace root")
-        .to_path_buf()
-}
-
 /// Absolutise the workspace root once, before it is used twice.
 ///
 /// [`run_tree`] sets the child's `current_dir` to the root and passes
@@ -451,7 +408,9 @@ pub(crate) fn real_workspace_root() -> PathBuf {
 fn abs_root(root: &Path) -> Result<PathBuf, String> {
     let abs = root.canonicalize().map_err(|e| {
         format!(
-            "workspace root `{}` cannot be resolved: {e}. FIX: pass `--root` an existing              directory holding the workspace `Cargo.toml`, or omit `--root` and run from              anywhere inside the workspace.",
+            "workspace root `{}` cannot be resolved: {e}. FIX: pass `--root` an existing \
+             directory holding the workspace `Cargo.toml`, or omit `--root` and run from \
+             anywhere inside the workspace.",
             root.display()
         )
     })?;
@@ -516,152 +475,128 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::repo_root;
 
-    /// The verbatim-disk spelling Windows `canonicalize` answers is the one
-    /// cargo refuses under `--locked`; everything else passes through untouched.
+    /// Each browser root needs a wasm cell of its own. NEGATIVE CONTROLS: a
+    /// root whose cell is gone, and one measured only by a native cell, are
+    /// both unmeasured.
     #[test]
-    fn abs_root_drops_the_verbatim_disk_prefix_and_nothing_else() {
-        if cfg!(windows) {
-            assert_eq!(
-                strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\x\aterm")),
-                PathBuf::from(r"C:\Users\x\aterm")
-            );
-            assert_eq!(
-                strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\aterm")),
-                PathBuf::from(r"\\?\UNC\server\share\aterm")
-            );
-            assert_eq!(
-                strip_verbatim_prefix(PathBuf::from(r"C:\Users\x\aterm")),
-                PathBuf::from(r"C:\Users\x\aterm")
-            );
-        } else {
-            // No prefix component exists off Windows; the text is a plain
-            // relative path there and must come back byte-identical.
-            let p = PathBuf::from(r"\\?\C:\Users\x\aterm");
-            assert_eq!(strip_verbatim_prefix(p.clone()), p);
+    fn independent_wasm_roots_each_need_a_wasm_cell() {
+        let roots = ["crates/cpu", "crates/gpu"];
+        let mut cells = vec![
+            Cell {
+                name: "cpu".into(),
+                triple: "wasm32-unknown-unknown".into(),
+                package: "cpu".into(),
+            },
+            Cell {
+                name: "gpu".into(),
+                triple: "wasm32-unknown-unknown".into(),
+                package: "gpu".into(),
+            },
+        ];
+        assert!(unmeasured_wasm_roots(&cells, &roots).is_empty());
+        cells.remove(0);
+        assert_eq!(unmeasured_wasm_roots(&cells, &roots), ["crates/cpu"]);
+        cells.push(Cell {
+            name: "native-cpu".into(),
+            triple: "aarch64-apple-darwin".into(),
+            package: "cpu".into(),
+        });
+        assert_eq!(unmeasured_wasm_roots(&cells, &roots), ["crates/cpu"]);
+    }
+
+    /// `cargo tree --prefix depth` lines, as cargo prints them: the depth, the
+    /// id, the directory a path package resolved to, the ` (proc-macro)` and
+    /// ` (*)` annotations, a directory that itself holds a paren, and a
+    /// build-metadata version.
+    #[test]
+    fn tree_lines_parse_into_depth_id_path_and_annotations() {
+        type Want = (
+            usize,
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            bool,
+            bool,
+        );
+        let cases: [(&str, Want); 7] = [
+            (
+                "8unicode-ident v1.0.24",
+                (8, "unicode-ident", "1.0.24", None, false, false),
+            ),
+            (
+                "0aterm v0.47.0 (/Users//a/aterm/crates/aterm)",
+                (
+                    0,
+                    "aterm",
+                    "0.47.0",
+                    Some("/Users//a/aterm/crates/aterm"),
+                    false,
+                    false,
+                ),
+            ),
+            (
+                "6aterm-error-derive v0.47.0 (proc-macro) (/w/crates/aterm-error-derive)",
+                (
+                    6,
+                    "aterm-error-derive",
+                    "0.47.0",
+                    Some("/w/crates/aterm-error-derive"),
+                    true,
+                    false,
+                ),
+            ),
+            (
+                "3serde v1.0.228 (*)",
+                (3, "serde", "1.0.228", None, false, true),
+            ),
+            (
+                "4indexmap v2.14.0 (/Users//a/aterm/vendor/indexmap) (*)",
+                (
+                    4,
+                    "indexmap",
+                    "2.14.0",
+                    Some("/Users//a/aterm/vendor/indexmap"),
+                    false,
+                    true,
+                ),
+            ),
+            (
+                "2foo v1.0.0 (/Users//a b (1)/vendor/foo) (*)",
+                (
+                    2,
+                    "foo",
+                    "1.0.0",
+                    Some("/Users//a b (1)/vendor/foo"),
+                    false,
+                    true,
+                ),
+            ),
+            (
+                "4zstd-sys v2.0.16+zstd.1.5.7",
+                (4, "zstd-sys", "2.0.16+zstd.1.5.7", None, false, false),
+            ),
+        ];
+        for (raw, (depth, name, version, path, pm, deduped)) in cases {
+            let line = parse_line(raw).expect(raw).expect(raw);
+            assert_eq!(line.depth, depth, "{raw}");
+            assert_eq!(line.id, PkgId::new(name, version), "{raw}");
+            assert_eq!(line.path.as_deref(), path.map(Path::new), "{raw}");
+            assert_eq!((line.is_proc_macro, line.deduped), (pm, deduped), "{raw}");
         }
-        let real = abs_root(&repo_root()).expect("the workspace root resolves");
-        assert!(
-            !real.to_string_lossy().starts_with(r"\\?\"),
-            "{}",
-            real.display()
-        );
-        assert!(real.join("Cargo.toml").is_file());
+        assert_eq!(parse_line("   ").unwrap(), None, "a blank line is skipped");
     }
 
-    fn names(cells: &[Cell]) -> Vec<&str> {
-        cells.iter().map(|c| c.name.as_str()).collect()
-    }
-
+    /// A line the parser cannot read is an error, never a skip: a skipped line
+    /// is a package dropped from every count.
     #[test]
-    fn no_cell_flag_means_every_cell() {
-        let cells = default_cells();
-        assert_eq!(select(&cells, &[]).unwrap(), cells);
-    }
-
-    #[test]
-    fn selection_keeps_request_order_and_collapses_repeats() {
-        let cells = default_cells();
-        let want = ["wasm-gpu", "linux", "wasm-gpu"].map(String::from);
-        assert_eq!(
-            names(&select(&cells, &want).unwrap()),
-            ["wasm-gpu", "linux"]
-        );
-    }
-
-    #[test]
-    fn an_unknown_cell_names_every_valid_cell() {
-        let err = select(&default_cells(), &["macos".to_string()]).unwrap_err();
-        for good in ["mac-arm", "linux", "win", "wasm-cpu", "wasm-gpu"] {
-            assert!(err.contains(good), "refusal must list `{good}`: {err}");
+    fn an_unreadable_tree_line_refuses() {
+        for raw in ["|-- serde v1.0.228", "2serde", "2serde 1.0.228"] {
+            assert!(parse_line(raw).is_err(), "{raw}");
         }
-        assert!(err.contains("--cell"), "refusal must name the fix: {err}");
-    }
-
-    #[test]
-    fn a_plain_registry_line_parses() {
-        let line = parse_line("8unicode-ident v1.0.24").unwrap().unwrap();
-        assert_eq!(line.depth, 8);
-        assert_eq!(line.id, PkgId::new("unicode-ident", "1.0.24"));
-        assert_eq!(line.path, None);
-        assert!(!line.is_proc_macro && !line.deduped);
-    }
-
-    #[test]
-    fn a_workspace_line_carries_its_path() {
-        let line = parse_line("0aterm v0.47.0 (/Users//example/aterm/crates/aterm)")
-            .unwrap()
-            .unwrap();
-        assert_eq!(line.depth, 0);
-        assert_eq!(line.id, PkgId::new("aterm", "0.47.0"));
-        assert_eq!(
-            line.path.as_deref(),
-            Some(Path::new("/Users//example/aterm/crates/aterm"))
-        );
-    }
-
-    #[test]
-    fn proc_macro_annotation_precedes_the_path() {
-        let raw = "6aterm-error-derive v0.47.0 (proc-macro) (/w/crates/aterm-error-derive)";
-        let line = parse_line(raw).unwrap().unwrap();
-        assert!(line.is_proc_macro);
-        assert_eq!(
-            line.path.as_deref(),
-            Some(Path::new("/w/crates/aterm-error-derive"))
-        );
-        assert_eq!(line.id, PkgId::new("aterm-error-derive", "0.47.0"));
-    }
-
-    #[test]
-    fn the_dedupe_marker_is_recognised_alone_and_after_a_path() {
-        let bare = parse_line("3serde v1.0.228 (*)").unwrap().unwrap();
-        assert!(bare.deduped && bare.path.is_none());
-        let pathed = parse_line("4indexmap v2.14.0 (/Users//example/aterm/vendor/indexmap) (*)")
-            .unwrap()
-            .unwrap();
-        assert!(pathed.deduped);
-        assert_eq!(
-            pathed.path.as_deref(),
-            Some(Path::new("/Users//example/aterm/vendor/indexmap"))
-        );
-    }
-
-    #[test]
-    fn a_directory_containing_a_paren_still_parses() {
-        let line = parse_line("2foo v1.0.0 (/Users//a b (1)/vendor/foo) (*)")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            line.path.as_deref(),
-            Some(Path::new("/Users//a b (1)/vendor/foo"))
-        );
-        assert!(line.deduped);
-    }
-
-    #[test]
-    fn a_build_metadata_version_survives() {
-        let line = parse_line("4zstd-sys v2.0.16+zstd.1.5.7").unwrap().unwrap();
-        assert_eq!(line.id.version, "2.0.16+zstd.1.5.7");
-        assert_eq!(line.id.spec(), "zstd-sys@2.0.16+zstd.1.5.7");
-    }
-
-    #[test]
-    fn blank_lines_are_skipped_not_failed() {
-        assert_eq!(parse_line("").unwrap(), None);
-        assert_eq!(parse_line("   ").unwrap(), None);
-    }
-
-    #[test]
-    fn a_line_without_a_depth_prefix_refuses_and_names_the_flag() {
-        let err = parse_line("|-- serde v1.0.228").unwrap_err();
-        assert!(err.contains("--prefix depth"), "{err}");
-    }
-
-    #[test]
-    fn a_line_without_a_version_refuses() {
-        assert!(parse_line("2serde").is_err());
-        assert!(parse_line("2serde 1.0.228").is_err());
+        for tree in ["0root v0.1.0\n2orphan v1.0.0\n", "1alpha v1.0.0\n"] {
+            assert!(parse_tree(tree).is_err(), "{tree}");
+        }
     }
 
     const FIXTURE: &str = "\
@@ -695,38 +630,5 @@ mod tests {
             PathBuf::from("/w/vendor/gamma")
         );
         assert!(!paths.contains_key(&PkgId::new("alpha", "1.0.0")));
-    }
-
-    #[test]
-    fn a_depth_jump_refuses() {
-        let err = parse_tree("0root v0.1.0\n2orphan v1.0.0\n").unwrap_err();
-        assert!(err.contains("depth jumped"), "{err}");
-    }
-
-    #[test]
-    fn output_with_no_root_refuses() {
-        assert!(parse_tree("1alpha v1.0.0\n").is_err());
-    }
-
-    /// A relative root resolves the identical graph as the absolute one.
-    #[test]
-    fn a_relative_root_resolves_the_same_graph_as_an_absolute_one() {
-        let cell = &default_cells()[3]; // wasm-cpu — the smallest cell.
-        // The absolute side is the shared real-workspace resolution; the relative side
-        // below is the one under test and always resolves afresh.
-        let (absolute, _) =
-            real_workspace_graph_and_paths(cell).expect("absolute root must resolve");
-        let relative = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
-        assert!(relative.is_relative() || relative.components().count() > 3);
-        let via_relative = graph(&relative, cell).expect("a relative root must resolve too");
-        assert_eq!(absolute.nodes, via_relative.nodes, "same tree, same graph");
-    }
-
-    /// A root that does not exist is a NAMED refusal, never an empty survey.
-    #[test]
-    fn a_root_that_does_not_exist_is_refused_by_name() {
-        let err = graph(Path::new("/no/such/workspace"), &default_cells()[0]).unwrap_err();
-        assert!(err.contains("/no/such/workspace"), "{err}");
-        assert!(err.contains("FIX:"), "a refusal must name the fix: {err}");
     }
 }

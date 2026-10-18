@@ -233,8 +233,8 @@ impl Grid {
     /// (`Terminal::process_at`), an alternate-screen switch and a reset.
     #[inline]
     #[cfg_attr(
-        any(test, feature = "spec-anchors"),
-        aterm_spec::refines(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
             machine = "ResizeRowReuse",
             action = "Output",
             project = "grid::tests::resize_row_reuse::resize_row_reuse_conforms"

@@ -138,6 +138,30 @@ pub fn lease(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
     }
 }
 
+/// [`lease`], failing closed: a build under the store whose lease cannot be laid is refused
+/// rather than run on unleased. For a toolchain a gate RUNS (the bundle's hello sysroot),
+/// whose reclaim mid-run would leave the gate proving nothing.
+///
+/// # Errors
+///
+/// [`lease`]'s, and a refusal when the store build's lease could not be taken.
+pub fn lease_required(ctx: &Ctx, dir: &Path, who: &str) -> Result<Held> {
+    match atpkg::lease::hold_for(&ctx.pkg_prefix, dir, who, atpkg::lease::DEFAULT_WAIT) {
+        Ok(atpkg::lease::Hold::Held(l)) => Ok(Held::Lease(l)),
+        Ok(atpkg::lease::Hold::Unmanaged) => Ok(Held::Nothing),
+        Ok(atpkg::lease::Hold::NotTaken(subject, why)) => Err(Error::refused(format!(
+            "no lease on {} ({why:?}) — an update landing mid-run could reclaim it, so \
+             nothing runs on it unleased",
+            subject.describe()
+        ))),
+        Err(missing) => Err(Error::refused(format!(
+            "{} is gone (reclaimed after it was resolved, or never installed) — nothing runs \
+             on a toolchain that is not there",
+            ctx.shown(&missing.dir)
+        ))),
+    }
+}
+
 /// Admit the compiler in `bin` by content and lineage under `switch`'s policy, through
 /// the client's own checker; its record is the pack's provenance.
 ///

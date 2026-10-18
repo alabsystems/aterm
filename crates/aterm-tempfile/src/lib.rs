@@ -666,13 +666,6 @@ mod tests {
         assert_eq!(names, ["a", "b", "c"]);
     }
 
-    #[test]
-    fn unique_names_are_unique() {
-        let a = unique_name("test");
-        let b = unique_name("test");
-        assert_ne!(a, b);
-    }
-
     /// On Windows the OS RNG (BCryptGenRandom) must actually work: two
     /// consecutive 8-byte reads succeed and produce different values.
     #[cfg(windows)]

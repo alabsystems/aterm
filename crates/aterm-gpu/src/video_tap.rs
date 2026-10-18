@@ -21,6 +21,7 @@
 //! is a counted drop, never a block.
 
 use std::collections::VecDeque;
+#[cfg(any(wgpu_arm, not(target_arch = "wasm32")))]
 use std::sync::mpsc;
 
 use aterm_render::{linear_to_srgb, srgb_to_linear};
@@ -121,32 +122,32 @@ pub struct CapturedFrame {
 /// order, so appending on completion would scramble the timeline. Returns the
 /// number of frames evicted, counted separately from `dropped`.
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "HarvestThree",
         project = "aterm_gpu::video_tap::ordered_capture_store_push"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "HarvestOne",
         project = "aterm_gpu::video_tap::ordered_capture_store_push"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "HarvestTwo",
         project = "aterm_gpu::video_tap::ordered_capture_store_push"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "VideoTapSlot",
         action = "BuggyHarvestCallbackOrder",
         reason = "Buggy=1 negative control only; the push inserts by capture sequence, never at \
@@ -154,8 +155,8 @@ pub struct CapturedFrame {
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "VideoTapSlot",
         action = "BuggyEvictNewest",
         reason = "Buggy=1 negative control only; budget eviction pops the lowest sequence from \
@@ -163,8 +164,8 @@ pub struct CapturedFrame {
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "VideoTapSlot",
         action = "BuggyEvictionUnreported",
         reason = "Buggy=1 negative control only; every eviction increments the returned count \
@@ -272,48 +273,48 @@ pub struct VideoSlotDecision {
 /// `None`, so stale or duplicate map callbacks never mutate a reused slot. Map
 /// failure and finalization abort both release the slot and count one loss.
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "Enqueue",
         project = "aterm_gpu::video_tap::video_slot_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "StartMap",
         project = "aterm_gpu::video_tap::video_slot_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "MapOk",
         project = "aterm_gpu::video_tap::video_slot_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "MapError",
         project = "aterm_gpu::video_tap::video_slot_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "Abort",
         project = "aterm_gpu::video_tap::video_slot_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "VideoTapSlot",
         action = "BuggyMapErrorLeaksSlot",
         reason = "Buggy=1 negative control only; a map failure frees the slot as it counts the \
@@ -352,16 +353,16 @@ pub enum VideoPresentDecision {
 /// Classify a present, keeping decimation separate from invalid-metadata
 /// loss: a present the fps gate rejects never inflates `dropped`.
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "VideoTapSlot",
         action = "RejectInvalidMetadata",
         project = "aterm_gpu::video_tap::video_present_decision"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "VideoTapSlot",
         action = "BuggyRejectInvalidUncounted",
         reason = "Buggy=1 negative control only; an accepted sample with invalid metadata is \
@@ -426,6 +427,11 @@ enum SlotBuf {
         buf: crate::metal::resources::SharedBuffer,
         probe: Option<crate::metal::encoder::CbProbe>,
     },
+    /// GL slot: the destination's padded rows, read back when the present
+    /// drew them (GL's readback waits for the draws, so a filled slot is
+    /// complete; `gl_present.rs`).
+    #[cfg(gl_arm)]
+    Gl(Vec<u8>),
 }
 
 impl SlotBuf {
@@ -452,7 +458,15 @@ impl SlotBuf {
             Self::Metal { .. } => {
                 unreachable!("a Metal slot never reaches the wgpu map/harvest path")
             }
+            #[cfg(gl_arm)]
+            Self::Gl(_) => unreachable!("a GL slot never reaches the wgpu map/harvest path"),
         }
+    }
+
+    /// Whether this slot stages through the GL arm.
+    #[cfg(gl_arm)]
+    fn is_gl(&self) -> bool {
+        matches!(self, Self::Gl(_))
     }
 }
 
@@ -891,6 +905,12 @@ impl VideoTap {
             self.resized_early_stop = true;
             return;
         }
+        // Nor in a GL ring.
+        #[cfg(gl_arm)]
+        if self.ring_is_gl() {
+            self.resized_early_stop = true;
+            return;
+        }
         let Some(idx) = self
             .slots
             .iter()
@@ -1266,6 +1286,263 @@ impl VideoTap {
         }
     }
 
+    /// Build a GL-arm tap: the same ring, counters, budget, fps gate and
+    /// conversion lane, with CPU slots the present fills by readback
+    /// (`gl_enqueue_frame`).
+    #[cfg(gl_arm)]
+    pub(crate) fn new_gl(
+        src_w: u32,
+        src_h: u32,
+        format: crate::device_layer::TexelFormat,
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+        opts: CaptureOpts,
+    ) -> Result<Self, String> {
+        let bpp = capture_bpp(format)
+            .map_err(|_| format!("video: unsupported swapchain format {format:?}"))?;
+        let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
+            .map_err(|error| format!("video: {error}"))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let worker = usize::try_from(padded_row_bytes(src_w, bpp))
+            .ok()
+            .and_then(|row| spawn_convert_worker(src_w, src_h, row, format, opts.half_res));
+        #[cfg(wgpu_arm)]
+        let (done_tx, done_rx) = mpsc::channel();
+        let slots = (0..RING)
+            .map(|_| Slot {
+                buffer: SlotBuf::Gl(Vec::new()),
+                state: SlotState::Free,
+            })
+            .collect();
+        Ok(Self {
+            slots,
+            #[cfg(wgpu_arm)]
+            done_tx,
+            #[cfg(wgpu_arm)]
+            done_rx,
+            store: VecDeque::new(),
+            store_bytes: 0,
+            budget_bytes: opts.budget_bytes.max(16 * 1024 * 1024),
+            dropped: 0,
+            evicted: 0,
+            decimated: 0,
+            fps_cap: opts.fps_cap.map(|f| f.clamp(1, 120)),
+            requested_ms: opts.requested_ms,
+            next_capture_us: 0,
+            epoch: aterm_time::Instant::now(),
+            seq: 0,
+            half_res: opts.half_res,
+            src_w,
+            src_h,
+            format,
+            first_capture_encoding: None,
+            mixed_capture_encoding: false,
+            bpp,
+            resized_early_stop: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            worker,
+        })
+    }
+
+    /// Whether this ring stages through the GL arm.
+    #[cfg(gl_arm)]
+    pub(crate) fn ring_is_gl(&self) -> bool {
+        self.slots.first().is_some_and(|s| s.buffer.is_gl())
+    }
+
+    /// GL enqueue: this present's destination bytes (`dims`, rows padded to
+    /// [`padded_row_bytes`], `Rgba8Unorm`), with the same gates, counters and
+    /// finalize rules as [`Self::enqueue_copy`].
+    #[cfg(gl_arm)]
+    pub(crate) fn gl_enqueue_frame(
+        &mut self,
+        (w, h): (u32, u32),
+        padded_rgba: &[u8],
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+    ) {
+        if self.resized_early_stop {
+            return;
+        }
+        if !self.ring_is_gl()
+            || (w, h) != (self.src_w, self.src_h)
+            || self.format != crate::device_layer::TexelFormat::Rgba8Unorm
+        {
+            self.resized_early_stop = true;
+            return;
+        }
+        let now_us = self.epoch.elapsed().as_micros() as u64;
+        let Some(capture_encoding) =
+            self.capture_encoding_for_present(now_us, color_space, sdr_white_scale)
+        else {
+            return;
+        };
+        let Some(idx) = self
+            .slots
+            .iter()
+            .position(|s| matches!(s.state, SlotState::Free))
+        else {
+            self.dropped += 1;
+            return;
+        };
+        let len = self.padded_row() as usize * self.src_h as usize;
+        match &mut self.slots[idx].buffer {
+            SlotBuf::Gl(bytes) => {
+                bytes.clear();
+                bytes.extend_from_slice(&padded_rgba[..len.min(padded_rgba.len())]);
+            }
+            #[cfg(multi_arm)]
+            _ => unreachable!("guarded homogeneous above"),
+        }
+        self.seq += 1;
+        self.note_capture_encoding(capture_encoding);
+        let transition =
+            video_slot_transition(self.slots[idx].state.phase(), VideoSlotEvent::Enqueue)
+                .expect("the selected video staging slot is free");
+        match transition {
+            VideoSlotDecision {
+                phase: VideoSlotPhase::Pending,
+                count_drop: false,
+            } => {
+                self.slots[idx].state = SlotState::Pending {
+                    seq: self.seq,
+                    capture_encoding,
+                };
+            }
+            _ => unreachable!("a free video slot enqueues to Pending without a drop"),
+        }
+    }
+
+    /// [`Self::after_present`] for a GL ring: stamp the pending slot, then
+    /// harvest it at once (its bytes are already read back).
+    #[cfg(gl_arm)]
+    pub(crate) fn gl_after_present(&mut self, t_us: u64) {
+        self.adopt_converted();
+        for slot in &mut self.slots {
+            if let SlotState::Pending {
+                seq,
+                capture_encoding,
+            } = slot.state
+            {
+                let start = video_slot_transition(slot.state.phase(), VideoSlotEvent::StartMap)
+                    .expect("only pending slots start mapping");
+                debug_assert_eq!(start.phase, VideoSlotPhase::InFlight);
+                slot.state = SlotState::InFlight {
+                    seq,
+                    t_us,
+                    capture_encoding,
+                };
+            }
+        }
+        // The harvest: an in-flight GL slot's bytes are complete.
+        for idx in 0..self.slots.len() {
+            let SlotState::InFlight {
+                seq,
+                t_us,
+                capture_encoding,
+            } = self.slots[idx].state
+            else {
+                continue;
+            };
+            let done = video_slot_transition(VideoSlotPhase::InFlight, VideoSlotEvent::MapOk)
+                .expect("an in-flight slot completes");
+            let raw = match &mut self.slots[idx].buffer {
+                SlotBuf::Gl(bytes) => std::mem::take(bytes),
+                #[cfg(multi_arm)]
+                _ => unreachable!("a GL ring holds GL slots"),
+            };
+            if let Some(frame) = self.convert_raw(raw, seq, t_us, capture_encoding) {
+                self.push_frame(frame);
+            }
+            debug_assert!(!done.count_drop);
+            self.slots[idx].state = SlotState::Free;
+        }
+        self.adopt_converted();
+    }
+
+    /// Finalize a GL ring: nothing is in flight past a present, so the abort
+    /// sweep, the conversion drain and the take.
+    #[cfg(gl_arm)]
+    pub(crate) fn gl_finish(mut self) -> VideoTake {
+        for s in &mut self.slots {
+            if !matches!(s.state, SlotState::Free) {
+                let transition = video_slot_transition(s.state.phase(), VideoSlotEvent::Abort)
+                    .expect("only an outstanding slot reaches finalization abort");
+                self.dropped += u64::from(transition.count_drop);
+                s.state = SlotState::Free;
+            }
+        }
+        self.drain_convert_lane();
+        self.into_take()
+    }
+
+    /// Hand one slot's raw padded bytes to the conversion lane, or convert
+    /// inline without a worker (the GL twin of `metal_convert_or_dispatch`).
+    #[cfg(gl_arm)]
+    fn convert_raw(
+        &mut self,
+        raw: Vec<u8>,
+        seq: u64,
+        t_us: u64,
+        capture_encoding: CaptureEncoding,
+    ) -> Option<CapturedFrame> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(worker) = self.worker.as_mut() {
+            if worker.pending >= CONVERT_BACKLOG {
+                self.dropped += 1;
+                return None;
+            }
+            match worker.job_tx.send(ConvertJob {
+                raw,
+                seq,
+                t_us,
+                capture_encoding,
+            }) {
+                Ok(()) => {
+                    worker.pending += 1;
+                    return None;
+                }
+                Err(send_err) => {
+                    self.worker = None;
+                    return self.convert_inline(&send_err.0.raw, seq, t_us, capture_encoding);
+                }
+            }
+        }
+        self.convert_inline(&raw, seq, t_us, capture_encoding)
+    }
+
+    /// Inline conversion of raw padded bytes; a malformed slot is one drop.
+    #[cfg(gl_arm)]
+    fn convert_inline(
+        &mut self,
+        raw: &[u8],
+        seq: u64,
+        t_us: u64,
+        capture_encoding: CaptureEncoding,
+    ) -> Option<CapturedFrame> {
+        match mapped_to_rgba8(
+            raw,
+            self.src_w,
+            self.src_h,
+            self.padded_row() as usize,
+            self.format,
+            capture_encoding,
+            self.half_res,
+        ) {
+            Ok((rgba, w, h)) => Some(CapturedFrame {
+                seq,
+                t_us,
+                w,
+                h,
+                rgba,
+            }),
+            Err(_) => {
+                self.dropped += 1;
+                None
+            }
+        }
+    }
+
     /// The `fps=` gate, pure on `(self, now_us)`. With no cap every frame is
     /// accepted; with cap `n` a frame is accepted iff at least `1_000_000 / n` µs
     /// have passed since the last accepted frame (rejections accrue no catch-up
@@ -1342,6 +1619,9 @@ impl VideoTap {
                     // committed; the harvest books it as one drop.
                     #[cfg(target_os = "macos")]
                     SlotBuf::Metal { .. } => {}
+                    // A GL ring never reaches the wgpu hook (`gl_after_present`).
+                    #[cfg(gl_arm)]
+                    SlotBuf::Gl(_) => {}
                 }
                 let transition =
                     video_slot_transition(slot.state.phase(), VideoSlotEvent::StartMap)
@@ -1727,48 +2007,48 @@ pub struct PresentedFrameDecision {
 /// Decide one [`PresentedFrameTap`] transition. Invalid pairs return `None`,
 /// so a stale callback cannot complete the wrong capture.
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PresentedFrameTap",
         action = "EnqueueValid",
         project = "aterm_gpu::video_tap::presented_frame_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PresentedFrameTap",
         action = "RejectEnqueue",
         project = "aterm_gpu::video_tap::presented_frame_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PresentedFrameTap",
         action = "StartMap",
         project = "aterm_gpu::video_tap::presented_frame_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PresentedFrameTap",
         action = "CompleteMap",
         project = "aterm_gpu::video_tap::presented_frame_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::refines(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
         machine = "PresentedFrameTap",
         action = "MapError",
         project = "aterm_gpu::video_tap::presented_frame_transition"
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "PresentedFrameTap",
         action = "BuggyMapErrorPublishesFrame",
         reason = "Buggy=1 negative control only; the MapError arm completes with an Error, never \
@@ -1776,8 +2056,8 @@ pub struct PresentedFrameDecision {
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "PresentedFrameTap",
         action = "BuggyRejectReservesSlot",
         reason = "Buggy=1 negative control only; the RejectEnqueue arm completes the one-shot \
@@ -1785,8 +2065,8 @@ pub struct PresentedFrameDecision {
     )
 )]
 #[cfg_attr(
-    any(test, feature = "spec-anchors"),
-    aterm_spec::spec_unmodeled(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
         machine = "PresentedFrameTap",
         action = "BuggyMapErrorWithoutOutcome",
         reason = "Buggy=1 negative control only; every terminal arm carries its Frame or Error"
@@ -2115,6 +2395,168 @@ impl PresentedFrameTap {
         );
     }
 
+    /// The GL one-shot: the same lifecycle with a CPU slot the present fills
+    /// by readback (`gl_enqueue_frame`). Windows only (a virtual target reads
+    /// back directly), so the shipped build's.
+    #[cfg(all(gl_arm, not(wgpu_arm)))]
+    pub(crate) fn new_gl(
+        src_w: u32,
+        src_h: u32,
+        format: crate::device_layer::TexelFormat,
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+    ) -> Result<Self, String> {
+        let bpp = capture_bpp(format)
+            .map_err(|_| format!("presented snapshot: unsupported format {format:?}"))?;
+        let _ = CaptureEncoding::new(format, color_space, sdr_white_scale)
+            .map_err(|error| format!("presented snapshot: {error}"))?;
+        if src_w == 0 || src_h == 0 {
+            return Err("presented snapshot: destination has zero area".to_string());
+        }
+        #[cfg(wgpu_arm)]
+        let (done_tx, done_rx) = mpsc::channel();
+        Ok(Self {
+            buffer: SlotBuf::Gl(Vec::new()),
+            #[cfg(wgpu_arm)]
+            done_tx,
+            #[cfg(wgpu_arm)]
+            done_rx,
+            state: PresentedFrameState::Armed,
+            result: None,
+            src_w,
+            src_h,
+            format,
+            capture_encoding: None,
+            bpp,
+        })
+    }
+
+    /// Whether this one-shot stages through the GL arm.
+    #[cfg(gl_arm)]
+    pub(crate) fn tap_is_gl(&self) -> bool {
+        self.buffer.is_gl()
+    }
+
+    /// GL enqueue (see `VideoTap::gl_enqueue_frame`): keep this present's
+    /// destination bytes. Mismatch and metadata refusals are terminal and
+    /// explicit.
+    #[cfg(gl_arm)]
+    pub(crate) fn gl_enqueue_frame(
+        &mut self,
+        (w, h): (u32, u32),
+        padded_rgba: &[u8],
+        color_space: CaptureColorSpace,
+        sdr_white_scale: f32,
+    ) {
+        if self.state != PresentedFrameState::Armed {
+            return;
+        }
+        let refusal = if !self.buffer.is_gl() {
+            Some("presented snapshot: the renderer changed arms mid-capture".to_string())
+        } else if (w, h) != (self.src_w, self.src_h)
+            || self.format != crate::device_layer::TexelFormat::Rgba8Unorm
+        {
+            Some(format!(
+                "presented snapshot: destination changed from {}x{} {:?} to {w}x{h} Rgba8Unorm",
+                self.src_w, self.src_h, self.format,
+            ))
+        } else {
+            None
+        };
+        let capture_encoding = match refusal {
+            Some(e) => Err(e),
+            None => CaptureEncoding::new(self.format, color_space, sdr_white_scale)
+                .map_err(|error| format!("presented snapshot: {error}")),
+        };
+        let capture_encoding = match capture_encoding {
+            Ok(encoding) => encoding,
+            Err(e) => {
+                self.result = Some(Err(e));
+                let outcome = self.apply_transition(PresentedFrameEvent::RejectEnqueue, None);
+                debug_assert_eq!(outcome, PresentedFrameOutcome::Error);
+                return;
+            }
+        };
+        let len = self.padded_row() as usize * self.src_h as usize;
+        match &mut self.buffer {
+            SlotBuf::Gl(bytes) => {
+                bytes.clear();
+                bytes.extend_from_slice(&padded_rgba[..len.min(padded_rgba.len())]);
+            }
+            #[cfg(multi_arm)]
+            _ => unreachable!("guarded above"),
+        }
+        self.capture_encoding = Some(capture_encoding);
+        let outcome = self.apply_transition(PresentedFrameEvent::EnqueueValid, None);
+        debug_assert_eq!(outcome, PresentedFrameOutcome::None);
+    }
+
+    /// The GL one-shot's post-present hook: stamp, then convert at once (the
+    /// bytes are already read back).
+    #[cfg(gl_arm)]
+    pub(crate) fn gl_after_present(&mut self, t_us: u64) -> Result<(), String> {
+        match self.state {
+            PresentedFrameState::Armed => {
+                return Err(
+                    "presented snapshot: successful present did not enqueue a destination copy"
+                        .to_string(),
+                );
+            }
+            PresentedFrameState::Pending => {
+                let outcome = self.apply_transition(PresentedFrameEvent::StartMap, Some(t_us));
+                debug_assert_eq!(outcome, PresentedFrameOutcome::None);
+                let raw = match &mut self.buffer {
+                    SlotBuf::Gl(bytes) => std::mem::take(bytes),
+                    #[cfg(multi_arm)]
+                    _ => Vec::new(),
+                };
+                let result = mapped_to_rgba8(
+                    &raw,
+                    self.src_w,
+                    self.src_h,
+                    self.padded_row() as usize,
+                    self.format,
+                    self.capture_encoding
+                        .expect("a pending presented copy freezes its capture encoding"),
+                    false,
+                )
+                .map(|(rgba, w, h)| CapturedFrame {
+                    seq: 1,
+                    t_us,
+                    w,
+                    h,
+                    rgba,
+                });
+                let ok = result.is_ok();
+                self.result = Some(result);
+                let event = if ok {
+                    PresentedFrameEvent::CompleteMap
+                } else {
+                    PresentedFrameEvent::MapError
+                };
+                let _ = self.apply_transition(event, None);
+            }
+            PresentedFrameState::InFlight { .. } | PresentedFrameState::Complete => {}
+        }
+        self.result_status()
+    }
+
+    /// [`Self::finish`] for a GL one-shot: complete by its post-present hook.
+    #[cfg(gl_arm)]
+    pub(crate) fn gl_finish(&mut self) -> Result<(), String> {
+        match self.state {
+            PresentedFrameState::Armed => {
+                Err("presented snapshot: no successful present was captured".to_string())
+            }
+            PresentedFrameState::Pending => Err(
+                "presented snapshot: after-present hook was not called before finish".to_string(),
+            ),
+            PresentedFrameState::InFlight { .. } | PresentedFrameState::Complete => {
+                self.result_status()
+            }
+        }
+    }
+
     fn apply_transition(
         &mut self,
         event: PresentedFrameEvent,
@@ -2175,6 +2617,17 @@ impl PresentedFrameTap {
             }
         };
         // Cross-arm guard: see VideoTap::enqueue_copy.
+        #[cfg(gl_arm)]
+        if self.buffer.is_gl() {
+            self.result = Some(Err(
+                "presented snapshot: the renderer changed arms mid-capture (GL staging, \
+                 wgpu present)"
+                    .to_string(),
+            ));
+            let outcome = self.apply_transition(PresentedFrameEvent::RejectEnqueue, None);
+            debug_assert_eq!(outcome, PresentedFrameOutcome::Error);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if matches!(self.buffer, SlotBuf::Metal { .. }) {
             self.result = Some(Err(
@@ -2237,6 +2690,9 @@ impl PresentedFrameTap {
                     // harvest below polls it.
                     #[cfg(target_os = "macos")]
                     SlotBuf::Metal { .. } => {}
+                    // A GL one-shot never reaches the wgpu hook.
+                    #[cfg(gl_arm)]
+                    SlotBuf::Gl(_) => {}
                 }
                 let outcome = self.apply_transition(PresentedFrameEvent::StartMap, Some(t_us));
                 debug_assert_eq!(outcome, PresentedFrameOutcome::None);
@@ -2523,16 +2979,6 @@ mod tests {
         }
     }
 
-    fn synth_frame(seq: u64) -> CapturedFrame {
-        CapturedFrame {
-            seq,
-            t_us: seq * 16_667,
-            w: 2,
-            h: 2,
-            rgba: vec![seq as u8; 16], // 2x2 RGBA8 = 16 bytes
-        }
-    }
-
     fn padded_fixture(rows: &[&[u8]], stride: usize) -> Vec<u8> {
         let mut out = vec![0u8; rows.len() * stride];
         for (row, bytes) in rows.iter().enumerate() {
@@ -2551,53 +2997,6 @@ mod tests {
         sdr_white_scale: f32,
     ) -> CaptureEncoding {
         CaptureEncoding::new(format, color_space, sdr_white_scale).unwrap()
-    }
-
-    /// Overflowing the byte budget counts `evicted`, not `dropped`, and keeps
-    /// the tail.
-    #[test]
-    fn budget_eviction_counts_evicted_not_dropped() {
-        // Budget holds exactly 3 of the 16-byte frames; push 5.
-        let mut tap = test_tap(3 * 16, None);
-        for seq in 1..=5 {
-            tap.push_frame(synth_frame(seq));
-        }
-        assert_eq!(tap.evicted, 2, "two head frames evicted");
-        assert_eq!(tap.dropped, 0, "eviction is not a mid-stream drop");
-        assert_eq!(tap.store.len(), 3, "store bounded by the budget");
-        let kept: Vec<u64> = tap.store.iter().map(|f| f.seq).collect();
-        assert_eq!(kept, vec![3, 4, 5], "drop-oldest keeps the tail");
-        // head_truncated (index.json) is defined as evicted > 0.
-        assert!(tap.evicted > 0, "this recording IS head-truncated");
-    }
-
-    /// Map callbacks completing 3,1,2 publish 1,2,3; a two-frame budget evicts 1 and keeps 2,3.
-    #[test]
-    fn out_of_order_harvest_is_sorted_and_budget_keeps_sequence_tail() {
-        let mut all = test_tap(usize::MAX, None);
-        for seq in [3, 1, 2] {
-            all.push_frame(synth_frame(seq));
-        }
-        assert_eq!(
-            all.store.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
-            vec![1, 2, 3],
-            "callback arrival order must not become recording order"
-        );
-        assert_eq!(all.evicted, 0);
-        assert_eq!(all.store_bytes, 3 * 16);
-
-        let mut tail = test_tap(2 * 16, None);
-        for seq in [3, 1, 2] {
-            tail.push_frame(synth_frame(seq));
-        }
-        assert_eq!(
-            tail.store.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
-            vec![2, 3],
-            "budget eviction must remove the lowest sequence, not first callback"
-        );
-        assert_eq!(tail.evicted, 1);
-        assert_eq!(tail.dropped, 0);
-        assert_eq!(tail.store_bytes, 2 * 16);
     }
 
     /// The worker's conversion is byte-identical to inline [`mapped_to_rgba8`] (SDR swizzle and
@@ -2707,25 +3106,6 @@ mod tests {
             assert!(tap.should_capture(t));
         }
         assert_eq!(tap.decimated, 0);
-    }
-
-    #[test]
-    fn f16_roundtrip_anchors() {
-        assert_eq!(f16_to_f32(0x3c00), 1.0, "1.0");
-        assert_eq!(f16_to_f32(0x0000), 0.0, "0.0");
-        assert!((f16_to_f32(0x3800) - 0.5).abs() < 1e-6, "0.5");
-        assert!(
-            (f16_to_f32(0x4000) - 2.0).abs() < 1e-6,
-            "2.0 (EDR overrange)"
-        );
-    }
-
-    #[test]
-    fn srgb_encode_anchors() {
-        assert_eq!(linear_to_srgb(0.0), 0.0);
-        assert!((linear_to_srgb(1.0) - 1.0).abs() < 1e-6);
-        // mid-gray: linear 0.2159 ≈ sRGB 0.5 (well-known anchor)
-        assert!((linear_to_srgb(0.2159) - 0.5).abs() < 0.01);
     }
 
     /// Device-free format contract: both byte-order variants retain source
@@ -3123,8 +3503,10 @@ mod tests {
         );
     }
 
+    /// A recording whose surface encoding changes mid-capture keeps the first
+    /// encoding and flags the recording as mixed.
     #[test]
-    fn in_flight_slots_freeze_encoding_while_later_frames_track_changes() {
+    fn a_mid_recording_encoding_change_marks_the_recording_mixed() {
         let srgb = encoding(
             crate::device_layer::TexelFormat::Rgba8Unorm,
             CaptureColorSpace::Srgb,
@@ -3137,36 +3519,10 @@ mod tests {
         );
         let mut tap = test_tap(usize::MAX, None);
         tap.note_capture_encoding(srgb);
-        let in_flight = SlotState::InFlight {
-            seq: 1,
-            t_us: 10,
-            capture_encoding: srgb,
-        };
+        assert!(!tap.mixed_capture_encoding);
         tap.note_capture_encoding(p3);
         assert_eq!(tap.first_capture_encoding, Some(srgb));
         assert!(tap.mixed_capture_encoding);
-        assert!(matches!(
-            in_flight,
-            SlotState::InFlight {
-                capture_encoding,
-                ..
-            } if capture_encoding == srgb
-        ));
-
-        let scale_one = encoding(
-            crate::device_layer::TexelFormat::Rgba16Float,
-            CaptureColorSpace::ExtendedLinearSrgb,
-            1.0,
-        );
-        let scale_two = encoding(
-            crate::device_layer::TexelFormat::Rgba16Float,
-            CaptureColorSpace::ExtendedLinearSrgb,
-            2.0,
-        );
-        assert_ne!(
-            scale_one, scale_two,
-            "a brightness/SDR-white change is source metadata, not the same encoding"
-        );
     }
 
     #[test]

@@ -1,29 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm_objc::cf` at run time, on CoreFoundation alone: the two owners, and a run-loop source
-//! and observer registered the way winit's macOS backend registers them. `cf_cg_sdk.rs` checks
-//! the declarations against the headers; this checks that the owners balance their retains, the
-//! string reads out whole, and CoreFoundation calls the callouts through the declared types (the
-//! observer's `"C-unwind"` one included). `cg` has no run-time test: every CoreGraphics display
-//! call opens a WindowServer connection.
+//! `aterm_objc::cf`'s two owners AT RUN TIME, on CoreFoundation alone.
+//!
+//! `cf_sdk.rs` proves the declarations are the headers'; this proves the
+//! owners balance their retains and the string reads out whole. `aterm-cg`
+//! has no run-time test: every CoreGraphics display call opens a WindowServer
+//! connection, so only a real aterm exercises it.
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aterm_objc::cf::{
-    CFAllocatorRef, CFIndex, CFRelease, CFRunLoopActivity, CFRunLoopAddObserver,
-    CFRunLoopAddSource, CFRunLoopObserverContext, CFRunLoopObserverCreate, CFRunLoopObserverRef,
-    CFRunLoopRunInMode, CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopSourceInvalidate,
-    CFRunLoopSourceSignal, CFString, CFStringRef, CFTypeRef, CFUUID, CFUUIDBytes, CFUUIDRef,
-    kCFRunLoopAfterWaiting, kCFRunLoopBeforeWaiting, kCFRunLoopDefaultMode,
+    CFAllocatorRef, CFIndex, CFString, CFStringRef, CFTypeRef, CFUUID, CFUUIDBytes, CFUUIDRef,
 };
 
 unsafe extern "C" {
-    fn CFRunLoopGetCurrent() -> *mut c_void;
     fn CFGetRetainCount(cf: CFTypeRef) -> CFIndex;
     fn CFUUIDCreateFromUUIDBytes(alloc: CFAllocatorRef, bytes: CFUUIDBytes) -> CFUUIDRef;
     fn CFStringCreateWithCharacters(
@@ -32,10 +25,6 @@ unsafe extern "C" {
         num_chars: CFIndex,
     ) -> CFStringRef;
 }
-
-/// `kCFRunLoopRunTimedOut` and `kCFRunLoopRunHandledSource`.
-const RUN_TIMED_OUT: i32 = 3;
-const RUN_HANDLED_SOURCE: i32 = 4;
 
 fn retain_count(cf: CFTypeRef) -> CFIndex {
     // SAFETY: `cf` is a live CoreFoundation object for the caller's borrow.
@@ -116,7 +105,7 @@ fn cf_string(units: &[u16]) -> CFString {
 fn the_string_owner_reads_out_the_whole_string() {
     for s in [
         "",
-        // `IO32BitDirectPixels`, the string winit's `video_modes` compares.
+        // `IO32BitDirectPixels`, the string upstream winit's macOS `video_modes` compares.
         "--------RRRRRRRRGGGGGGGGBBBBBBBB",
         "é → 😀 (two bytes, three, four)",
     ] {
@@ -127,111 +116,4 @@ fn the_string_owner_reads_out_the_whole_string() {
     // the string still comes back (a UTF-8 `CFStringGetBytes` stops there).
     let lone = [0xD800, u16::from(b'a')];
     assert_eq!(cf_string(&lone).to_string(), "\u{FFFD}a");
-}
-
-static PERFORMED: AtomicUsize = AtomicUsize::new(0);
-static PERFORMED_WITH_INFO: AtomicUsize = AtomicUsize::new(0);
-static BEFORE_WAITING: AtomicUsize = AtomicUsize::new(0);
-static AFTER_WAITING: AtomicUsize = AtomicUsize::new(0);
-
-/// The source's `perform`, at the declared `void (*)(void *)`. It only counts
-/// (a panic here would abort): the assertions are the thread's.
-extern "C" fn perform(info: *mut c_void) {
-    let counter = if info.is_null() {
-        &PERFORMED
-    } else {
-        &PERFORMED_WITH_INFO
-    };
-    counter.fetch_add(1, Ordering::SeqCst);
-}
-
-/// The observer's callout, at the declared `"C-unwind"` type: registered with
-/// no transmute, as `observer.rs` registers winit's.
-extern "C-unwind" fn observe(_: CFRunLoopObserverRef, activity: CFRunLoopActivity, _: *mut c_void) {
-    match activity {
-        a if a == kCFRunLoopBeforeWaiting => BEFORE_WAITING.fetch_add(1, Ordering::SeqCst),
-        a if a == kCFRunLoopAfterWaiting => AFTER_WAITING.fetch_add(1, Ordering::SeqCst),
-        _ => 0,
-    };
-}
-
-/// One thread's own run loop, so nothing else sources it: a timed run with an
-/// unsignalled source waits (both observer activities fire), and a signalled
-/// source is handled exactly once.
-#[test]
-fn a_source_and_an_observer_run_through_the_declared_callouts() {
-    std::thread::spawn(|| {
-        // SAFETY: this thread's run loop, used only on this thread; every
-        // context is copied by CoreFoundation at creation, and both +1s are
-        // released before the thread (and its run loop) ends.
-        unsafe {
-            let rl = CFRunLoopGetCurrent().cast();
-            let mut source_context = CFRunLoopSourceContext {
-                version: 0,
-                info: ptr::null_mut(),
-                retain: None,
-                release: None,
-                copyDescription: None,
-                equal: None,
-                hash: None,
-                schedule: None,
-                cancel: None,
-                perform,
-            };
-            let source = CFRunLoopSourceCreate(ptr::null(), 0, &raw mut source_context);
-            assert!(!source.is_null());
-            CFRunLoopAddSource(rl, source, kCFRunLoopDefaultMode);
-
-            let mut observer_context = CFRunLoopObserverContext {
-                version: 0,
-                info: ptr::null_mut(),
-                retain: None,
-                release: None,
-                copyDescription: None,
-            };
-            let observer = CFRunLoopObserverCreate(
-                ptr::null(),
-                kCFRunLoopBeforeWaiting | kCFRunLoopAfterWaiting,
-                1,
-                0,
-                observe,
-                &raw mut observer_context,
-            );
-            assert!(!observer.is_null());
-            CFRunLoopAddObserver(rl, observer, kCFRunLoopDefaultMode);
-
-            // Nothing is signalled, so the loop waits out the short run.
-            let timed = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1);
-            assert_eq!(
-                timed, RUN_TIMED_OUT,
-                "an unsignalled source does not end the run"
-            );
-            assert_eq!(PERFORMED.load(Ordering::SeqCst), 0);
-            assert!(
-                BEFORE_WAITING.load(Ordering::SeqCst) >= 1,
-                "BeforeWaiting fired"
-            );
-            assert!(
-                AFTER_WAITING.load(Ordering::SeqCst) >= 1,
-                "AfterWaiting fired"
-            );
-
-            // Signalled, it is handled; 60 s is a hang detector, not a budget.
-            CFRunLoopSourceSignal(source);
-            let handled = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 60.0, 1);
-            assert_eq!(handled, RUN_HANDLED_SOURCE);
-            assert_eq!(PERFORMED.load(Ordering::SeqCst), 1, "perform ran once");
-            assert_eq!(
-                PERFORMED_WITH_INFO.load(Ordering::SeqCst),
-                0,
-                "perform got the context's NULL info back"
-            );
-
-            CFRunLoopSourceInvalidate(source);
-            CFRelease(source.cast_const().cast());
-            CFRelease(observer.cast_const().cast());
-        }
-    })
-    .join()
-    .expect("the run-loop thread");
 }

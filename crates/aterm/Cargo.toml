@@ -48,6 +48,9 @@ aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket clie
 # Already in the graph through aterm-gui; no new crate reaches the binary.
 aterm-control = { path = "../aterm-control" }
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
+# The Full Disk Access probe's child, `aterm __tcc-open` (`consent::run_open_probe_verb`);
+# already in the graph through aterm-gui.
+aterm-containment = { workspace = true }
 # The workspace's one epoch-clock read; already in the graph through aterm-gui.
 aterm-time = { workspace = true }
 # `aterm update`'s log hint names the resolved log directory (`dirs::logs_dir`);
@@ -105,6 +108,14 @@ aterm-uds = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 aterm-link = { path = "../aterm-link" }
 
+# `aterm machines` — a lab of Macs managed from this one over SSH
+# (docs/DESIGN-machines-2026-10-16.md). MACOS ONLY: it drives macOS's own tools
+# (`defaults`, `scutil`, `launchctl`, `dns-sd`, Apple's `ssh-keygen`), so the
+# other cells never build it, and `machines_unavailable` in src/main.rs answers
+# the verb there by name.
+[target.'cfg(target_os = "macos")'.dependencies]
+aterm-machines = { workspace = true }
+
 [features]
 # The SEALED cross-host transport in the one binary — `aterm link broker --tcp`,
 # `aterm fabric on --tcp`, `aterm fabric join` (docs/FABRIC-SECOND-HOST.md).
@@ -137,6 +148,8 @@ libc = { workspace = true }
 aterm-tempfile = { workspace = true }
 # The live tests' bounded polls (`aterm_spec::wait`): one hang-detector loop.
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-session = { workspace = true }
 # The front-door verb-routing test drives the binary under a REAL pty: the
 # regression it pins (`aterm ship` reaching the session parser) is invisible
 # with piped stdio, because piped stdio takes the WINDOW route instead. Its
@@ -147,6 +160,9 @@ aterm-spec = { workspace = true }
 aterm-pty = { workspace = true }
 # The fabric worlds' fixture config is asserted as TOML.
 aterm-toml = { workspace = true }
+# The bus mirror's world (`tests/fabric_world/log_mirror.rs`) decodes and folds
+# the session logs' bus bodies as every reader does (`aterm_slog::bus`).
+aterm-slog = { workspace = true }
 # `fabric status --json` is asserted as JSON, not as substrings.
 aterm-json = { workspace = true }
 
@@ -184,16 +200,21 @@ path = "tests/aterm_suite.rs"
 name = "fabric_world"
 path = "tests/fabric_world/main.rs"
 
+# The fabric MEASUREMENT (post -> deliver latency, burst throughput, attach
+# time, records per message) over the same stack the fabric worlds boot, whose
+# harness it mounts. Its own binary because it measures: no other test's live
+# stacks may share the machine with it. Its one measuring entry is `#[ignore]`d
+# and inert unless `FABRIC_BENCH` is set, so an ordinary run is its pure tests;
+# `targo --unverified verify perf fabric` runs the measurement.
+[[test]]
+name = "fabric_bench"
+path = "tests/fabric_bench/main.rs"
+
 # The sealed cross-host rung: the one target that builds the cipher tree.
 [[test]]
 name = "two_nodes_sealed"
 path = "tests/two_nodes_sealed.rs"
 required-features = ["sealed"]
-
-# Alone: re-execs its own binary with an `--exact` filter.
-[[test]]
-name = "conn_live_headless"
-path = "tests/conn_live_headless.rs"
 
 # Alone: raises this process's descriptor limit.
 [[test]]

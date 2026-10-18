@@ -44,7 +44,7 @@ const COLS: usize = 140;
 /// 12 cps, the owner's pace.
 const KEY_MS: u64 = 83;
 const FRAME_MS: u64 = 16;
-/// `inkish.py`'s pause between a redraw's two reads.
+/// The Ink-shaped composer's pause between a redraw's two reads.
 const INK_SPLIT_MS: u64 = 30;
 /// A settled frame: this long after a mid key's echo, inside the key gap.
 const SETTLE_MS: u64 = 70;
@@ -62,8 +62,8 @@ const MID: &str = "abcdef";
 /// ([`Host::repaint`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// `inkish.py`: hide, home, clear, the whole line | present | 30 ms |
-    /// the caret placed and shown | present.
+    /// The Ink-shaped redraw: hide, home, clear, the whole line | present |
+    /// 30 ms | the caret placed and shown | present.
     InkSplit,
     /// The same bytes in one read, one present.
     InkWhole,
@@ -109,8 +109,8 @@ struct Snap {
     /// `(id, anchor_col, t0, d0, col0, col1)` of every cohort on the row.
     cohorts: Vec<(u32, u16, f32, f32, u16, u16)>,
     /// Every live cell on the row as `(col, t, its cohort's t_at(col))`, for C2
-    /// (`assert_every_cohort_on_its_walk` in `ribbon.rs`): a resident cell
-    /// carries its cohort's walk at its column.
+    /// (`ribbon.rs`, "The walk"): a resident cell carries its cohort's walk at
+    /// its column.
     walk: Vec<(u16, f32, f32)>,
 }
 
@@ -283,7 +283,8 @@ impl Host {
         self.glow.note_context(self.term.is_alternate_screen());
         observe_caret_row(&self.term, &mut self.glow, &mut self.row_buf, c, self.now);
         observe_ribbon_rows(&self.term, &mut self.glow, &mut self.row_buf);
-        self.glow.observe_print_anchor(self.term.print_anchor());
+        self.glow
+            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
         let g = geom(ROWS, COLS, CW, CH);
         self.glow.tick(cur, self.now, &self.cfg, g, &mut self.out);
     }
@@ -783,12 +784,11 @@ fn a_hop_over_the_pushed_tail_does_not_repaint_it() {
     );
 }
 
-/// Every cell an insert leaves is on its cohort's walk: C2
-/// (`assert_every_cohort_on_its_walk` in `ribbon.rs`), the root of both laws
-/// above. After an insert mid-line the tail's cells take their new columns'
-/// stops; after an insert at the line's first glyph the anchor stays put, so the
-/// keys laid there do not pile onto one stop. Negative control: the frame before
-/// the insert passes the same census.
+/// Every cell an insert leaves is on its cohort's walk: C2 (`ribbon.rs`, "The
+/// walk"), the root of both laws above. After an insert mid-line the tail's
+/// cells take their new columns' stops; after an insert at the line's first
+/// glyph the anchor stays put, so the keys laid there do not pile onto one
+/// stop. Negative control: the frame before the insert passes the same census.
 #[test]
 fn every_cell_a_mid_line_insert_leaves_is_on_its_cohorts_walk() {
     let mut report = String::new();

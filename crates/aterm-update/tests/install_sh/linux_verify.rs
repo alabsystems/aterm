@@ -34,8 +34,13 @@ const OTHER: &str = "other";
 /// Runs the verifier the installer pipes to `python3 -`. `run`: the script as
 /// `__main__` with its master pin replaced, exit status and all. `pins`: the
 /// master keys it trusts. `calls`: each line of `$STUB_CALLS` (`function`,
-/// space-separated pins, arguments; tab-separated) answered on one line.
-const HARNESS: &str = r#"import contextlib, io, json, os, sys
+/// space-separated pins, arguments; tab-separated) answered on one line; a
+/// `json:function` takes each argument as JSON (a number, a list, `null`). A
+/// function may carry one stand-in for its call, `function|target=<JSON>`:
+/// `os.getxattr` answers each attribute from the JSON table (`null`, it
+/// exists; an errno; `ENODATA` for one the table leaves out), and any other
+/// target is a verifier function that answers the JSON whatever it is asked.
+const HARNESS: &str = r#"import contextlib, errno, io, json, os, sys, types
 source = sys.stdin.read()
 marker = "\nMASTER_PUBKEYS = "
 if source.count(marker) != 1:
@@ -54,10 +59,28 @@ if mode == "pins":
     print("\n".join(verifier["MASTER_PUBKEYS"]))
     sys.exit(0)
 refusals = (ValueError, OSError, verifier["subprocess"].SubprocessError)
+def stand_in(spec):
+    target, _, value = spec.partition("=")
+    value = json.loads(value)
+    if target != "os.getxattr":
+        return target, lambda *args, **kwargs: value
+    def getxattr(path, attribute, *, follow_symlinks=True):
+        answer = value.get(attribute, errno.ENODATA)
+        if answer is None:
+            return b""
+        raise OSError(answer, os.strerror(answer), path)
+    return "os", types.SimpleNamespace(**{**vars(os), "getxattr": getxattr})
 with open(os.environ["STUB_CALLS"], encoding="utf-8") as calls:
     for line in calls:
         name, pins, *args = line.rstrip("\n").split("\t")
+        name, _, spec = name.partition("|")
+        if name.startswith("json:"):
+            name, args = name[5:], [json.loads(arg) for arg in args]
         verifier["MASTER_PUBKEYS"] = tuple(pins.split())
+        target, replacement = stand_in(spec) if spec else (None, None)
+        kept = verifier.get(target)
+        if target:
+            verifier[target] = replacement
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out):
@@ -68,6 +91,9 @@ with open(os.environ["STUB_CALLS"], encoding="utf-8") as calls:
             print("refused\t" + str(error).replace("\n", " "), flush=True)
         except Exception as error:
             print("crashed\t" + type(error).__name__ + ": " + str(error).replace("\n", " "), flush=True)
+        finally:
+            if target:
+                verifier[target] = kept
 "#;
 
 /// The verifier's own floor: Python 3.11+ (tomllib, `hashlib.file_digest`) and
@@ -142,7 +168,9 @@ impl Verifier {
         let bin = scratch.mkdir("verifier-bin");
         scratch.stand_in(
             "verifier-bin/python3",
-            "#!/bin/sh\nexec \"$STUB_PYTHON\" -I \"$STUB_HARNESS\" \"$@\"\n",
+            // The installer runs its verifier isolated (`python3 -I -`); the
+            // stand-in holds it to that and drops the flag the harness re-adds.
+            "#!/bin/sh\n[ \"$1\" = -I ] || { echo 'install.sh ran python3 without -I' >&2; exit 97; }\nshift\nexec \"$STUB_PYTHON\" -I \"$STUB_HARNESS\" \"$@\"\n",
         );
         symlink(&tools.openssl, &bin.join("openssl"));
         scratch.write("verifier-bin/harness.py", HARNESS);
@@ -646,11 +674,6 @@ enum Rule {
     /// origin bind, the source commit's spelling, an explicit schema, and a
     /// whole-roster refusal when any member is malformed. It must refuse.
     Installer,
-    /// A known gap: the installer accepts what the updater refuses, so a fresh
-    /// install runs a binary the updater would not place. Applied alone and
-    /// kept as a row, so tightening install.sh fails it until it moves to
-    /// [`Rule::Shared`].
-    KnownLooser,
 }
 
 type Mutation = (&'static str, Rule, fn(&mut Case, &Keys));
@@ -1009,12 +1032,12 @@ const MUTATIONS: &[Mutation] = &[
     }),
     (
         "an appcast without the dmg's digest",
-        Rule::KnownLooser,
+        Rule::Shared,
         |c, _| c.drop_key("sha256"),
     ),
     (
         "a machine added_at that is not a string",
-        Rule::KnownLooser,
+        Rule::Shared,
         |c, _| c.machines[0].extra = "added_at = 1\n".into(),
     ),
 ];
@@ -1038,11 +1061,7 @@ fn corpus(keys: &Keys) -> Vec<Case> {
     };
     let mut cases = vec![Case::base(keys)];
     cases.extend(MUTATIONS.iter().map(|m| apply(&[m])));
-    // A known gap is a row of its own: combined, its verdict is no one's.
-    let combinable: Vec<&Mutation> = MUTATIONS
-        .iter()
-        .filter(|(_, rule, _)| *rule != Rule::KnownLooser)
-        .collect();
+    let combinable: Vec<&Mutation> = MUTATIONS.iter().collect();
     // The mutations a release survives alone, combined, reach the accepting
     // side's interactions; any mutation on top of them reaches the refusals'.
     let neutral: Vec<&Mutation> = combinable
@@ -1065,13 +1084,11 @@ fn corpus(keys: &Keys) -> Vec<Case> {
     cases
 }
 
-/// How a corpus run came out: the cases both accepted, both refused, the known
-/// gaps still open, and every case decided otherwise than expected (or on
-/// which the installer crashed).
+/// How a corpus run came out: the cases both accepted, both refused, and every
+/// case decided otherwise than expected (or on which the installer crashed).
 struct Tally {
     accepted: usize,
     refused: usize,
-    looser: usize,
     wrong: Vec<String>,
 }
 
@@ -1085,8 +1102,8 @@ impl Tally {
             self.wrong.join("\n")
         );
         eprintln!(
-            "corpus: {} accepted by both, {} refused by both, {} known gaps",
-            self.accepted, self.refused, self.looser
+            "corpus: {} accepted by both, {} refused by both",
+            self.accepted, self.refused
         );
         assert!(
             self.accepted >= 150 && self.refused >= 150,
@@ -1098,8 +1115,7 @@ impl Tally {
 }
 
 /// The verifier in `script` over the corpus: each case must get the updater's verdict,
-/// a refusal where an installer-only rule is broken, or the installer's acceptance where
-/// a known gap is the case.
+/// or a refusal where an installer-only rule is broken.
 fn differential(scratch: &Scratch, verifier: &Verifier, script: &Path) -> Tally {
     let keys = Keys::new();
     let cases = corpus(&keys);
@@ -1115,7 +1131,6 @@ fn differential(scratch: &Scratch, verifier: &Verifier, script: &Path) -> Tally 
     let mut tally = Tally {
         accepted: 0,
         refused: 0,
-        looser: 0,
         wrong: Vec::new(),
     };
     for ((case, updater), answer) in cases.iter().zip(expected).zip(answers) {
@@ -1123,20 +1138,17 @@ fn differential(scratch: &Scratch, verifier: &Verifier, script: &Path) -> Tally 
         let agree = match (case.rule, &installer) {
             (_, Err(why)) if why.starts_with("crashed") => false,
             (Rule::Installer, verdict) => verdict.is_err(),
-            (Rule::KnownLooser, verdict) => verdict.is_ok() && updater.is_err(),
             (Rule::Shared, Ok(i)) => updater.as_ref().is_ok_and(|u| u == i),
             (Rule::Shared, Err(_)) => updater.is_err(),
         };
         let why = match case.rule {
             Rule::Shared => "",
             Rule::Installer => " (an installer-only rule is broken)",
-            Rule::KnownLooser => " (a known gap: if both now refuse, make the row Rule::Shared)",
         };
-        match (agree, case.rule, &installer) {
-            (true, Rule::KnownLooser, _) => tally.looser += 1,
-            (true, _, Ok(_)) => tally.accepted += 1,
-            (true, _, Err(_)) => tally.refused += 1,
-            (false, ..) => tally.wrong.push(format!(
+        match (agree, &installer) {
+            (true, Ok(_)) => tally.accepted += 1,
+            (true, Err(_)) => tally.refused += 1,
+            (false, _) => tally.wrong.push(format!(
                 "{}: install.sh {installer:?}, updater {updater:?}{why}",
                 case.label
             )),
@@ -1442,6 +1454,546 @@ fn a_private_ancestor_shields_writable_children_but_not_earlier_ancestors() {
     );
     let tmp_refusal = answers[2].as_ref().expect_err("under /tmp");
     assert!(tmp_refusal.contains("unshielded"), "{tmp_refusal}");
+    assert!(
+        !tmp_refusal.contains("chmod"),
+        "only the owner can take a write bit back: {tmp_refusal}"
+    );
+}
+
+/// The user-private-group rule is the updater's, fact for fact: over every
+/// combination of an account, a group and the accounts that have it as their
+/// primary group (each fact known or not), the embedded verifier's
+/// `user_private_group` and the updater's answer alike.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_user_private_group_rule_is_the_updaters() {
+    use aterm_update::linux::install_path::{Account, Group, user_private_group};
+    let scratch = Scratch::new();
+    let verifier = Verifier::new(&scratch);
+    let accounts = [
+        None,
+        Some(("ann", 1000)),
+        Some(("ann", 1001)),
+        Some(("root", 0)),
+    ];
+    let groups: [Option<(&str, &[&str])>; 6] = [
+        None,
+        Some(("ann", &[])),
+        Some(("ann", &["ann"])),
+        Some(("ann", &["ann", "bob"])),
+        Some(("bob", &[])),
+        Some(("root", &[])),
+    ];
+    let primaries: [&[u32]; 4] = [&[], &[1000], &[1000, 1001], &[0]];
+    let mut cases = Vec::new();
+    for uid in [0, 1000] {
+        for gid in [0, 1000, 1001] {
+            for account in &accounts {
+                for group in &groups {
+                    for others in &primaries {
+                        cases.push((uid, gid, *account, *group, *others));
+                    }
+                }
+            }
+        }
+    }
+    let json = |v: &aterm_json::Value| aterm_json::to_string(v).expect("JSON");
+    let calls: Vec<String> = cases
+        .iter()
+        .map(|(uid, gid, account, group, others)| {
+            let account = account.map_or(aterm_json::Value::Null, |(name, gid)| {
+                aterm_json::json!([name, gid])
+            });
+            let group = group.map_or(aterm_json::Value::Null, |(name, members)| {
+                aterm_json::json!([name, members])
+            });
+            [
+                "json:user_private_group".to_string(),
+                "-".into(),
+                uid.to_string(),
+                gid.to_string(),
+                json(&account),
+                json(&group),
+                json(&aterm_json::json!(others)),
+            ]
+            .join("\t")
+        })
+        .collect();
+    let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
+    let mut admitted = 0;
+    for ((uid, gid, account, group, others), answer) in cases.iter().zip(&answers) {
+        let account = account.map(|(name, gid)| Account {
+            name: name.into(),
+            gid,
+        });
+        let group = group.map(|(name, members)| Group {
+            name: name.into(),
+            members: members.iter().map(|m| m.as_bytes().to_vec()).collect(),
+        });
+        let rust = user_private_group(*uid, *gid, account.as_ref(), group.as_ref(), others);
+        admitted += usize::from(rust);
+        assert_eq!(
+            answer,
+            &format!("ok\t{}", if rust { "true" } else { "false" }),
+            "uid {uid}, gid {gid}, {account:?}, {group:?}, primaries {others:?}"
+        );
+    }
+    assert!(admitted > 0, "the corpus holds a private group");
+}
+
+/// The install-path walk is the updater's on this machine's own accounts and
+/// directories: a directory of each mode, on this user's primary group and on
+/// every other group it belongs to, laid where nothing above it is private and
+/// again below a private directory, is admitted or refused alike by the
+/// embedded verifier's `check_install_path` and the updater's
+/// `install_path::refusal`, as is one on the primary group whose access ACL
+/// gives another account its group class's bits (the mode unchanged); and each
+/// of those groups is private, or not, to both. A user-private group's write
+/// bit is no other account's, unless an access ACL makes it another's.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_install_path_walk_is_the_updaters_on_this_machine() {
+    use aterm_update::linux::install_path::{
+        grant_group_class_by_acl, is_user_private_group, refusal,
+    };
+    let scratch = Scratch::new();
+    let verifier = Verifier::new(&scratch);
+    // SAFETY: getgid has no preconditions and cannot fail.
+    let primary = unsafe { libc::getgid() };
+    let mut gids = vec![primary];
+    // SAFETY: a zero count asks only for the number of supplementary groups.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut more = vec![0; usize::try_from(count).expect("a group count")];
+    // SAFETY: `more` has room for exactly `count` gids.
+    let got = unsafe { libc::getgroups(count, more.as_mut_ptr()) };
+    more.truncate(usize::try_from(got).expect("the groups"));
+    for gid in more {
+        if !gids.contains(&gid) {
+            gids.push(gid);
+        }
+    }
+    // Unshielded: the scratch root's chain, with no private directory of its own.
+    let open = aterm_tempfile::Builder::new()
+        .prefix("install-sh-open.")
+        .tempdir_in(crate::support::scratch_root())
+        .expect("an unshielded dir");
+    let open_root = open.path().canonicalize().expect("its physical path");
+    chmod(&open_root, 0o755);
+    let shield = scratch.mkdir("shielded");
+    chmod(&shield, 0o700);
+    let mut dirs = Vec::new();
+    for base in [&open_root, &shield] {
+        for gid in &gids {
+            for mode in [0o755, 0o775, 0o770, 0o757, 0o777, 0o700] {
+                let dir = base.join(format!("g{gid}-{mode:o}"));
+                std::fs::create_dir(&dir).expect("mkdir");
+                std::os::unix::fs::chown(&dir, None, Some(*gid)).expect("a group of ours");
+                chmod(&dir, mode);
+                dirs.push(dir.join("store"));
+                std::fs::create_dir(dirs.last().expect("laid")).expect("mkdir");
+                chmod(dirs.last().expect("laid"), 0o755);
+            }
+        }
+        for mode in [0o775, 0o755] {
+            let dir = base.join(format!("acl-{mode:o}"));
+            std::fs::create_dir(&dir).expect("mkdir");
+            chmod(&dir, mode);
+            grant_group_class_by_acl(&dir, 65534).expect("an access ACL");
+            dirs.push(dir.join("store"));
+            std::fs::create_dir(dirs.last().expect("laid")).expect("mkdir");
+            chmod(dirs.last().expect("laid"), 0o755);
+        }
+        let alias = base.join("alias");
+        symlink(base.join(format!("g{primary}-755")), &alias);
+        dirs.push(alias.join("store"));
+    }
+    let mut calls: Vec<String> = dirs
+        .iter()
+        .map(|dir| format!("check_install_path\t-\t{}", s(dir)))
+        .collect();
+    let probed: Vec<u32> = gids.iter().copied().chain([0, 65534]).collect();
+    calls.extend(
+        probed
+            .iter()
+            .map(|gid| format!("json:private_group\t-\t{gid}")),
+    );
+    let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
+    let (walks, facts) = answers.split_at(dirs.len());
+    let mut refused = 0;
+    for (dir, answer) in dirs.iter().zip(walks) {
+        let updater = refusal(dir);
+        refused += usize::from(updater.is_err());
+        assert_eq!(
+            answer.starts_with("ok\t"),
+            updater.is_ok(),
+            "{}: install.sh {answer:?}, updater {updater:?}",
+            dir.display()
+        );
+    }
+    assert!(refused > 0, "the corpus holds a refused path");
+    for (gid, answer) in probed.iter().zip(facts) {
+        let private = is_user_private_group(*gid);
+        assert_eq!(
+            answer,
+            &format!("ok\t{}", if private { "true" } else { "false" }),
+            "gid {gid}"
+        );
+    }
+    // On a machine whose primary group is a user-private one, its write bit
+    // refuses nothing (the scratch root's own chain is one the walk admits).
+    if is_user_private_group(primary) {
+        let own = open_root.join(format!("g{primary}-775/store"));
+        assert!(refusal(&own).is_ok(), "{}", own.display());
+    }
+    // An access ACL that lets another account write takes that back.
+    let shared = open_root.join("acl-775/store");
+    let why = refusal(&shared).expect_err("an ACL that grants write");
+    assert!(why.contains("writable by other users"), "{why}");
+    let read_only = open_root.join("acl-755/store");
+    assert!(refusal(&read_only).is_ok(), "{}", read_only.display());
+}
+
+/// The access-ACL rule is the updater's, attribute for attribute, on a
+/// stand-in filesystem: over every pair of answers the two ACL attributes'
+/// length queries can give (it exists, `ENODATA`, `ENOTSUP`, another errno),
+/// the embedded verifier's `access_acl`, its `os.getxattr` standing in for
+/// the file, and the updater's `acl_carried` alike. A file on NFSv4, whose
+/// ACL is `system.nfs4_acl` with no POSIX attribute, carries one.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_acl_rule_is_the_updaters_on_a_stand_in_nfs4_file() {
+    use aterm_update::linux::install_path::acl_carried;
+    const POSIX: &str = "system.posix_acl_access";
+    const NFS4: &str = "system.nfs4_acl";
+    let (enodata, enotsup, eio) = (61, 95, 5);
+    let scratch = Scratch::new();
+    let verifier = Verifier::new(&scratch);
+    let outcomes = [None, Some(enodata), Some(enotsup), Some(eio)];
+    let pairs: Vec<(Option<i32>, Option<i32>)> = outcomes
+        .iter()
+        .flat_map(|posix| outcomes.iter().map(move |nfs4| (*posix, *nfs4)))
+        .collect();
+    let json = |v: &aterm_json::Value| aterm_json::to_string(v).expect("JSON");
+    let calls: Vec<String> = pairs
+        .iter()
+        .map(|(posix, nfs4)| {
+            let table = json(&aterm_json::json!({ POSIX: posix, NFS4: nfs4 }));
+            format!("json:access_acl|os.getxattr={table}\t-\t\"/stand-in\"")
+        })
+        .collect();
+    let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
+    for ((posix, nfs4), answer) in pairs.iter().zip(&answers) {
+        let rust = acl_carried(|name| match name.to_bytes() {
+            b"system.posix_acl_access" => *posix,
+            b"system.nfs4_acl" => *nfs4,
+            other => panic!("asked {other:?}"),
+        });
+        assert_eq!(
+            answer,
+            &format!("ok\t{rust}"),
+            "posix {posix:?}, nfs4 {nfs4:?}"
+        );
+    }
+    let carried = |posix, nfs4| {
+        let at = pairs.iter().position(|pair| *pair == (posix, nfs4));
+        answers[at.expect("in the corpus")] == "ok\ttrue"
+    };
+    assert!(carried(Some(enotsup), None), "an NFSv4 ACL");
+    assert!(carried(Some(enodata), Some(eio)), "an unreadable NFSv4 ACL");
+    assert!(!carried(Some(enodata), Some(enotsup)), "no ACL on ext4");
+}
+
+/// The filesystem rule is the updater's: each remote type, and the local ones
+/// beside them, is remote or not to the embedded verifier's
+/// `remote_filesystem_type` as to the updater's `remote_filesystem`; the
+/// verifier's statfs (ctypes) reads the type the updater reads on each of
+/// this machine's paths, `/proc` and the scratch root among them, and none
+/// for a path that does not exist; with no C library to read the type, the
+/// verifier counts the filesystem remote; and its install-path walk takes the
+/// private group's exemption back on a stand-in NFS type, as on an
+/// unreadable one.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_filesystem_rule_is_the_updaters() {
+    use aterm_update::linux::install_path::{
+        REMOTE_FILESYSTEMS, filesystem_type_at, is_user_private_group, remote_filesystem,
+    };
+    let scratch = Scratch::new();
+    let verifier = Verifier::new(&scratch);
+    let magics: Vec<u32> = REMOTE_FILESYSTEMS
+        .iter()
+        .copied()
+        .chain([
+            0xEF53,
+            0x0102_1994,
+            0x9123_683E,
+            0x5846_5342,
+            0x794C_7630,
+            0x9FA0,
+            0,
+            u32::MAX,
+        ])
+        .collect();
+    let root = crate::support::scratch_root();
+    let paths = [
+        PathBuf::from("/"),
+        PathBuf::from("/proc"),
+        root.to_path_buf(),
+        scratch.mkdir("fs"),
+        root.join("no-such-entry"),
+    ];
+    let json = |v: &aterm_json::Value| aterm_json::to_string(v).expect("JSON");
+    let mut calls: Vec<String> = magics
+        .iter()
+        .map(|magic| format!("json:remote_filesystem_type\t-\t{magic}"))
+        .collect();
+    calls.extend(paths.iter().map(|path| {
+        format!(
+            "json:filesystem_type\t-\t{}",
+            json(&aterm_json::json!(s(path)))
+        )
+    }));
+    calls.push("json:remote_filesystem|libc=null\t-\t\"/\"".into());
+    // A store whose one writable component is on this user's primary group,
+    // below a scratch root the walk admits.
+    let open = aterm_tempfile::Builder::new()
+        .prefix("install-sh-fs.")
+        .tempdir_in(root)
+        .expect("an unshielded dir");
+    let open_root = open.path().canonicalize().expect("its physical path");
+    chmod(&open_root, 0o755);
+    let own = open_root.join("own");
+    std::fs::create_dir(&own).expect("mkdir");
+    chmod(&own, 0o775);
+    let store = own.join("store");
+    std::fs::create_dir(&store).expect("mkdir");
+    chmod(&store, 0o755);
+    for stand_in in ["", "|filesystem_type=26985", "|filesystem_type=null"] {
+        calls.push(format!("check_install_path{stand_in}\t-\t{}", s(&store)));
+    }
+    let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
+    let (types, rest) = answers.split_at(magics.len());
+    let (reads, rest) = rest.split_at(paths.len());
+    let (unloaded, walks) = rest.split_at(1);
+    for (magic, answer) in magics.iter().zip(types) {
+        assert_eq!(
+            answer,
+            &format!("ok\t{}", remote_filesystem(*magic)),
+            "{magic:#x}"
+        );
+    }
+    for (path, answer) in paths.iter().zip(reads) {
+        let rust = filesystem_type_at(path);
+        assert_eq!(
+            answer,
+            &format!("ok\t{}", json(&aterm_json::json!(rust))),
+            "{}",
+            path.display()
+        );
+    }
+    assert_eq!(filesystem_type_at(Path::new("/proc")), Some(0x9FA0));
+    assert_eq!(unloaded, ["ok\ttrue"], "no C library: remote");
+    // SAFETY: getgid has no preconditions and cannot fail.
+    let admitted = is_user_private_group(unsafe { libc::getgid() });
+    assert_eq!(
+        walks[0].starts_with("ok\t"),
+        admitted,
+        "on this filesystem: {}",
+        walks[0]
+    );
+    for refused in &walks[1..] {
+        assert!(refused.starts_with("refused\t"), "{refused}");
+    }
+}
+
+/// The passwd enumeration is the updater's on this machine's accounts: for
+/// root's group, this user's primary group and `nogroup`, the embedded
+/// verifier's `primary_members` (`getpwent_r` through ctypes) lists the uids
+/// the updater's does, in order. Its `private_group` refuses a group whose
+/// enumeration fails or names another account, which it must therefore ask:
+/// on a machine whose primary group is this user's private one, that group
+/// is private with the true enumeration and not with another account in it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_passwd_enumeration_is_the_updaters_on_this_machine() {
+    use aterm_update::linux::install_path::{is_user_private_group, primary_members};
+    let scratch = Scratch::new();
+    let verifier = Verifier::new(&scratch);
+    // SAFETY: getuid and getgid have no preconditions and cannot fail.
+    let (uid, primary) = unsafe { (libc::getuid(), libc::getgid()) };
+    let gids = [0, primary, 65534];
+    let mut calls: Vec<String> = gids
+        .iter()
+        .map(|gid| format!("json:primary_members\t-\t{gid}"))
+        .collect();
+    calls.push("json:primary_members|libc=null\t-\t0".into());
+    for stand_in in [
+        "null".to_string(),
+        format!("[{uid}, {}]", uid + 1),
+        format!("[{uid}]"),
+    ] {
+        calls.push(format!(
+            "json:private_group|primary_members={stand_in}\t-\t{primary}"
+        ));
+    }
+    let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
+    let (lists, rest) = answers.split_at(gids.len());
+    for (gid, answer) in gids.iter().zip(lists) {
+        let python: aterm_json::Value = aterm_json::from_str(
+            answer
+                .strip_prefix("ok\t")
+                .unwrap_or_else(|| panic!("gid {gid}: {answer}")),
+        )
+        .expect("JSON");
+        assert_eq!(
+            python,
+            aterm_json::json!(primary_members(*gid)),
+            "gid {gid}"
+        );
+    }
+    assert_eq!(rest[0], "ok\tnull", "no C library: no enumeration");
+    assert_eq!(rest[1], "ok\tfalse", "an enumeration that failed");
+    assert_eq!(rest[2], "ok\tfalse", "another account's primary group");
+    assert_eq!(
+        rest[3],
+        format!("ok\t{}", is_user_private_group(primary)),
+        "this user's own enumeration"
+    );
+}
+
+/// What the installer makes, its own verifier admits, whatever the caller's
+/// umask: `ensure_dirs_writable` adds group and other write to the umask (and
+/// keeps its read bits), so a missing `~/.local/lib/aterm/bin` is never made
+/// writable by others under Ubuntu's `002`; the pre-flight (`--store-path`)
+/// judges the existing part of a store before anything is downloaded, and
+/// names the remedy.
+#[test]
+fn what_the_installer_makes_its_verifier_admits_under_any_umask() {
+    use std::os::unix::fs::MetadataExt as _;
+    let scratch = Scratch::new();
+    let verifier = Verifier::new(&scratch);
+    let open = aterm_tempfile::Builder::new()
+        .prefix("install-sh-umask.")
+        .tempdir_in(crate::support::scratch_root())
+        .expect("an unshielded dir");
+    let open_root = open.path().canonicalize().expect("its physical path");
+    chmod(&open_root, 0o755);
+    let rows = [
+        ("002", 0o755),
+        ("022", 0o755),
+        ("077", 0o700),
+        ("000", 0o755),
+    ];
+    let mut lib = Lib::new();
+    let made: Vec<(usize, PathBuf)> = rows
+        .iter()
+        .map(|(umask, _)| {
+            let home = open_root.join(format!("u{umask}"));
+            let store = home.join(".local/lib/aterm/bin");
+            let call = lib.call(
+                format!(
+                    "umask {umask}; ensure_dirs_writable {} {} && umask",
+                    q(s(&store)),
+                    q(s(&home.join(".local/bin")))
+                ),
+                &[],
+            );
+            (call, store)
+        })
+        .collect();
+    let recs = lib.run(&scratch);
+    let mut calls = Vec::new();
+    for ((umask, mode), (call, store)) in rows.iter().zip(&made) {
+        assert_eq!(recs[*call].rc, 0, "umask {umask}: {}", recs[*call].err);
+        assert_eq!(
+            recs[*call].out.trim(),
+            format!("0{umask}"),
+            "the caller's umask stands"
+        );
+        for dir in store
+            .ancestors()
+            .take_while(|d| d.starts_with(&open_root) && *d != open_root.as_path())
+        {
+            let got = std::fs::metadata(dir).expect("made").mode() & 0o7777;
+            assert_eq!(
+                format!("{got:o}"),
+                format!("{mode:o}"),
+                "umask {umask}: {}",
+                dir.display()
+            );
+        }
+        calls.push(format!("read_install_policy\t-\t{}", s(store)));
+        calls.push(format!(
+            "main\t-\t--store-path\t{}",
+            s(&store.join("not/yet"))
+        ));
+    }
+    // The pre-flight's refusal names the remedy for a directory of this user's
+    // that nothing private above it shields.
+    let shared = open_root.join("shared");
+    std::fs::create_dir(&shared).expect("mkdir");
+    chmod(&shared, 0o757);
+    calls.push(format!(
+        "main\t-\t--store-path\t{}",
+        s(&shared.join("lib/aterm/bin"))
+    ));
+    let answers = ask_verifier(&scratch, &verifier, &install_sh(), &calls);
+    let (last, admitted) = answers.split_last().expect("answers");
+    // The scratch root's chain is one the verifier admits (`scratch_root`).
+    for answer in admitted {
+        assert!(answer.starts_with("ok\t"), "{answer}");
+    }
+    // The installer's own pre-flight, through the shell wrapper the run takes:
+    // the verifier's refusal becomes the skip reason, its prefix stripped. Its
+    // `python3` is the found 3.11+ (`Verifier::lib`): the system one may be
+    // older (macOS's /usr/bin/python3 is 3.9, without tomllib).
+    let mut lib = verifier.lib(&install_sh());
+    lib.env("STUB_MODE", "run").env(
+        "STUB_MASTER_PUBKEYS",
+        &aterm_update_core::pins::PAPER_MASTER_PUBKEYS.join(" "),
+    );
+    let ours = lib.call(
+        format!("linux_store_preflight {}", q(s(&made[0].1))),
+        &["LINUX_STORE_SKIP"],
+    );
+    let theirs_store = shared.join("lib/aterm/bin");
+    let theirs = lib.call(
+        format!("linux_store_preflight {}", q(s(&theirs_store))),
+        &["LINUX_STORE_SKIP"],
+    );
+    let recs = lib.run(&scratch);
+    assert_eq!(recs[ours].rc, 0, "{}", recs[ours].err);
+    assert_eq!(recs[ours].var("LINUX_STORE_SKIP"), "");
+    let skip = recs[theirs].var("LINUX_STORE_SKIP");
+    if shielded(&open_root) {
+        assert!(last.starts_with("ok\t"), "{last}");
+        assert_eq!(recs[theirs].rc, 0, "{}", recs[theirs].err);
+        assert_eq!(skip, "");
+    } else {
+        assert!(last.starts_with("refused\t"), "{last}");
+        assert!(
+            last.contains(&format!("chmod go-w {}", s(&shared))),
+            "{last}"
+        );
+        assert_eq!(recs[theirs].rc, 1, "{}", recs[theirs].err);
+        let lead = format!("another account could replace {}/aterm: ", s(&theirs_store));
+        assert!(skip.starts_with(&lead), "{skip}");
+        assert!(!skip.contains("install.sh:"), "{skip}");
+        assert!(
+            skip.contains(&format!("chmod go-w {}", s(&shared))),
+            "{skip}"
+        );
+    }
+}
+
+/// Whether a directory of this user's that no other account can enter (mode
+/// `0700`, as `$XDG_RUNTIME_DIR` is) contains `dir`.
+fn shielded(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let me = unsafe { libc::getuid() };
+    dir.ancestors()
+        .any(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.uid() == me && m.mode() & 0o077 == 0))
 }
 
 /// A first install that recorded its policy before placing the binary keeps
@@ -1583,5 +2135,54 @@ fn an_older_release_is_judged_under_the_current_signed_policy() {
             (Err(why), Err(key)) => assert!(why.contains(key), "{name}: {why}"),
             (got, _) => panic!("{name}: {got:?}"),
         }
+    }
+}
+
+/// The verifier the installer pipes to `python3` imports nothing from the
+/// directory the install runs in. A piped install's working directory is
+/// wherever the person typed the command (`~/Downloads`), and `python3 -` puts it
+/// ahead of the standard library, so a `base64.py` there (the verifier's first
+/// import) would run inside the signature check. The real `python3` runs here;
+/// the argument-less call is refused either way. Negative control: the same
+/// verifier without `-I` imports the plant.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_verifier_imports_nothing_from_the_directory_the_install_runs_in() {
+    let scratch = Scratch::new();
+    let planted = scratch.mkdir("downloads");
+    let mark = planted.join("planted-ran");
+    scratch.write(
+        "downloads/base64.py",
+        format!("open({:?}, 'w').close()\n", s(&mark)),
+    );
+    let shipped = install_sh();
+    let text = std::fs::read_to_string(&shipped).expect("read install.sh");
+    let open = text.replace(
+        "python3 -I - \"$@\" <<'ATERM_LINUX_VERIFY_PY'",
+        "python3 - \"$@\" <<'ATERM_LINUX_VERIFY_PY'",
+    );
+    assert_ne!(open, text, "the fixture edit applies to install.sh");
+    let unisolated = scratch.write("install-unisolated.sh", open);
+    for (script, imports) in [(&shipped, false), (&unisolated, true)] {
+        let _ = std::fs::remove_file(&mark);
+        let mut lib = Lib::of(script);
+        let call = lib.call(
+            format!("cd {} && linux_release_verify", q(s(&planted))),
+            &[],
+        );
+        let recs = lib.run(&scratch);
+        assert_ne!(
+            recs[call].rc, 0,
+            "an argument-less call is refused: {}",
+            recs[call].err
+        );
+        assert_eq!(
+            mark.exists(),
+            imports,
+            "{}: the planted module {} imported: {}",
+            script.display(),
+            if imports { "must be" } else { "was" },
+            recs[call].err
+        );
     }
 }

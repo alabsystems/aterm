@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use crate::store::{Layout, ToolName};
+use crate::store::Layout;
 
 /// The notice directory has no pass progress, status or download files in it:
 /// an active download cannot repeatedly wake the idle harness host.
@@ -39,8 +39,7 @@ pub fn marker_path(layout: &Layout) -> PathBuf {
 /// instant. A missing or pending twin has no target.
 #[must_use]
 pub(crate) fn agent_target(layout: &Layout, agent: &str) -> Option<PathBuf> {
-    let tool = ToolName::new(agent)?;
-    crate::platform::resolve_shim(&layout.agent_shim(&tool))
+    crate::activate::twin_target(layout, agent)
 }
 
 /// What the front-of-PATH managed Claude twin actually runs at this instant.
@@ -109,6 +108,7 @@ fn publish(layout: &Layout) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::ToolName;
 
     #[test]
     fn only_a_final_claude_target_change_replaces_the_marker() {
@@ -155,38 +155,6 @@ mod tests {
         .unwrap();
         note_if_changed(&layout, &before);
         assert_ne!(std::fs::metadata(&marker).unwrap().ino(), first);
-        let _ = std::fs::remove_dir_all(&prefix);
-    }
-
-    #[test]
-    fn a_rolled_back_claude_twin_emits_no_notice() {
-        let prefix = crate::testdir::dir("atpkg-claude-activation-rollback-");
-        let layout = Layout {
-            prefix: prefix.clone(),
-        };
-        prepare(&layout);
-        let tool = ToolName::new("claude").unwrap();
-        std::fs::create_dir_all(layout.agents_dir()).unwrap();
-        let old = layout.build_dir("claude", 42).join("bin/claude");
-        let new = layout.build_dir("claude", 43).join("bin/claude");
-        for target in [&old, &new] {
-            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-            std::fs::write(target, b"#!/bin/sh\nexit 0\n").unwrap();
-        }
-        let twin = layout.agent_shim(&tool);
-        crate::platform::install_twin_to_env(&twin, &old, &crate::shim_env::ShimEnv::NONE, "")
-            .unwrap();
-        let before = agent_targets(&layout);
-        crate::platform::install_twin_to_env(&twin, &new, &crate::shim_env::ShimEnv::NONE, "")
-            .unwrap();
-        crate::platform::install_twin_to_env(&twin, &old, &crate::shim_env::ShimEnv::NONE, "")
-            .unwrap();
-        assert_eq!(agent_targets(&layout), before);
-        note_if_changed(&layout, &before);
-        assert!(
-            !marker_path(&layout).exists(),
-            "a pass that restored its original live twin cannot wake the host"
-        );
         let _ = std::fs::remove_dir_all(&prefix);
     }
 

@@ -151,6 +151,9 @@ pub(crate) fn set_self_sock(sock_dir: &Path, sock_path: &str) {
             }
         });
     *SELF_SOCK.write().unwrap_or_else(|p| p.into_inner()) = Some((sock_dir.to_path_buf(), canon));
+    // Sessions publish from here on: their writes' thread starts now, on the
+    // binder's thread, not in a tab's landing turn.
+    let _ = publisher();
 }
 
 /// This instance's own bound socket path, or `None` when no socket is bound.
@@ -185,14 +188,187 @@ pub(crate) fn self_sock_test_guard() -> std::sync::MutexGuard<'static, ()> {
 /// best-effort. Uses [`publish_graph_entry`], so an instance on an explicit
 /// `--control-sock` also lands its entry in the default rendezvous dir the
 /// client reads. Called at the session-registration seam for every session.
+///
+/// The write is queued ([`queue_publication`]): on the event loop it cost
+/// 0.5–1 ms of every tab's landing turn. The socket is read here, at the
+/// registration, so the bind order holds as before (published ⟹ bound: a
+/// registration that reads no socket is in `publish_discovery`'s snapshot),
+/// and the one queue keeps a session's publish ahead of its
+/// [`unpublish_session`]. It is queued while the socket's record is still
+/// read-held, as the inline write was made: whatever clears the record
+/// (a test's reset) finds it queued, and a [`flush_publications`] after that
+/// waits for it.
 pub(crate) fn publish_session(sid: &SessionId, nonce: &LaunchNonce) {
     let guard = SELF_SOCK.read().unwrap_or_else(|p| p.into_inner());
-    if let Some((dir, sock)) = guard.as_ref() {
-        // On disk goes the spelling every reader can dial and dedupe. The
-        // recorded path is canonical, which on Windows is the verbatim
-        // `\\?\C:\…` form the bind-time publish does not use; un-verbatim it so
-        // one instance is not listed twice. The in-memory record stays canonical.
-        publish_graph_entry(dir, sid, &published_sock_spelling(sock), nonce);
+    let Some((dir, sock)) = guard.as_ref() else {
+        return;
+    };
+    // On disk goes the spelling every reader can dial and dedupe. The
+    // recorded path is canonical, which on Windows is the verbatim
+    // `\\?\C:\…` form the bind-time publish does not use; un-verbatim it so
+    // one instance is not listed twice. The in-memory record stays canonical.
+    queue_publication(Publication::Publish {
+        dir: dir.clone(),
+        sid: sid.clone(),
+        sock: published_sock_spelling(sock),
+        nonce: *nonce,
+    });
+    drop(guard);
+}
+
+/// One discovery write, in the order its sessions registered and closed.
+enum Publication {
+    /// [`publish_graph_entry`] of `sid` naming `sock`.
+    Publish {
+        dir: PathBuf,
+        sid: SessionId,
+        sock: String,
+        nonce: LaunchNonce,
+    },
+    /// [`retire_graph_entry`] of `sid`.
+    Retire { dir: PathBuf, sid: SessionId },
+    /// Retire only this instance's graph entries, behind all earlier publishes.
+    RetireOwn {
+        dir: PathBuf,
+        sid: SessionId,
+        sock: String,
+        recorded_sock: Option<String>,
+    },
+    /// Answered once every write queued before it has been processed (a rendezvous
+    /// channel holds the thread until the answer is taken: a test's).
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+impl Publication {
+    fn write(self) {
+        match self {
+            Self::Publish {
+                dir,
+                sid,
+                sock,
+                nonce,
+            } => publish_graph_entry(&dir, &sid, &sock, &nonce),
+            Self::Retire { dir, sid } => retire_graph_entry(&dir, &sid),
+            Self::RetireOwn {
+                dir,
+                sid,
+                sock,
+                recorded_sock,
+            } => {
+                let retire = |at: &Path| {
+                    remove_own_graph_entry(at, &sid, &sock);
+                    if let Some(recorded) = recorded_sock.as_deref() {
+                        remove_own_graph_entry(at, &sid, recorded);
+                        remove_own_graph_entry(at, &sid, &published_sock_spelling(recorded));
+                    }
+                };
+                retire(&dir);
+                if let Some(mirror) = rendezvous_mirror_dir(&dir) {
+                    retire(&mirror);
+                }
+            }
+            Self::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// The `aterm-publish` thread's queue, and how many writes on it have not
+/// landed.
+struct Publisher {
+    tx: std::sync::mpsc::Sender<Publication>,
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+static PUBLISHER: std::sync::OnceLock<Option<Publisher>> = std::sync::OnceLock::new();
+
+/// The publication thread, started with the bind ([`set_self_sock`], on the
+/// control thread), so no tab's landing pays for the thread. `None` when it
+/// could not start: then each write runs where it is asked, as before.
+fn publisher() -> Option<&'static Publisher> {
+    PUBLISHER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Publication>();
+            let spawned = crate::qos::spawn_lane_thread(
+                "aterm-publish",
+                // A new tab's shell finds its instance through its entry
+                // (`aterm ctl`'s self-location), so it lands promptly.
+                crate::qos::Role::Responsive,
+                move || {
+                    for publication in rx {
+                        publication.write();
+                        if let Some(Some(p)) = PUBLISHER.get() {
+                            p.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        }
+                    }
+                },
+            );
+            match spawned {
+                Ok(_) => Some(Publisher {
+                    tx,
+                    pending: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Err(e) => {
+                    aterm_log::warn!("discovery: could not start the publication thread: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Hand `publication` to the publication thread; written here when there is
+/// none.
+fn queue_publication(publication: Publication) {
+    let Some(p) = publisher() else {
+        publication.write();
+        return;
+    };
+    p.pending.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    if let Err(std::sync::mpsc::SendError(publication)) = p.tx.send(publication) {
+        p.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        publication.write();
+    }
+}
+
+/// Wait up to `within` for earlier queued operations to be processed. This
+/// fences their order, not best-effort filesystem success. A Commit refuses
+/// false; a quit queues its guarded retirements first, so they stay ordered
+/// even if the wait expires and process exit leaves cleanup to the stale sweep.
+/// Free when nothing is queued. `false` when the operations were still behind.
+pub(crate) fn flush_publications(within: std::time::Duration) -> bool {
+    let Some(Some(p)) = PUBLISHER.get() else {
+        return true;
+    };
+    if p.pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return true;
+    }
+    let (done, landed) = std::sync::mpsc::sync_channel(1);
+    queue_publication(Publication::Flush(done));
+    landed.recv_timeout(within).is_ok()
+}
+
+/// Stop session publication and queue this instance's guarded retirements.
+/// Taking the socket's write lock waits for every earlier read-held enqueue;
+/// later registrations see no socket. Drop that lock before enqueueing, since
+/// the no-worker fallback writes inline and the owner guard reads self_sock_path.
+pub(crate) fn retire_own_sessions(
+    dir: &Path,
+    sock: &str,
+    sessions: impl IntoIterator<Item = SessionId>,
+) {
+    let recorded_sock = {
+        let mut guard = SELF_SOCK.write().unwrap_or_else(|p| p.into_inner());
+        guard.take().map(|(_, recorded)| recorded)
+    };
+    for sid in sessions {
+        queue_publication(Publication::RetireOwn {
+            dir: dir.to_path_buf(),
+            sid,
+            sock: sock.to_string(),
+            recorded_sock: recorded_sock.clone(),
+        });
     }
 }
 
@@ -217,12 +393,19 @@ fn published_sock_spelling(sock: &str) -> String {
 /// resolving it. No-op when no socket is bound. A leftover (crash, missed
 /// close) is harmless: the sibling forward re-checks socket liveness and the
 /// hosting instance re-checks its own store, so it can only produce `ERR no
-/// such session`, never a wrong target.
+/// such session`, never a wrong target. Queued behind the session's publish
+/// ([`publish_session`]).
 pub(crate) fn unpublish_session(sid: &SessionId) {
     let guard = SELF_SOCK.read().unwrap_or_else(|p| p.into_inner());
-    if let Some((dir, _)) = guard.as_ref() {
-        retire_graph_entry(dir, sid);
-    }
+    let Some((dir, _)) = guard.as_ref() else {
+        return;
+    };
+    // Queued under the read, as [`publish_session`] is.
+    queue_publication(Publication::Retire {
+        dir: dir.clone(),
+        sid: sid.clone(),
+    });
+    drop(guard);
 }
 
 /// Read the per-launch auth token of the sibling instance whose socket is
@@ -575,17 +758,18 @@ const EDGE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(10 
 pub(crate) fn start_edge_sweeper() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
-        let spawned = std::thread::Builder::new()
-            .name("aterm-edge-sweep".into())
-            .spawn(|| {
-                crate::qos::set_self(crate::qos::Role::Housekeeping);
+        let spawned = crate::qos::spawn_lane_thread(
+            "aterm-edge-sweep",
+            crate::qos::Role::Housekeeping,
+            || {
                 loop {
                     if let Some(dir) = crate::control_auth::socket_dir() {
                         sweep_dead_edge_files(&dir.join("edges"));
                     }
                     std::thread::sleep(EDGE_SWEEP_EVERY);
                 }
-            });
+            },
+        );
         if let Err(e) = spawned {
             aterm_log::warn!("edge-token sweep: could not start its thread: {e}");
         }
@@ -617,7 +801,7 @@ pub(crate) fn read_edge_tokens(path: &str) -> Option<(String, String, String)> {
 ///
 /// Dropping it retires both, so a closed tab deregisters its child and
 /// [`proxies`] does not grow for the process lifetime
-/// (`aterm_spec::derive::proxy_registry_model`); a spawn that fails after
+/// (`aterm_models_session::proxy_registry_model`); a spawn that fails after
 /// provisioning drops it on the way out. The file removed is the exact path
 /// written, never one re-derived from a socket dir that may resolve differently.
 ///
@@ -1310,23 +1494,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn graph_entry_roundtrips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("aterm-graph-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let sid = SessionId::generate();
-        let nonce = LaunchNonce::generate();
-        write_graph_entry(&dir, &sid, "/run/user/1000/aterm/aterm-42.sock", &nonce);
-        let (sock, got_nonce) = read_graph_entry(&dir, &sid).expect("entry exists");
-        assert_eq!(sock, "/run/user/1000/aterm/aterm-42.sock");
-        assert!(got_nonce.ct_eq(&nonce));
-        // A different sid has no entry.
-        assert!(read_graph_entry(&dir, &SessionId::generate()).is_none());
-        remove_graph_entry(&dir, &sid);
-        assert!(read_graph_entry(&dir, &sid).is_none(), "removed");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// An instance on an explicit `--control-sock` mirrors its graph entry into the
     /// default rendezvous dir (the only one the flagless `aterm-ctl` reads), and the
     /// client's own parse (`control_socket::graph_entry_sock`) recovers the absolute
@@ -1858,7 +2025,7 @@ mod tests {
     }
 
     /// Tier-1 conformance of the real relay to
-    /// `aterm_spec::derive::relay_teardown_model` (`RelayTeardown`): on teardown both
+    /// `aterm_models_session::relay_teardown_model` (`RelayTeardown`): on teardown both
     /// read halves of both local sockets are shut, so a pump parked on a clone of
     /// either gets EOF and the worker joins.
     ///
@@ -1871,7 +2038,7 @@ mod tests {
     #[cfg(unix)]
     fn relay_teardown_conforms_to_readers_unblock_after_teardown() {
         use aterm_spec::verify::validate_transition_tiered;
-        let model = aterm_spec::derive::relay_teardown_model();
+        let model = aterm_models_session::relay_teardown_model();
         let buggy = aterm_spec::interp::with_buggy(&model, 1);
         for fault in [RelayFault::ChildBound, RelayFault::ClientBound] {
             let (observed, returned) = relay_teardown_under(fault);
@@ -2136,6 +2303,10 @@ mod tests {
         );
         set_self_sock(&dir, &sock);
         publish_session(&sid, &nonce);
+        assert!(
+            flush_publications(aterm_spec::wait::MUST_HAPPEN),
+            "the write lands"
+        );
         let (got_sock, got_nonce) = read_graph_entry(&dir, &sid).expect("published");
         assert_eq!(got_sock, canon_sock);
         assert!(got_nonce.ct_eq(&nonce));
@@ -2154,6 +2325,10 @@ mod tests {
 
         // Close: the entry is retired from both our dir and the scratch mirror.
         unpublish_session(&sid);
+        assert!(
+            flush_publications(aterm_spec::wait::MUST_HAPPEN),
+            "the retire lands"
+        );
         assert!(read_graph_entry(&dir, &sid).is_none(), "retired on close");
         assert!(
             read_graph_entry(&mirror, &sid).is_none(),
@@ -2179,6 +2354,63 @@ mod tests {
         assert_eq!(read_sibling_token(&other), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session's discovery write is queued, not made in the registration's
+    /// turn: held behind a write the thread cannot finish, a publish has not
+    /// landed when `publish_session` returns, and lands once the thread moves.
+    /// The queue keeps order: a session closed while its publish waits is
+    /// retired after it, so no entry is left behind.
+    #[test]
+    fn a_session_publication_is_queued_off_the_caller_and_kept_in_order() {
+        /// The process-global discovery state, cleared on every exit path: the
+        /// queue drained while the scratch mirror still stands.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                clear_self_sock();
+                let _ = flush_publications(aterm_spec::wait::MUST_HAPPEN);
+                set_mirror_dir_override(None);
+            }
+        }
+        let _guard = self_sock_test_guard();
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let (dir, mirror) = (scratch.path().join("own"), scratch.path().join("mirror"));
+        for d in [&dir, &mirror] {
+            std::fs::create_dir_all(d).expect("scratch dir");
+        }
+        set_mirror_dir_override(Some(mirror.clone()));
+        let _reset = Reset;
+        set_self_sock(&dir, &dir.join("aterm-88003.sock").to_string_lossy());
+
+        // The thread holds a write until this test takes its answer.
+        let (held, release) = std::sync::mpsc::sync_channel(0);
+        queue_publication(Publication::Flush(held));
+        let (kept, closed) = (SessionId::generate(), SessionId::generate());
+        publish_session(&kept, &LaunchNonce::generate());
+        publish_session(&closed, &LaunchNonce::generate());
+        unpublish_session(&closed);
+        assert!(
+            read_graph_entry(&dir, &kept).is_none(),
+            "publish_session wrote in the caller's turn"
+        );
+        release
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the publication thread reached the held write");
+        assert!(
+            flush_publications(aterm_spec::wait::MUST_HAPPEN),
+            "the queue drained"
+        );
+        assert!(
+            read_graph_entry(&dir, &kept).is_some(),
+            "the publish landed"
+        );
+        assert!(read_graph_entry(&mirror, &kept).is_some(), "and its mirror");
+        assert!(
+            read_graph_entry(&dir, &closed).is_none()
+                && read_graph_entry(&mirror, &closed).is_none(),
+            "a session retired behind its publish leaves no entry"
+        );
     }
 
     /// A sibling's token file is read the way every control client reads its

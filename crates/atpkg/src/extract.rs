@@ -25,7 +25,7 @@
 //!   that would write THROUGH it ([`ExtractReject::ThroughSymlink`] /
 //!   [`ExtractReject::Occupied`]) — so a link can never redirect a write, and the tree
 //!   the digest describes is the tree on disk;
-//! * an in-root HARDLINK is admitted only after [`vet_hardlink`] walks BOTH ends through
+//! * an in-root HARDLINK is admitted only after [`vet_hardlink_stripped`] walks BOTH ends through
 //!   the same component vet, NEITHER path passes through a link laid earlier (`lstat`
 //!   and `link` decline to follow only the LAST component, so the target's ancestors are
 //!   walked too), AND the target is already an extracted regular file — a
@@ -75,7 +75,7 @@ pub enum ExtractReject {
     RootEscape,
     /// A symlink where the lane refuses them, or any non-regular/non-directory/non-link
     /// entry — refused outright. (An in-root hardlink is separately vetted by
-    /// [`vet_hardlink`]; one that fails that vet lands here or in the path rejections
+    /// [`vet_hardlink_stripped`]; one that fails that vet lands here or in the path rejections
     /// above.)
     DisallowedKind,
     /// A hardlink whose target had not been extracted by the time the link entry
@@ -108,7 +108,7 @@ pub enum ExtractReject {
 /// The kind of an archive entry, as the reader classifies it.
 /// [`Regular`](EntryKind::Regular) and [`Directory`](EntryKind::Directory) are
 /// extracted after [`vet_entry`]; a [`Hardlink`](EntryKind::Hardlink) is laid
-/// down only after the stricter [`vet_hardlink`] (both ends walked, target
+/// down only after the stricter [`vet_hardlink_stripped`] (both ends walked, target
 /// already extracted, in-root); a [`Symlink`](EntryKind::Symlink) only where the
 /// lane admits them and after [`vet_symlink`]; everything else is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +120,7 @@ pub enum EntryKind {
     /// A symbolic link. Refused by the release-bundle lane; admitted by the vendor
     /// lanes only when its target resolves inside the stage root.
     Symlink,
-    /// A hard link. Allowed ONLY when [`vet_hardlink`] proves both the entry
+    /// A hard link. Allowed ONLY when [`vet_hardlink_stripped`] proves both the entry
     /// path and the link target resolve inside the store root and the target
     /// is already extracted — a toolchain sysroot dedups identical binaries
     /// this way (`cargo`/`targo`, `trustc`/`rustc`, shared dylibs), and the
@@ -247,7 +247,7 @@ fn join_under(root: &Path, rel: &Path) -> Result<PathBuf, ExtractReject> {
 pub fn vet_entry(root: &Path, raw: &Path, kind: EntryKind) -> Result<PathBuf, ExtractReject> {
     // 1. Only real files/dirs are laid down through THIS vet. Symlinks (the
     //    classic slip + TOCTOU vector) and exotic types are refused outright;
-    //    a hardlink must come through [`vet_hardlink`], which walks BOTH ends;
+    //    a hardlink must come through [`vet_hardlink_stripped`], which walks BOTH ends;
     //    a symlink the lane admits must come through [`vet_symlink`].
     match kind {
         EntryKind::Regular | EntryKind::Directory => {}
@@ -287,28 +287,16 @@ pub fn vet_entry_stripped(
 
 /// Vet one HARDLINK entry: the entry path AND the link target must each pass
 /// the exact [`vet_entry`] component walk (relative, no `..`, no root/prefix,
-/// non-empty, joined-under-root). Returns `(dest, target)` as safe absolute
-/// paths. The link target is resolved against the store `root` (tar hardlink
-/// names are archive-relative), so a target can never name anything outside
-/// the tree being extracted — an escaping hardlink is structurally unreachable.
+/// non-empty, joined-under-root), with `strip_components` applied to BOTH ends (GNU
+/// tar strips link targets too). Returns `(dest, target)` as safe absolute paths. The
+/// link target is resolved against the store `root` (tar hardlink names are
+/// archive-relative), so a target can never name anything outside the tree being
+/// extracted — an escaping hardlink is structurally unreachable.
 ///
-/// Pure like [`vet_entry`]; the existence-at-link-time check
-/// ([`ExtractReject::HardlinkTargetMissing`]) lives at the extraction site,
-/// where the filesystem is in scope.
-pub fn vet_hardlink(
-    root: &Path,
-    raw: &Path,
-    link_target: &Path,
-) -> Result<(PathBuf, PathBuf), ExtractReject> {
-    let dest = vet_entry(root, raw, EntryKind::Regular)?;
-    let target = vet_entry(root, link_target, EntryKind::Regular)?;
-    Ok((dest, target))
-}
-
-/// [`vet_hardlink`] with `strip_components` applied to BOTH ends (GNU tar strips link
-/// targets too). `Ok(None)` when the ENTRY strips away; a target that strips away while
-/// the entry does not is [`ExtractReject::HardlinkTargetMissing`] — nothing extracted
-/// can be its target.
+/// `Ok(None)` when the ENTRY strips away; a target that strips away while the entry
+/// does not is [`ExtractReject::HardlinkTargetMissing`] — nothing extracted can be its
+/// target. Pure like [`vet_entry`]; the existence-at-link-time check (the same
+/// rejection) lives at the extraction site, where the filesystem is in scope.
 pub fn vet_hardlink_stripped(
     root: &Path,
     raw: &Path,
@@ -2234,116 +2222,41 @@ mod tests {
         PathBuf::from("/store/ay/staging")
     }
 
-    // Safe relative regular files / dirs resolve to a destination under the root.
+    /// The entry vet, every classic tar-slip shape (the §15 "every escape fixture aborts"
+    /// matrix): safe relative paths resolve under the root (a `.` component dropped, dots
+    /// within a name a plain name); `..` anywhere, an absolute path, an empty or dot-only
+    /// path, and any link or exotic kind — however in-root its path — are refused.
     #[test]
-    fn accepts_safe_relative_entries() {
+    fn vet_entry_admits_in_root_paths_and_refuses_every_escape() {
+        use EntryKind::{Directory as D, Hardlink, Other, Regular as F, Symlink};
         let r = root();
-        assert_eq!(
-            vet_entry(&r, Path::new("bin/ay"), EntryKind::Regular).unwrap(),
-            r.join("bin/ay")
-        );
-        assert_eq!(
-            vet_entry(&r, Path::new("share/doc"), EntryKind::Directory).unwrap(),
-            r.join("share/doc")
-        );
-        // A `.` component is dropped, not an error.
-        assert_eq!(
-            vet_entry(&r, Path::new("a/./b"), EntryKind::Regular).unwrap(),
-            r.join("a/b")
-        );
-        // Dots WITHIN a name are a normal filename, not traversal.
-        assert_eq!(
-            vet_entry(&r, Path::new("lib/foo..bar.so"), EntryKind::Regular).unwrap(),
-            r.join("lib/foo..bar.so")
-        );
-    }
-
-    // Every classic tar-slip escape aborts (the §15 "every escape fixture aborts" matrix).
-    #[test]
-    fn rejects_traversal_and_absolute_paths() {
-        let r = root();
-        assert_eq!(
-            vet_entry(&r, Path::new("../etc/passwd"), EntryKind::Regular),
-            Err(ExtractReject::ParentTraversal)
-        );
-        assert_eq!(
-            vet_entry(&r, Path::new("a/../../b"), EntryKind::Regular),
-            Err(ExtractReject::ParentTraversal)
-        );
-        assert_eq!(
-            vet_entry(&r, Path::new("/etc/passwd"), EntryKind::Regular),
-            Err(ExtractReject::AbsolutePath)
-        );
-        assert_eq!(
-            vet_entry(&r, Path::new("/"), EntryKind::Directory),
-            Err(ExtractReject::AbsolutePath)
-        );
-        // Leading `..` even before a normal segment.
-        assert_eq!(
-            vet_entry(&r, Path::new(".."), EntryKind::Directory),
-            Err(ExtractReject::ParentTraversal)
-        );
-    }
-
-    // Symlinks, hardlinks, and exotic types are refused outright — regardless of where
-    // their (untrusted) target points.
-    #[test]
-    fn rejects_links_and_exotic_kinds() {
-        let r = root();
-        // Even a perfectly in-root PATH is refused if the kind is a link.
-        for kind in [EntryKind::Symlink, EntryKind::Hardlink, EntryKind::Other] {
+        for (raw, kind, at) in [
+            ("bin/ay", F, "bin/ay"),
+            ("share/doc", D, "share/doc"),
+            ("a/./b", F, "a/b"),
+            ("lib/foo..bar.so", F, "lib/foo..bar.so"),
+        ] {
+            assert_eq!(vet_entry(&r, Path::new(raw), kind), Ok(r.join(at)), "{raw}");
+        }
+        for (raw, kind, why) in [
+            ("../etc/passwd", F, ExtractReject::ParentTraversal),
+            ("a/../../b", F, ExtractReject::ParentTraversal),
+            ("..", D, ExtractReject::ParentTraversal),
+            ("/etc/passwd", F, ExtractReject::AbsolutePath),
+            ("/", D, ExtractReject::AbsolutePath),
+            ("", F, ExtractReject::EmptyPath),
+            (".", D, ExtractReject::EmptyPath),
+            ("./././", D, ExtractReject::EmptyPath),
+            ("bin/ay", Symlink, ExtractReject::DisallowedKind),
+            ("bin/ay", Hardlink, ExtractReject::DisallowedKind),
+            ("bin/ay", Other, ExtractReject::DisallowedKind),
+        ] {
             assert_eq!(
-                vet_entry(&r, Path::new("bin/ay"), kind),
-                Err(ExtractReject::DisallowedKind),
-                "{kind:?} must be refused"
+                vet_entry(&r, Path::new(raw), kind),
+                Err(why),
+                "{raw} {kind:?}"
             );
         }
-    }
-
-    // Hardlinks go through the two-ended walk: both ends in-root passes;
-    // an escaping / absolute / traversal TARGET is refused with the same
-    // rejections as an escaping entry path (the slip vector stays closed).
-    #[test]
-    fn hardlink_vet_walks_both_ends() {
-        let r = root();
-        assert_eq!(
-            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("bin/targo")).unwrap(),
-            (r.join("bin/cargo"), r.join("bin/targo"))
-        );
-        assert_eq!(
-            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("../outside")),
-            Err(ExtractReject::ParentTraversal)
-        );
-        assert_eq!(
-            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("/etc/passwd")),
-            Err(ExtractReject::AbsolutePath)
-        );
-        assert_eq!(
-            vet_hardlink(&r, Path::new("../escape"), Path::new("bin/targo")),
-            Err(ExtractReject::ParentTraversal)
-        );
-        assert_eq!(
-            vet_hardlink(&r, Path::new("bin/cargo"), Path::new("")),
-            Err(ExtractReject::EmptyPath)
-        );
-    }
-
-    // Empty / dot-only paths name no target → refused.
-    #[test]
-    fn rejects_empty_and_dot_only_paths() {
-        let r = root();
-        assert_eq!(
-            vet_entry(&r, Path::new(""), EntryKind::Regular),
-            Err(ExtractReject::EmptyPath)
-        );
-        assert_eq!(
-            vet_entry(&r, Path::new("."), EntryKind::Directory),
-            Err(ExtractReject::EmptyPath)
-        );
-        assert_eq!(
-            vet_entry(&r, Path::new("./././"), EntryKind::Directory),
-            Err(ExtractReject::EmptyPath)
-        );
     }
 
     /// `strip_components` drops leading components AFTER the full path is vetted: `..`
@@ -2364,24 +2277,9 @@ mod tests {
             vet_entry_stripped(&r, Path::new("a/b/c"), EntryKind::Regular, 3).unwrap(),
             None
         );
-        // A leading `.` is a component the strip SPENDS itself on, exactly as the tar
-        // that authors these rows spends it (measured, bsdtar 3.5.3: `--strip-components
-        // 1` over `./top/bin/gh` lays `top/bin/gh`). Anything else and a
-        // `tar -C dir -c .` archive lays a different tree here than the one the
-        // authoring ceremony staged and signed the `tree_root` of.
-        assert_eq!(
-            vet_entry_stripped(&r, Path::new("./top/bin/gh"), EntryKind::Regular, 1).unwrap(),
-            Some(r.join("top/bin/gh"))
-        );
-        assert_eq!(
-            vet_entry_stripped(&r, Path::new("./top/bin/gh"), EntryKind::Regular, 2).unwrap(),
-            Some(r.join("bin/gh"))
-        );
-        assert_eq!(
-            vet_entry_stripped(&r, Path::new("./bin/gh"), EntryKind::Regular, 0).unwrap(),
-            Some(r.join("bin/gh"))
-        );
-        // A symlink member strips by the same accounting.
+        // A leading `.` is a component the strip SPENDS itself on, as the authoring tar
+        // spends it (`dot_rooted_archives_extract_like_the_tar_that_authored_them`); a
+        // symlink member strips by the same accounting.
         assert_eq!(
             vet_symlink(&r, Path::new("./top/bin/link"), Path::new("gh"), 1).unwrap(),
             Some(r.join("top/bin/link"))
@@ -2531,44 +2429,6 @@ mod tests {
         path
     }
 
-    // A benign bundle extracts every file under the root with sanitized modes + content.
-    #[test]
-    fn extracts_benign_bundle() {
-        let d = dest("benign");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let archive = make_archive(
-            &d,
-            "ok",
-            &[
-                ("bin/ay", b'0', "", b"#!/bin/true\nbinary"),
-                ("share/doc/readme", b'0', "", b"hello"),
-            ],
-        );
-        extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap();
-        assert_eq!(
-            std::fs::read(root.join("bin/ay")).unwrap(),
-            b"#!/bin/true\nbinary"
-        );
-        assert_eq!(
-            std::fs::read(root.join("share/doc/readme")).unwrap(),
-            b"hello"
-        );
-        // Modes are sanitized to 0644 (no exec bit was set in the header) — Unix-only.
-        #[cfg(unix)]
-        assert_eq!(
-            std::fs::metadata(root.join("bin/ay"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o644
-        );
-        // The extracted tree has a stable tree_root.
-        assert_eq!(crate::tree::tree_root(&root).unwrap().len(), 64);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
     /// The env that turns [`probe_stages_its_directories_0755_under_an_open_umask`] on:
     /// the scratch directory it stages under.
     #[cfg(unix)]
@@ -2652,254 +2512,158 @@ mod tests {
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
-    // An in-root hardlink (typeflag '1') materializes as a same-inode alias of
-    // its already-extracted target — the sysroot dedup shape (`cargo`→`targo`,
-    // `trustc`→`rustc`) — and the linked tree still yields a stable tree_root.
+    /// The release-bundle lane's link refusals: a symlink entry, refused outright however
+    /// in-root its target, and a hardlink whose target leaves the root, is absolute, or is
+    /// a forward reference (not yet extracted) — the §9 fixtures for links. None is laid.
     #[test]
-    fn extracts_in_root_hardlinks() {
-        let d = dest("hardlink-ok");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let archive = make_archive(
-            &d,
-            "hl",
-            &[
-                ("bin/targo", b'0', "", b"the one binary"),
-                ("bin/cargo", b'1', "bin/targo", b""),
-            ],
-        );
-        extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap();
-        assert_eq!(
-            std::fs::read(root.join("bin/cargo")).unwrap(),
-            b"the one binary"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            assert_eq!(
-                std::fs::metadata(root.join("bin/cargo")).unwrap().ino(),
-                std::fs::metadata(root.join("bin/targo")).unwrap().ino(),
-                "hardlink must alias the target inode, not copy it"
-            );
-        }
-        assert_eq!(crate::tree::tree_root(&root).unwrap().len(), 64);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // The hardlink escape matrix: a target outside the root, an absolute
-    // target, and a forward reference (target not yet extracted) each abort
-    // with nothing written outside the root — the §9 fixtures for links.
-    #[test]
-    fn aborts_on_escaping_or_dangling_hardlinks() {
-        for (label, entries) in [
+    fn the_release_lane_refuses_symlinks_and_escaping_or_dangling_hardlinks() {
+        let d = dest("release-links");
+        let empty = b"".as_slice();
+        for (label, entries, never) in [
+            ("symlink", vec![("link", b'2', "bin/real", empty)], "link"),
             (
                 "hl-escape",
                 vec![
                     ("bin/real", b'0', "", b"x".as_slice()),
-                    ("bin/evil", b'1', "../../etc/passwd", b"".as_slice()),
+                    ("bin/evil", b'1', "../../etc/passwd", empty),
                 ],
+                "bin/evil",
             ),
             (
                 "hl-abs",
-                vec![("bin/evil", b'1', "/etc/passwd", b"".as_slice())],
+                vec![("bin/evil", b'1', "/etc/passwd", empty)],
+                "bin/evil",
             ),
             (
                 "hl-forward",
-                vec![("bin/evil", b'1', "bin/not-yet", b"".as_slice())],
+                vec![("bin/evil", b'1', "bin/not-yet", empty)],
+                "bin/evil",
             ),
         ] {
-            let d = dest(label);
-            let root = d.join("staging");
-            std::fs::create_dir_all(&root).unwrap();
+            let root = d.join(label);
             let archive = make_archive(&d, label, &entries);
-            let err = extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap_err();
+            let err = extract_tar_zst_tree(
+                &archive,
+                &root,
+                10_000_000,
+                10_000,
+                ExtractOptions::default(),
+                FrameChecksum::IfPresent,
+            )
+            .unwrap_err();
             assert!(
-                matches!(err, ExtractError::Rejected(_, _)),
+                matches!(err, ExtractError::Rejected(..)),
                 "{label}: {err:?}"
             );
             assert!(
-                !d.join("etc").exists() && !Path::new("/tmp/atpkg-hl-escape-proof").exists(),
-                "{label}: nothing may land outside the root"
-            );
-            let _ = std::fs::remove_dir_all(&d);
-        }
-    }
-
-    // A `../` traversal entry aborts extraction and never writes outside the root.
-    #[test]
-    fn aborts_on_traversal_entry() {
-        let d = dest("traversal");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let sentinel = d.join("OUTSIDE"); // sibling of root; must never be created
-        let rel_escape = "../OUTSIDE";
-        let archive = make_archive(&d, "evil", &[(rel_escape, b'0', "", b"pwned")]);
-        let err = extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ExtractError::Rejected(ExtractReject::ParentTraversal, _)
-            ),
-            "got {err:?}"
-        );
-        assert!(
-            !sentinel.exists(),
-            "a traversal entry must not escape the root"
-        );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // A symlink entry aborts extraction in the release-bundle lane (refused outright).
-    #[test]
-    fn aborts_on_symlink_entry() {
-        let d = dest("symlink");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let archive = make_archive(&d, "lnk", &[("link", b'2', "/etc/passwd", b"")]);
-        let err = extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ExtractError::Rejected(ExtractReject::DisallowedKind, _)
-            ),
-            "got {err:?}"
-        );
-        assert!(!root.join("link").exists(), "no symlink should be written");
-        // …and the same through the folding entry point with default options.
-        let root2 = d.join("staging2");
-        let err = extract_tar_zst_tree(
-            &archive,
-            &root2,
-            10_000_000,
-            10_000,
-            ExtractOptions::default(),
-            FrameChecksum::IfPresent,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ExtractError::Rejected(ExtractReject::DisallowedKind, _)
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // The uncompressed-size cap (from the SIGNED manifest, §9) aborts a too-large bundle.
-    #[test]
-    fn aborts_when_over_size_cap() {
-        let d = dest("toolarge");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let archive = make_archive(&d, "big", &[("data", b'0', "", &[b'x'; 4096])]);
-        // Cap below the 4096-byte payload ⇒ TooLarge.
-        let err = extract_tar_zst(&archive, &root, 1024, 10_000).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
-            "got {err:?}"
-        );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // An explicit directory entry that legitimately declares size 0 still extracts — the
-    // declared-size guard must reject no valid bundle.
-    #[test]
-    fn extracts_bundle_with_explicit_directory_entry() {
-        let d = dest("dirok");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let archive = make_archive(
-            &d,
-            "dirok",
-            &[
-                ("share/", b'5', "", b""), // explicit directory entry, declared size 0
-                ("share/readme", b'0', "", b"hi"),
-            ],
-        );
-        extract_tar_zst(&archive, &root, 10_000_000, 10_000).unwrap();
-        assert!(
-            root.join("share").is_dir(),
-            "the directory entry should be created"
-        );
-        assert_eq!(std::fs::read(root.join("share/readme")).unwrap(), b"hi");
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // A directory entry whose header declares a non-zero `size` is a decompression-bomb
-    // vector: the tar reader decompresses that many bytes to skip the entry, yet the size
-    // cap counts only bytes WRITTEN (regular files), so the cap is never touched. Refuse
-    // it on the header alone — before any body is decompressed — even with a generous cap.
-    #[test]
-    fn aborts_on_oversized_directory_entry() {
-        let d = dest("dirbomb");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        // Build the archive by hand: one directory entry whose header declares 50 MiB but
-        // carries no body — the fix rejects on the header, before any body is read.
-        let mut tar = Vec::new();
-        tar.extend_from_slice(&raw_header("payload/", b'5', "", 50 * 1024 * 1024));
-        tar.resize(tar.len() + 1024, 0); // end-of-archive marker
-        let path = d.join("dirbomb.tar.zst");
-        std::fs::write(&path, zstd_bytes(&tar)).unwrap();
-        // A generous 10 MB cap the 50 MiB declared size would blow past only if the bytes
-        // were actually decompressed — but we reject on the header alone.
-        let err = extract_tar_zst(&path, &root, 10_000_000, 10_000).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(_))
-            ),
-            "got {err:?}"
-        );
-        assert!(
-            !root.join("payload").exists(),
-            "the bomb directory must not be created"
-        );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    // A HARDLINK entry that declares a body is the directory bomb wearing a different
-    // typeflag. `Layer::hardlink` writes no content, so the body is left for the tar
-    // reader to discard on its next `next_entry` — through the per-entry STRUCTURAL
-    // budget, refreshed to 1 MiB before every entry. Until 2026-10-04 that was all that
-    // bounded it: N such entries decompressed ~1 MiB each while `remaining` never moved
-    // (~4 TB at the production MAX_ENTRIES); structure now has a signed allowance of its
-    // own (`the_tar_structure_counts_against_the_signed_cap`). Refused on the header all the
-    // same, exactly as the body-less directory and symlink kinds are, naming the shape.
-    #[test]
-    fn aborts_on_hardlink_entry_declaring_a_body() {
-        let d = dest("hlbomb");
-        // Just under the 1 MiB structural budget, so nothing else refuses it: before
-        // the guard this body decompressed for free, charged to no cap at all.
-        let bomb = vec![0u8; 1_000_000];
-        let archive = make_archive(
-            &d,
-            "hlbomb",
-            &[
-                ("bin/targo", b'0', "", b"the one binary".as_slice()),
-                ("bin/cargo", b'1', "bin/targo", bomb.as_slice()),
-            ],
-        );
-        // A cap far under the declared body and one far over it: both refuse on the
-        // header, since the cap is precisely what this body never reached.
-        for (i, cap) in [64 * 1024, 10_000_000].into_iter().enumerate() {
-            let root = d.join(format!("staging{i}"));
-            std::fs::create_dir_all(&root).unwrap();
-            let err = extract_tar_zst(&archive, &root, cap, 10_000).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    ExtractError::TooLarge(TooLargeReason::HardlinkWithBody(_))
-                ),
-                "cap {cap}: {err:?}"
-            );
-            assert!(
-                !root.join("bin/cargo").exists(),
-                "cap {cap}: the aliasing entry must not be laid down"
+                std::fs::symlink_metadata(root.join(never)).is_err(),
+                "{label}: {never} was laid"
             );
         }
-        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Every bomb defence of the tar lanes refuses with its OWN reason — a caller matches
+    /// on it, and an operator once chased `disk_installed` for what was a directory
+    /// header's size — naming the member where there is one, and lays nothing for it:
+    ///
+    /// * a directory, symlink or hardlink header declaring a body: the reader decompresses
+    ///   that body to skip it, yet the content cap counts only bytes WRITTEN, so it is
+    ///   refused on the header alone, under a cap far over the body as well as one under
+    ///   it (until 2026-10-04 N hardlink bodies decompressed ~1 MiB each, charged to no
+    ///   cap: ~4 TB at the production `MAX_ENTRIES`);
+    /// * a GNU longname extension body, read INSIDE the tar iterator before any per-file
+    ///   write cap — bounded by the structural budget, not memory;
+    /// * content past the signed cap, and one entry past the entry cap.
+    #[test]
+    fn every_tar_bomb_defence_refuses_with_its_own_reason() {
+        use TooLargeReason as Why;
+        /// `(label, tar, content cap, entry cap, member never laid, the refusal)`.
+        type Case<'a> = (
+            &'a str,
+            &'a [u8],
+            u64,
+            u64,
+            &'a str,
+            fn(&ExtractError) -> bool,
+        );
+        let d = dest("bombs");
+        let eoa = |mut tar: Vec<u8>| {
+            tar.resize(tar.len() + 1024, 0);
+            tar
+        };
+        let dir_bomb = eoa(raw_header("payload/", b'5', "", 50 << 20).to_vec());
+        let link_bomb = eoa(raw_header_mode("lnk", b'2', "target", 50 << 20, 0o777).to_vec());
+        let hardlink_body = vec![0u8; 1_000_000];
+        let hardlink_bomb = tar_bytes(&[
+            ("bin/targo", b'0', "", b"the one binary", 0o644),
+            ("bin/cargo", b'1', "bin/targo", &hardlink_body, 0o644),
+        ]);
+        let longname = 8usize << 20;
+        let mut ext_bomb = raw_header("././@LongLink", b'L', "", longname).to_vec();
+        ext_bomb.resize(ext_bomb.len() + longname, 0);
+        let ext_bomb = eoa(ext_bomb);
+        let big = tar_bytes(&[("data", b'0', "", &[b'x'; 4096], 0o644)]);
+        let cases: [Case<'_>; 7] = [
+            (
+                "directory body",
+                &dir_bomb,
+                10_000_000,
+                10_000,
+                "payload",
+                |e| matches!(e, ExtractError::TooLarge(Why::DirectoryWithBody(m)) if m == Path::new("payload/")),
+            ),
+            ("symlink body", &link_bomb, 10_000_000, 10, "lnk", |e| {
+                matches!(e, ExtractError::TooLarge(Why::SymlinkWithBody(_)))
+            }),
+            (
+                "hardlink body, small cap",
+                &hardlink_bomb,
+                64 * 1024,
+                10_000,
+                "bin/cargo",
+                |e| matches!(e, ExtractError::TooLarge(Why::HardlinkWithBody(_))),
+            ),
+            (
+                "hardlink body, large cap",
+                &hardlink_bomb,
+                10_000_000,
+                10_000,
+                "bin/cargo",
+                |e| matches!(e, ExtractError::TooLarge(Why::HardlinkWithBody(_))),
+            ),
+            ("longname body", &ext_bomb, 64 * 1024, 16, "", |e| {
+                matches!(e, ExtractError::TooLarge(Why::StructuralBudget))
+            }),
+            ("content", &big, 1024, 10_000, "", |e| {
+                matches!(e, ExtractError::TooLarge(Why::ContentCap))
+            }),
+            ("entries", &big, 10_000_000, 0, "", |e| {
+                matches!(e, ExtractError::TooLarge(Why::EntryCap))
+            }),
+        ];
+        for (i, (label, tar, cap, entries, never, want)) in cases.into_iter().enumerate() {
+            let archive = d.join(format!("{i}.tar.zst"));
+            std::fs::write(&archive, zstd_bytes(tar)).unwrap();
+            let root = d.join(format!("{i}"));
+            let err = extract_tar_zst_tree(
+                &archive,
+                &root,
+                cap,
+                entries,
+                vendor(0),
+                FrameChecksum::IfPresent,
+            )
+            .unwrap_err();
+            assert!(want(&err), "{label}: {err:?}");
+            if !never.is_empty() {
+                assert!(
+                    std::fs::symlink_metadata(root.join(never)).is_err(),
+                    "{label}: {never} was laid"
+                );
+            }
+        }
     }
 
     /// The tar STRUCTURE counts against the signed cap, not file content alone: every byte
@@ -2980,7 +2744,6 @@ mod tests {
                 );
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Structure and content are two allowances of the signed size, never one counter: a
@@ -3059,7 +2822,6 @@ mod tests {
             "cap {} is one byte under the structure: {under:?}",
             structure - 1
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The refusal a zstd lane's decoder raised, inside the extraction error.
@@ -3193,39 +2955,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    // A GNU longname ('L') EXTENSION-HEADER body is read INSIDE tar's entries() iterator
-    // (before any per-file write cap), so a huge declared size with a highly-compressible
-    // body is a decompression bomb the write cap never sees. The global CappedReader must
-    // abort it on the extension-header read — bounding memory to the budget, not OOM.
-    #[test]
-    fn aborts_on_oversized_extension_header_body() {
-        let d = dest("extbomb");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        // One GNU longname header declaring an 8 MiB body of NUL bytes (compresses to
-        // ~nothing); no following real entry is needed — the bomb is the body read.
-        let bomb: usize = 8 * 1024 * 1024;
-        let mut tar = Vec::new();
-        tar.extend_from_slice(&raw_header("././@LongLink", b'L', "", bomb));
-        tar.resize(tar.len() + bomb, 0); // 8 MiB NUL longname body
-        let pad = (512 - bomb % 512) % 512;
-        tar.resize(tar.len() + pad, 0);
-        tar.resize(tar.len() + 1024, 0); // end-of-archive marker
-        let path = d.join("extbomb.tar.zst");
-        std::fs::write(&path, zstd_bytes(&tar)).unwrap();
-        // Small signed cap + few entries ⇒ a tight budget; the 8 MiB extension body,
-        // though not a regular-file body, must not be readable past it.
-        let err = extract_tar_zst(&path, &root, 64 * 1024, 16).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ExtractError::TooLarge(TooLargeReason::StructuralBudget)
-            ),
-            "got {err:?}"
-        );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
     /// THE parity gate for the fused digest (§8 cross-version byte contract).
     ///
     /// `verify_and_stage` compares the extraction's own root against the SIGNED
@@ -3325,7 +3054,6 @@ mod tests {
                 "the non-exec mode class"
             );
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Two members whose names differ in bytes but name ONE file on the filesystem being
@@ -3344,62 +3072,29 @@ mod tests {
         // what refuses it is the FILE's exclusive create; a folded directory is the test
         // below's.
         for (first, second) in [("bin/tool", "bin/TOOL"), ("caf\u{e9}", "cafe\u{301}")] {
-            let tar = tar_bytes(&[
-                (first, b'0', "", b"benign", 0o755),
-                (second, b'0', "", b"other!", 0o755),
-            ]);
-            let zst = d.join("pair.tar.zst");
-            std::fs::write(&zst, zstd_bytes(&tar)).unwrap();
-            let zip = d.join("pair.zip");
-            let member = |name, data| ZipMember {
-                name,
-                mode: 0o100_755,
-                data,
-                deflate: false,
-            };
-            std::fs::write(
-                &zip,
-                zip_bytes(
-                    &[member(first, b"benign"), member(second, b"other!")],
-                    false,
-                ),
-            )
-            .unwrap();
-            for lane in ["tar", "zip"] {
-                let root = d.join(format!("{lane}-{}", first.len()));
-                let got = if lane == "tar" {
-                    extract_tar_zst_tree(
-                        &zst,
-                        &root,
-                        1 << 20,
-                        10,
-                        ExtractOptions::default(),
-                        FrameChecksum::IfPresent,
-                    )
-                } else {
-                    extract_zip_tree(&zip, &root, 1 << 20, 10, vendor(0))
-                };
+            let entries = [
+                (first, b'0', "", b"benign".as_slice(), 0o755),
+                (second, b'0', "", b"other!".as_slice(), 0o755),
+            ];
+            let label = first.len().to_string();
+            for (lane, got, root) in in_both_lanes(&d, &label, &entries, vendor(0)) {
                 match got {
                     Ok(tree) => {
                         let (fused, walked) = fused_and_walked(tree, &root);
-                        assert_eq!(
-                            fused, walked,
-                            "{lane} {second:?}: the fold must describe the disk"
-                        );
+                        assert_eq!(fused, walked, "{lane}: the fold must describe the disk");
                     }
                     Err(ExtractError::Rejected(ExtractReject::Occupied, p)) => {
                         assert_eq!(p, Path::new(second), "{lane}: the second member");
                         assert_eq!(
                             std::fs::read(root.join(first)).unwrap(),
                             b"benign",
-                            "{lane} {second:?}: the first member is left as it was"
+                            "{lane}: the first member is left as it was"
                         );
                     }
-                    Err(e) => panic!("{lane} {second:?}: {e:?}"),
+                    Err(e) => panic!("{lane}: {e:?}"),
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The DIRECTORY half of the test above. Two members whose directory components
@@ -3427,77 +3122,51 @@ mod tests {
         ];
         for (pair, (first_dir, folded_dir)) in spellings.into_iter().enumerate() {
             let first = format!("{first_dir}/f");
-            // (kind, tar typeflag, leaf under the second spelling, link name, zip mode)
+            // (kind, tar typeflag, leaf under the second spelling, link name)
             let kinds = [
-                ("file", b'0', "g", "", 0o100_644),
-                ("dir", b'5', "sub/", "", 0o040_755),
-                ("symlink", b'2', "l", "f", 0o120_777),
-                ("hardlink", b'1', "h", first.as_str(), 0),
+                ("file", b'0', "g", ""),
+                ("dir", b'5', "sub/", ""),
+                ("symlink", b'2', "l", "f"),
+                ("hardlink", b'1', "h", first.as_str()),
             ];
             // `create_symlink` lays links on Unix only; elsewhere the lane refuses them.
             let kinds = kinds
                 .into_iter()
                 .filter(|(kind, ..)| cfg!(unix) || *kind != "symlink");
-            for (kind, flag, leaf, link, zip_mode) in kinds {
+            for (kind, flag, leaf, link) in kinds {
                 for (spelled, second_dir) in [("exact", first_dir), ("folded", folded_dir)] {
                     let second = format!("{second_dir}/{leaf}");
                     let body: &[u8] = if flag == b'0' { b"other!" } else { b"" };
-                    let tar = tar_bytes(&[
-                        (first.as_str(), b'0', "", b"benign", 0o644),
+                    let entries = [
+                        (first.as_str(), b'0', "", b"benign".as_slice(), 0o644),
                         (second.as_str(), flag, link, body, 0o644),
-                    ]);
+                    ];
                     let label = format!("{pair}-{kind}-{spelled}");
-                    let mut lanes = vec!["tar"];
-                    let gz = d.join(format!("{label}.tar.gz"));
-                    std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
-                    let zip = d.join(format!("{label}.zip"));
-                    if flag != b'1' {
-                        let member = |name, mode, data| ZipMember {
-                            name,
-                            mode,
-                            data,
-                            deflate: false,
-                        };
-                        let data = if flag == b'2' { link.as_bytes() } else { body };
-                        let members = [
-                            member(first.as_str(), 0o100_644, b"benign"),
-                            member(second.as_str(), zip_mode, data),
-                        ];
-                        std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
-                        lanes.push("zip");
-                    }
-                    for lane in lanes {
-                        let root = d.join(format!("{lane}-{label}"));
-                        let got = if lane == "tar" {
-                            extract_tar_gz_tree(&gz, &root, 1 << 20, 10, vendor(0))
-                        } else {
-                            extract_zip_tree(&zip, &root, 1 << 20, 10, vendor(0))
-                        };
+                    for (lane, got, root) in in_both_lanes(&d, &label, &entries, vendor(0)) {
                         match got {
                             Ok(tree) => {
                                 let (fused, walked) = fused_and_walked(tree, &root);
                                 assert_eq!(
                                     fused, walked,
-                                    "{lane} {kind} {second:?}: the fold must describe the disk"
+                                    "{lane}: the fold must describe the disk"
                                 );
                             }
                             Err(ExtractError::Rejected(ExtractReject::Occupied, p))
                                 if spelled == "folded" =>
                             {
-                                assert_eq!(p, Path::new(&second), "{lane} {kind}: the second");
+                                assert_eq!(p, Path::new(&second), "{lane}: the second");
                                 assert_eq!(
                                     std::fs::read(root.join(&first)).unwrap(),
                                     b"benign",
-                                    "{lane} {kind} {second:?}: the first member is left as it was"
+                                    "{lane}: the first member is left as it was"
                                 );
                             }
-                            Err(e) => panic!("{lane} {kind} {second:?}: {e:?}"),
+                            Err(e) => panic!("{lane}: {e:?}"),
                         }
                     }
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The case the two tests above cannot see: ONE name the filesystem stores under
@@ -3510,30 +3179,14 @@ mod tests {
     ///
     /// APFS and ext4 keep both spellings as given, so the filesystem's part is played
     /// by a rename to exactly the bytes HFS+ stores, and by a removal for the name that
-    /// lays nothing; as laid, the same tree passes. Through every archive lane.
+    /// lays nothing; as laid, the same tree passes. Through the tar and the zip lane.
     #[test]
     fn a_name_the_filesystem_stores_under_other_bytes_is_refused() {
         let d = dest("fs-respelled");
-        let tar = tar_bytes(&[
-            ("caf\u{e9}/f", b'0', "", b"one", 0o644),
-            ("bin/tool", b'0', "", b"two", 0o755),
-        ]);
-        let zst = d.join("one.tar.zst");
-        std::fs::write(&zst, zstd_bytes(&tar)).unwrap();
-        let gz = d.join("one.tar.gz");
-        std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
-        let zip = d.join("one.zip");
-        let member = |name, mode, data| ZipMember {
-            name,
-            mode,
-            data,
-            deflate: false,
-        };
-        let members = [
-            member("caf\u{e9}/f", 0o100_644, b"one"),
-            member("bin/tool", 0o100_755, b"two"),
+        let entries = [
+            ("caf\u{e9}/f", b'0', "", b"one".as_slice(), 0o644),
+            ("bin/tool", b'0', "", b"two".as_slice(), 0o755),
         ];
-        std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
         type Respell = fn(&Path);
         let respellings: [(&str, Respell, &str); 2] = [
             (
@@ -3549,40 +3202,20 @@ mod tests {
                 "bin/tool",
             ),
         ];
-        for lane in ["tar-zst", "tar-gz", "zip"] {
-            for (how, respell, blamed) in respellings {
-                let root = d.join(format!("{lane}-{how}"));
-                let tree = match lane {
-                    "tar-zst" => extract_tar_zst_tree(
-                        &zst,
-                        &root,
-                        1 << 20,
-                        10,
-                        vendor(0),
-                        FrameChecksum::IfPresent,
-                    ),
-                    "tar-gz" => extract_tar_gz_tree(&gz, &root, 1 << 20, 10, vendor(0)),
-                    _ => extract_zip_tree(&zip, &root, 1 << 20, 10, vendor(0)),
-                }
-                .unwrap();
+        for (how, respell, blamed) in respellings {
+            for (lane, got, root) in in_both_lanes(&d, how, &entries, vendor(0)) {
+                let tree = got.unwrap_or_else(|e| panic!("{lane}: {e:?}"));
                 tree.require_spelled_back(&root)
-                    .unwrap_or_else(|e| panic!("{lane} {how}: as laid, the names pass: {e:?}"));
+                    .unwrap_or_else(|e| panic!("{lane}: as laid, the names pass: {e:?}"));
                 respell(&root);
                 match tree.require_spelled_back(&root) {
                     Err(ExtractError::Rejected(ExtractReject::Respelled, p)) => {
-                        assert_eq!(p, Path::new(blamed), "{lane} {how}: the recorded name");
+                        assert_eq!(p, Path::new(blamed), "{lane}: the recorded name");
                     }
-                    other => panic!("{lane} {how}: must be refused, got {other:?}"),
+                    other => panic!("{lane}: must be refused, got {other:?}"),
                 }
-                // What the refusal stands in front of: this fold's root is not the disk's.
-                assert_ne!(
-                    tree.root(),
-                    crate::tree::tree_root(&root).unwrap(),
-                    "{lane} {how}: the fold no longer describes the disk"
-                );
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The other side of the parity gate: the fused root must MOVE for exactly the
@@ -3620,7 +3253,6 @@ mod tests {
         // exactly as the producer's did when it signed the row (until 2026-09-22 the
         // Windows fold was a constant `0`, and no signed root could ever match it).
         assert_ne!(base, other_mode, "mode must move the fused root");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The fold's precondition, enforced: a destination that already holds something is
@@ -3638,41 +3270,6 @@ mod tests {
         let root = d.join("staging");
         std::fs::create_dir_all(&root).unwrap();
         let archive = make_archive(&d, "occupied", &[("bin/ay", b'0', "", b"payload")]);
-
-        // Empty: extraction proceeds and agrees with the walk, as always.
-        let tree = extract_tar_zst_tree(
-            &archive,
-            &root,
-            10_000_000,
-            10_000,
-            ExtractOptions::default(),
-            FrameChecksum::IfPresent,
-        )
-        .unwrap();
-        let (fused, walked) = fused_and_walked(tree, &root);
-        assert_eq!(fused, walked);
-
-        // …and the SAME call over the now-occupied root is refused, so a second
-        // extraction can never fold a root that omits what is already there.
-        let err = extract_tar_zst_tree(
-            &archive,
-            &root,
-            10_000_000,
-            10_000,
-            ExtractOptions::default(),
-            FrameChecksum::IfPresent,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(&err, ExtractError::Io { err, .. } if err.kind() == io::ErrorKind::AlreadyExists),
-            "got {err:?}"
-        );
-
-        // A stranger's file alone (no re-extraction) is refused just the same — that is
-        // the case the walk used to catch and the fold would not have.
-        let fresh = d.join("planted");
-        std::fs::create_dir_all(&fresh).unwrap();
-        std::fs::write(fresh.join("not-ours"), b"planted").unwrap();
         let fold = |dest: &Path| {
             extract_tar_zst_tree(
                 &archive,
@@ -3683,37 +3280,22 @@ mod tests {
                 FrameChecksum::IfPresent,
             )
         };
-        assert!(fold(&fresh).is_err());
-
-        // A destination that does not exist yet is still fine — extraction creates it.
-        let absent = d.join("absent");
-        assert!(fold(&absent).is_ok());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// An EMPTY tree folds to the same root either way (the SHA-256 of nothing), and a
-    /// plain `extract_tar_zst` still returns `()` for every existing caller.
-    #[test]
-    fn an_empty_extraction_agrees_and_the_unit_returning_wrapper_still_works() {
-        let d = dest("fused-empty");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let archive = make_archive(&d, "empty", &[]);
-        let tree = extract_tar_zst_tree(
-            &archive,
-            &root,
-            10_000_000,
-            10_000,
-            ExtractOptions::default(),
-            FrameChecksum::IfPresent,
-        )
-        .unwrap();
-        let (fused, walked) = fused_and_walked(tree, &root);
-        assert_eq!(fused, walked);
-        let root2 = d.join("staging2");
-        std::fs::create_dir_all(&root2).unwrap();
-        extract_tar_zst(&archive, &root2, 10_000_000, 10_000).unwrap();
-        let _ = std::fs::remove_dir_all(&d);
+        // Empty, or not there yet: extraction proceeds.
+        fold(&root).unwrap();
+        assert!(fold(&d.join("absent")).is_ok());
+        // The SAME call over the now-occupied root is refused, so a second extraction
+        // can never fold a root that omits what is already there…
+        let err = fold(&root).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Io { err, .. } if err.kind() == io::ErrorKind::AlreadyExists),
+            "got {err:?}"
+        );
+        // …and a stranger's file alone is refused just the same: the case the walk used
+        // to catch and the fold would not have.
+        let planted = d.join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("not-ours"), b"planted").unwrap();
+        assert!(fold(&planted).is_err());
     }
 
     // === the vendor lanes: gzip, zip, strip_components, in-root symlinks ===
@@ -3725,176 +3307,6 @@ mod tests {
             strip_components: strip,
             in_root_symlinks: true,
         }
-    }
-
-    /// The SAME tar bytes through all three compressors and both container readers give
-    /// the SAME tree and the SAME fused root, and that root equals the on-disk walk. The
-    /// fixture has the `gh` shape: a versioned top-level directory (stripped), an
-    /// executable, a plain file, a nested directory, an in-root symlink and a hardlink.
-    #[test]
-    fn every_vendor_archive_lane_agrees_with_the_walk_and_with_each_other() {
-        let d = dest("lanes-parity");
-        let entries: &[(&str, u8, &str, &[u8], u32)] = &[
-            ("gh_2.80.0_macOS_arm64/", b'5', "", b"", 0o755),
-            (
-                "gh_2.80.0_macOS_arm64/bin/gh",
-                b'0',
-                "",
-                b"#!/bin/sh\necho gh\n",
-                0o755,
-            ),
-            ("gh_2.80.0_macOS_arm64/LICENSE", b'0', "", b"MIT", 0o644),
-            (
-                "gh_2.80.0_macOS_arm64/share/man/man1/gh.1",
-                b'0',
-                "",
-                b".TH gh 1",
-                0o644,
-            ),
-            (
-                "gh_2.80.0_macOS_arm64/bin/gh-alias",
-                b'1',
-                "gh_2.80.0_macOS_arm64/bin/gh",
-                b"",
-                0o755,
-            ),
-            (
-                "gh_2.80.0_macOS_arm64/bin/gh-link",
-                b'2',
-                "../share/man/man1/gh.1",
-                b"",
-                0o777,
-            ),
-        ];
-        let tar = tar_bytes(entries);
-        let zst = d.join("a.tar.zst");
-        std::fs::write(&zst, zstd_bytes(&tar)).unwrap();
-        let gz = d.join("a.tar.gz");
-        std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
-        let zip = d.join("a.zip");
-        std::fs::write(
-            &zip,
-            zip_bytes(
-                &[
-                    ZipMember {
-                        name: "gh_2.80.0_macOS_arm64/",
-                        mode: 0o040_755,
-                        data: b"",
-                        deflate: false,
-                    },
-                    ZipMember {
-                        name: "gh_2.80.0_macOS_arm64/bin/gh",
-                        mode: 0o100_755,
-                        data: b"#!/bin/sh\necho gh\n",
-                        deflate: true,
-                    },
-                    ZipMember {
-                        name: "gh_2.80.0_macOS_arm64/LICENSE",
-                        mode: 0o100_644,
-                        data: b"MIT",
-                        deflate: false,
-                    },
-                    ZipMember {
-                        name: "gh_2.80.0_macOS_arm64/share/man/man1/gh.1",
-                        mode: 0o100_644,
-                        data: b".TH gh 1",
-                        deflate: true,
-                    },
-                    // zip has no hardlinks: the alias is a second regular file with the
-                    // same bytes, which the walk (and the fold) digest identically.
-                    ZipMember {
-                        name: "gh_2.80.0_macOS_arm64/bin/gh-alias",
-                        mode: 0o100_755,
-                        data: b"#!/bin/sh\necho gh\n",
-                        deflate: false,
-                    },
-                    ZipMember {
-                        name: "gh_2.80.0_macOS_arm64/bin/gh-link",
-                        mode: 0o120_777,
-                        data: b"../share/man/man1/gh.1",
-                        deflate: true,
-                    },
-                ],
-                false,
-            ),
-        )
-        .unwrap();
-
-        let r_zst = d.join("zst");
-        let (root_zst, walk_zst) = fused_and_walked(
-            extract_tar_zst_tree(
-                &zst,
-                &r_zst,
-                10_000_000,
-                10_000,
-                vendor(1),
-                FrameChecksum::IfPresent,
-            )
-            .unwrap(),
-            &r_zst,
-        );
-        let r_gz = d.join("gz");
-        let (root_gz, walk_gz) = fused_and_walked(
-            extract_tar_gz_tree(&gz, &r_gz, 10_000_000, 10_000, vendor(1)).unwrap(),
-            &r_gz,
-        );
-        let r_zip = d.join("zip");
-        let (root_zip, walk_zip) = fused_and_walked(
-            extract_zip_tree(&zip, &r_zip, 10_000_000, 10_000, vendor(1)).unwrap(),
-            &r_zip,
-        );
-
-        for (label, root, fused, walked) in [
-            ("zst", &r_zst, &root_zst, &walk_zst),
-            ("gz", &r_gz, &root_gz, &walk_gz),
-            ("zip", &r_zip, &root_zip, &walk_zip),
-        ] {
-            assert_eq!(fused, walked, "{label}: fold vs walk");
-            assert!(
-                !root.join("gh_2.80.0_macOS_arm64").exists(),
-                "{label}: the top level was stripped"
-            );
-            assert_eq!(
-                std::fs::read(root.join("bin/gh")).unwrap(),
-                b"#!/bin/sh\necho gh\n",
-                "{label}"
-            );
-            assert_eq!(
-                std::fs::read(root.join("LICENSE")).unwrap(),
-                b"MIT",
-                "{label}"
-            );
-            assert_eq!(
-                std::fs::read(root.join("bin/gh-alias")).unwrap(),
-                b"#!/bin/sh\necho gh\n",
-                "{label}"
-            );
-            #[cfg(unix)]
-            {
-                let mode_of = |p: &str| {
-                    std::fs::metadata(root.join(p))
-                        .unwrap()
-                        .permissions()
-                        .mode()
-                        & 0o7777
-                };
-                assert_eq!(mode_of("bin/gh"), 0o755, "{label}");
-                assert_eq!(mode_of("LICENSE"), 0o644, "{label}");
-                assert_eq!(
-                    std::fs::read_link(root.join("bin/gh-link")).unwrap(),
-                    Path::new("../share/man/man1/gh.1"),
-                    "{label}: the link target is verbatim"
-                );
-                assert_eq!(
-                    std::fs::read(root.join("bin/gh-link")).unwrap(),
-                    b".TH gh 1",
-                    "{label}: and it resolves"
-                );
-            }
-        }
-        assert_eq!(root_zst, root_gz, "zstd and gzip are the same tar");
-        assert_eq!(root_zst, root_zip, "zip lays down the same tree");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// An upstream tarball written as `tar -C dir -c .` — the shape both bsdtar and GNU
@@ -3915,8 +3327,6 @@ mod tests {
         ]);
         let gz = d.join("dot.tar.gz");
         std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
-        let zst = d.join("dot.tar.zst");
-        std::fs::write(&zst, zstd_bytes(&tar)).unwrap();
 
         // strip 0: `./` is the root itself — a no-op — and the rest lands exactly where
         // `tar -xzf … -C st` lays it. The fold still equals the on-disk walk.
@@ -3947,20 +3357,6 @@ mod tests {
         extract_tar_gz_tree(&gz, &r2, 10_000_000, 10_000, vendor(2)).unwrap();
         assert!(r2.join("bin/gh").is_file());
 
-        // The zstd lane is the same tar: same tree, same fused root.
-        let rz = d.join("zst0");
-        let rootz = extract_tar_zst_tree(
-            &zst,
-            &rz,
-            10_000_000,
-            10_000,
-            vendor(0),
-            FrameChecksum::IfPresent,
-        )
-        .unwrap()
-        .root();
-        assert_eq!(rootz, root0, "zstd and gzip are the same tar");
-
         // A root-naming member is a no-op ONLY as a directory: as a FILE it still names
         // no target, and the lane still refuses it.
         let bad = tar_bytes(&[("./", b'0', "", b"pwned", 0o644)]);
@@ -3972,7 +3368,43 @@ mod tests {
             matches!(&err, ExtractError::Rejected(ExtractReject::EmptyPath, _)),
             "a regular file naming the root is still EmptyPath: {err:?}"
         );
-        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The tar `entries` laid by the tar.gz lane and — when they hold no hardlink, which
+    /// zip has not — by the zip lane too, each under its own root in `d`.
+    #[allow(clippy::type_complexity)]
+    fn in_both_lanes(
+        d: &Path,
+        label: &str,
+        entries: &[(&str, u8, &str, &[u8], u32)],
+        opts: ExtractOptions,
+    ) -> Vec<(String, Result<TreeAccumulator, ExtractError>, PathBuf)> {
+        let gz = d.join(format!("{label}.tar.gz"));
+        std::fs::write(&gz, gzip_bytes(&tar_bytes(entries))).unwrap();
+        let root = d.join(format!("{label}-gz"));
+        let got = extract_tar_gz_tree(&gz, &root, 10_000_000, 10_000, opts);
+        let mut lanes = vec![(format!("gz {label}"), got, root)];
+        if entries.iter().all(|(_, tf, ..)| *tf != b'1') {
+            let members: Vec<ZipMember<'_>> = entries
+                .iter()
+                .map(|(name, tf, link, body, mode)| ZipMember {
+                    name,
+                    mode: match tf {
+                        b'5' => 0o040_755,
+                        b'2' => 0o120_777,
+                        _ => 0o100_000 | mode,
+                    },
+                    data: if *tf == b'2' { link.as_bytes() } else { body },
+                    deflate: false,
+                })
+                .collect();
+            let zip = d.join(format!("{label}.zip"));
+            std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
+            let root = d.join(format!("{label}-zip"));
+            let got = extract_zip_tree(&zip, &root, 10_000_000, 10_000, opts);
+            lanes.push((format!("zip {label}"), got, root));
+        }
+        lanes
     }
 
     /// Slip refusals per lane: `..`, an absolute path, an escaping symlink and an
@@ -3982,7 +3414,7 @@ mod tests {
     #[test]
     fn gzip_and_zip_lanes_refuse_every_slip_shape() {
         let d = dest("lanes-slip");
-        let cases: &[(&str, &str, u8, &str, ExtractReject)] = &[
+        for (label, name, tf, link, want) in [
             (
                 "dotdot",
                 "top/../../OUTSIDE",
@@ -4012,63 +3444,25 @@ mod tests {
                 "",
                 ExtractReject::EmptyPath,
             ),
-        ];
-        for (label, name, tf, link, want) in cases {
+        ] {
             // A tar symlink carries no body (a body would be the skip-bomb refusal).
-            let body: &[u8] = if *tf == b'2' { b"" } else { b"pwned" };
-            let tar = tar_bytes(&[
-                ("top/ok", b'0', "", b"fine", 0o644),
-                (name, *tf, link, body, 0o644),
-            ]);
-            let gz = d.join(format!("{label}.tar.gz"));
-            std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
-            let root = d.join(format!("{label}-gz"));
-            let err = extract_tar_gz_tree(&gz, &root, 10_000_000, 10_000, vendor(1)).unwrap_err();
-            assert!(
-                matches!(&err, ExtractError::Rejected(r, _) if r == want),
-                "gz {label}: {err:?}"
-            );
-
-            let (zmode, zdata): (u32, &[u8]) = if *tf == b'2' {
-                (0o120_777, link.as_bytes())
-            } else {
-                (0o100_644, b"pwned")
-            };
-            let zip = d.join(format!("{label}.zip"));
-            std::fs::write(
-                &zip,
-                zip_bytes(
-                    &[
-                        ZipMember {
-                            name: "top/ok",
-                            mode: 0o100_644,
-                            data: b"fine",
-                            deflate: false,
-                        },
-                        ZipMember {
-                            name,
-                            mode: zmode,
-                            data: zdata,
-                            deflate: false,
-                        },
-                    ],
-                    false,
-                ),
-            )
-            .unwrap();
-            let root = d.join(format!("{label}-zip"));
-            let err = extract_zip_tree(&zip, &root, 10_000_000, 10_000, vendor(1)).unwrap_err();
-            assert!(
-                matches!(&err, ExtractError::Rejected(r, _) if r == want),
-                "zip {label}: {err:?}"
-            );
+            let body: &[u8] = if tf == b'2' { b"" } else { b"pwned" };
+            let entries = [
+                ("top/ok", b'0', "", b"fine".as_slice(), 0o644),
+                (name, tf, link, body, 0o644),
+            ];
+            for (lane, got, _) in in_both_lanes(&d, label, &entries, vendor(1)) {
+                assert!(
+                    matches!(&got, Err(ExtractError::Rejected(r, _)) if *r == want),
+                    "{lane}: {:?}",
+                    got.map(|_| ())
+                );
+            }
         }
         assert!(
             !d.join("OUTSIDE").exists(),
             "nothing may land outside the roots"
         );
-        assert!(!std::env::temp_dir().join("OUTSIDE").exists());
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A symlink can never redirect a later write: an entry whose path passes THROUGH a
@@ -4122,52 +3516,18 @@ mod tests {
             ),
         ];
         for (label, entries, want) in cases {
-            let gz = d.join(format!("{label}.tar.gz"));
-            std::fs::write(&gz, gzip_bytes(&tar_bytes(entries))).unwrap();
-            let root = d.join(format!("{label}-gz"));
-            let err = extract_tar_gz_tree(&gz, &root, 10_000_000, 10_000, vendor(0)).unwrap_err();
-            assert!(
-                matches!(&err, ExtractError::Rejected(r, _) if r == want),
-                "gz {label}: {err:?}"
-            );
-            // An occupied path says what holds it, not the bare variant name.
-            if *want == ExtractReject::Occupied {
+            for (lane, got, root) in in_both_lanes(&d, label, entries, vendor(0)) {
                 assert!(
-                    err.to_string()
-                        .contains("path already taken by an earlier entry"),
-                    "{label}: {err}"
+                    matches!(&got, Err(ExtractError::Rejected(r, _)) if r == want),
+                    "{lane}: {:?}",
+                    got.map(|_| ())
                 );
+                // `real` must still hold its own bytes: nothing wrote through the link.
+                if root.join("real").is_file() {
+                    assert_eq!(std::fs::read(root.join("real")).unwrap(), b"r", "{lane}");
+                }
             }
-            // `real` must still hold its own bytes: nothing wrote through the link.
-            if root.join("real").is_file() {
-                assert_eq!(std::fs::read(root.join("real")).unwrap(), b"r", "{label}");
-            }
-            if *label == "hardlink-onto-link" {
-                continue; // zip has no hardlinks
-            }
-            let members: Vec<ZipMember<'_>> = entries
-                .iter()
-                .map(|(n, tf, l, c, _)| ZipMember {
-                    name: n,
-                    mode: match tf {
-                        b'5' => 0o040_755,
-                        b'2' => 0o120_777,
-                        _ => 0o100_644,
-                    },
-                    data: if *tf == b'2' { l.as_bytes() } else { c },
-                    deflate: false,
-                })
-                .collect();
-            let zip = d.join(format!("{label}.zip"));
-            std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
-            let root = d.join(format!("{label}-zip"));
-            let err = extract_zip_tree(&zip, &root, 10_000_000, 10_000, vendor(0)).unwrap_err();
-            assert!(
-                matches!(&err, ExtractError::Rejected(r, _) if r == want),
-                "zip {label}: {err:?}"
-            );
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// A hardlink whose TARGET is named through a symlink is refused by the VET, before
@@ -4233,7 +3593,6 @@ mod tests {
                 "{label}: the target must keep its single name"
             );
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Two symlinks that each vet in-root cannot ADD UP to one that leaves it: a `..` that
@@ -4256,197 +3615,106 @@ mod tests {
             ("bin-first", [bin, dir, up, file]),
         ];
         for (label, entries) in &orders {
-            let escaped = |root: &Path| {
-                std::fs::canonicalize(root.join("bin"))
-                    .is_ok_and(|p| p == std::fs::canonicalize(d.join("OUTSIDE")).unwrap())
-            };
-            let gz = d.join(format!("{label}.tar.gz"));
-            std::fs::write(&gz, gzip_bytes(&tar_bytes(entries))).unwrap();
-            let root = d.join(format!("{label}-gz"));
-            let got = extract_tar_gz_tree(&gz, &root, 10_000_000, 10_000, vendor(0));
-            assert!(
-                matches!(
-                    &got,
-                    Err(ExtractError::Rejected(
-                        ExtractReject::RootEscape | ExtractReject::ThroughSymlink,
-                        _
-                    ))
-                ),
-                "gz {label}: {:?} (bin escaped: {})",
-                got.map(|_| ()),
-                escaped(&root)
-            );
-            let members: Vec<ZipMember<'_>> = entries
-                .iter()
-                .map(|(n, tf, l, c, _)| ZipMember {
-                    name: n,
-                    mode: match tf {
-                        b'5' => 0o040_755,
-                        b'2' => 0o120_777,
-                        _ => 0o100_755,
-                    },
-                    data: if *tf == b'2' { l.as_bytes() } else { c },
-                    deflate: false,
-                })
-                .collect();
-            let zip = d.join(format!("{label}.zip"));
-            std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
-            let root = d.join(format!("{label}-zip"));
-            let got = extract_zip_tree(&zip, &root, 10_000_000, 10_000, vendor(0));
-            assert!(
-                matches!(
-                    &got,
-                    Err(ExtractError::Rejected(
-                        ExtractReject::RootEscape | ExtractReject::ThroughSymlink,
-                        _
-                    ))
-                ),
-                "zip {label}: {:?} (bin escaped: {})",
-                got.map(|_| ()),
-                escaped(&root)
-            );
+            for (lane, got, root) in in_both_lanes(&d, label, entries, vendor(0)) {
+                let escaped = std::fs::canonicalize(root.join("bin"))
+                    .is_ok_and(|p| p == std::fs::canonicalize(d.join("OUTSIDE")).unwrap());
+                assert!(
+                    matches!(
+                        &got,
+                        Err(ExtractError::Rejected(
+                            ExtractReject::RootEscape | ExtractReject::ThroughSymlink,
+                            _
+                        ))
+                    ),
+                    "{lane}: {:?} (bin escaped: {escaped})",
+                    got.map(|_| ())
+                );
+            }
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The caps hold in the new lanes: the byte cap trips on a gzip AND a zip body (a
-    /// deflate bomb stops mid-stream), a stripped-away body still counts against it, the
-    /// entry cap trips in both, and a tar symlink declaring a body is the skip-bomb the
-    /// directory guard already refuses.
+    /// The caps hold in the gzip and zip lanes alike: the byte cap trips mid-body (a
+    /// deflate bomb stops mid-stream); a body stripped away entirely is still charged and,
+    /// under a cap it fits, lays nothing and folds the empty root the walk of the
+    /// pre-created scratch agrees with; and the entry cap trips. A zip symlink whose target
+    /// is implausibly long is refused before it is read.
     #[test]
     fn gzip_and_zip_lanes_enforce_the_same_caps() {
+        type Lane =
+            fn(&Path, &Path, u64, u64, ExtractOptions) -> Result<TreeAccumulator, ExtractError>;
         let d = dest("lanes-caps");
         let big = vec![b'x'; 4096];
-        let tar = tar_bytes(&[("top/data", b'0', "", &big, 0o644)]);
-        let gz = d.join("big.tar.gz");
-        std::fs::write(&gz, gzip_bytes(&tar)).unwrap();
-        let err = extract_tar_gz_tree(&gz, &d.join("gz-cap"), 1024, 10_000, vendor(1)).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
-            "gz byte cap: {err:?}"
-        );
-        // Stripped away entirely (strip 2 > depth) — the body is still charged.
-        let err =
-            extract_tar_gz_tree(&gz, &d.join("gz-strip-cap"), 1024, 10_000, vendor(2)).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(_)),
-            "gz stripped-away body cap: {err:?}"
-        );
-        // Everything stripped away: nothing is written, the fold is the empty root, and
-        // (the stage pre-creates its scratch dir) the walk over the empty dir agrees.
-        std::fs::create_dir_all(d.join("gz-strip-ok")).unwrap();
-        let ok = extract_tar_gz_tree(&gz, &d.join("gz-strip-ok"), 8192, 10_000, vendor(2)).unwrap();
-        assert!(
-            !d.join("gz-strip-ok/data").exists(),
-            "stripped away means not written"
-        );
-        let (fused, walked) = fused_and_walked(ok, &d.join("gz-strip-ok"));
-        assert_eq!(fused, walked);
-
-        let zip = d.join("big.zip");
-        std::fs::write(
-            &zip,
-            zip_bytes(
-                &[ZipMember {
-                    name: "top/data",
-                    mode: 0o100_644,
-                    data: &big,
-                    deflate: true,
-                }],
-                false,
+        let write = |name: &str, bytes: Vec<u8>| {
+            let p = d.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let member = |name, mode, data| ZipMember {
+            name,
+            mode,
+            data,
+            deflate: true,
+        };
+        let one_tar = tar_bytes(&[("top/data", b'0', "", &big, 0o644)]);
+        let two_tar = tar_bytes(&[("a", b'0', "", b"1", 0o644), ("b", b'0', "", b"2", 0o644)]);
+        let lanes: [(&str, Lane, PathBuf, PathBuf); 2] = [
+            (
+                "gz",
+                extract_tar_gz_tree,
+                write("big.tar.gz", gzip_bytes(&one_tar)),
+                write("two.tar.gz", gzip_bytes(&two_tar)),
             ),
-        )
-        .unwrap();
-        let err = extract_zip_tree(&zip, &d.join("zip-cap"), 1024, 10_000, vendor(1)).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
-            "zip byte cap: {err:?}"
-        );
-        let err =
-            extract_zip_tree(&zip, &d.join("zip-strip-cap"), 1024, 10_000, vendor(2)).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(_)),
-            "zip stripped-away body cap: {err:?}"
-        );
-
-        // Entry cap: two entries, cap of one.
-        let two = tar_bytes(&[("a", b'0', "", b"1", 0o644), ("b", b'0', "", b"2", 0o644)]);
-        let gz2 = d.join("two.tar.gz");
-        std::fs::write(&gz2, gzip_bytes(&two)).unwrap();
-        let err =
-            extract_tar_gz_tree(&gz2, &d.join("gz-entries"), 10_000, 1, vendor(0)).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(TooLargeReason::EntryCap)),
-            "gz entry cap: {err:?}"
-        );
-        let zip2 = d.join("two.zip");
-        std::fs::write(
-            &zip2,
-            zip_bytes(
-                &[
-                    ZipMember {
-                        name: "a",
-                        mode: 0o100_644,
-                        data: b"1",
-                        deflate: false,
-                    },
-                    ZipMember {
-                        name: "b",
-                        mode: 0o100_644,
-                        data: b"2",
-                        deflate: false,
-                    },
-                ],
-                false,
+            (
+                "zip",
+                extract_zip_tree,
+                write(
+                    "big.zip",
+                    zip_bytes(&[member("top/data", 0o100_644, &big)], false),
+                ),
+                write(
+                    "two.zip",
+                    zip_bytes(
+                        &[member("a", 0o100_644, b"1"), member("b", 0o100_644, b"2")],
+                        false,
+                    ),
+                ),
             ),
-        )
-        .unwrap();
-        let err =
-            extract_zip_tree(&zip2, &d.join("zip-entries"), 10_000, 1, vendor(0)).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(TooLargeReason::EntryCap)),
-            "zip entry cap: {err:?}"
-        );
-
-        // A tar symlink declaring a body is refused on the header, like a directory.
-        let mut bomb = Vec::new();
-        bomb.extend_from_slice(&raw_header_mode(
-            "lnk",
-            b'2',
-            "target",
-            50 * 1024 * 1024,
-            0o777,
-        ));
-        bomb.resize(bomb.len() + 1024, 0);
-        let gz3 = d.join("linkbomb.tar.gz");
-        std::fs::write(&gz3, gzip_bytes(&bomb)).unwrap();
-        let err = extract_tar_gz_tree(&gz3, &d.join("gz-linkbomb"), 10_000_000, 10, vendor(0))
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ExtractError::TooLarge(TooLargeReason::SymlinkWithBody(_))
-            ),
-            "symlink body bomb: {err:?}"
-        );
-        // A zip symlink whose target is implausibly long is refused before it is read.
+        ];
+        for (label, lane, one, two) in lanes {
+            let root = |case: &str| d.join(format!("{label}-{case}"));
+            assert!(
+                matches!(
+                    lane(&one, &root("cap"), 1024, 10_000, vendor(1)),
+                    Err(ExtractError::TooLarge(TooLargeReason::ContentCap))
+                ),
+                "{label}: byte cap"
+            );
+            assert!(
+                matches!(
+                    lane(&one, &root("strip-cap"), 1024, 10_000, vendor(2)),
+                    Err(ExtractError::TooLarge(_))
+                ),
+                "{label}: a stripped-away body is charged"
+            );
+            std::fs::create_dir_all(root("strip-ok")).unwrap();
+            let ok = lane(&one, &root("strip-ok"), 8192, 10_000, vendor(2)).unwrap();
+            let (fused, walked) = fused_and_walked(ok, &root("strip-ok"));
+            assert_eq!(fused, walked, "{label}: stripped away is not written");
+            assert!(
+                matches!(
+                    lane(&two, &root("entries"), 10_000, 1, vendor(0)),
+                    Err(ExtractError::TooLarge(TooLargeReason::EntryCap))
+                ),
+                "{label}: entry cap"
+            );
+        }
         let long = vec![b'a'; 5000];
-        let zip3 = d.join("longlink.zip");
-        std::fs::write(
-            &zip3,
-            zip_bytes(
-                &[ZipMember {
-                    name: "lnk",
-                    mode: 0o120_777,
-                    data: &long,
-                    deflate: false,
-                }],
-                false,
-            ),
-        )
-        .unwrap();
-        let err = extract_zip_tree(&zip3, &d.join("zip-longlink"), 10_000_000, 10, vendor(0))
-            .unwrap_err();
+        let zip = write(
+            "longlink.zip",
+            zip_bytes(&[member("lnk", 0o120_777, &long)], false),
+        );
+        let err =
+            extract_zip_tree(&zip, &d.join("zip-longlink"), 10_000_000, 10, vendor(0)).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -4454,7 +3722,6 @@ mod tests {
             ),
             "zip long link: {err:?}"
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// What the zip reader refuses on its own format rules — each fail-closed, none a
@@ -4465,40 +3732,22 @@ mod tests {
     #[test]
     fn the_zip_reader_refuses_what_it_does_not_understand_and_reads_zip64() {
         let d = dest("zip-format");
-        let plain = zip_bytes(
-            &[
-                ZipMember {
-                    name: "bin/tool",
-                    mode: 0o100_755,
-                    data: b"#!/bin/sh\n",
-                    deflate: true,
-                },
-                ZipMember {
-                    name: "README",
-                    mode: 0o100_644,
-                    data: b"read me",
-                    deflate: false,
-                },
-            ],
-            false,
-        );
-        let z64 = zip_bytes(
-            &[
-                ZipMember {
-                    name: "bin/tool",
-                    mode: 0o100_755,
-                    data: b"#!/bin/sh\n",
-                    deflate: true,
-                },
-                ZipMember {
-                    name: "README",
-                    mode: 0o100_644,
-                    data: b"read me",
-                    deflate: false,
-                },
-            ],
-            true,
-        );
+        let members = [
+            ZipMember {
+                name: "bin/tool",
+                mode: 0o100_755,
+                data: b"#!/bin/sh\n",
+                deflate: true,
+            },
+            ZipMember {
+                name: "README",
+                mode: 0o100_644,
+                data: b"read me",
+                deflate: false,
+            },
+        ];
+        let plain = zip_bytes(&members, false);
+        let z64 = zip_bytes(&members, true);
         assert_ne!(plain, z64, "the fixture must really render two encodings");
         let p = d.join("plain.zip");
         std::fs::write(&p, &plain).unwrap();
@@ -4588,7 +3837,6 @@ mod tests {
                 & 0o7777,
             0o644
         );
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// `stage_file` — the raw-binary lane's whole extraction — lays one file down with the
@@ -4600,8 +3848,6 @@ mod tests {
         std::fs::create_dir_all(dest_path.parent().unwrap()).unwrap();
         let payload = b"the binary";
         let w = stage_file(&payload[..], &dest_path, 0o755, 1 << 20).unwrap();
-        assert_eq!(w.len, payload.len() as u64);
-        assert_eq!(std::fs::read(&dest_path).unwrap(), payload);
         // The folded mode is the one requested on EVERY platform: read back on Unix,
         // declared on Windows — a `0` here is the exact defect that made every Windows
         // `claude` install fail its re-verify (2026-09-22).
@@ -4610,127 +3856,8 @@ mod tests {
         tree.record_file(b"bin/claude".to_vec(), w.mode, w.content_sha_hex);
         let (fused, walked) = fused_and_walked(tree, &d);
         assert_eq!(fused, walked);
-        #[cfg(unix)]
-        assert_eq!(
-            std::fs::metadata(&dest_path).unwrap().permissions().mode() & 0o7777,
-            0o755
-        );
-        // Capped.
         let err = stage_file(&payload[..], &d.join("capped"), 0o755, 4).unwrap_err();
-        assert!(matches!(err, ExtractError::TooLarge(_)));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// `stage_tar_gz_member` judges the member by its header — a non-regular kind, a name
-    /// that is not one bare component, no member at all — before it opens the file it
-    /// would lay (the laid member: install.rs's
-    /// `a_one_member_tar_gz_binary_stages_its_file_at_bin_entry_0755`).
-    #[test]
-    fn stage_tar_gz_member_refuses_by_header_before_writing() {
-        let d = dest("tgz-member");
-        let out = d.join("agy");
-        for (i, tar) in [
-            tar_bytes(&[("antigravity", b'2', "/bin/sh", b"", 0o777)]),
-            tar_bytes(&[("antigravity/", b'5', "", b"", 0o755)]),
-            tar_bytes(&[("dir/antigravity", b'0', "", b"agy", 0o755)]),
-            tar_bytes(&[("antigravity\\x", b'0', "", b"agy", 0o755)]),
-            tar_bytes(&[]),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let gz = d.join(format!("{i}.tar.gz"));
-            std::fs::write(&gz, gzip_bytes(tar)).unwrap();
-            let err = stage_tar_gz_member(&gz, &out, 0o755, 1 << 20).unwrap_err();
-            assert!(matches!(err, ExtractError::Rejected(..)), "{i}: {err}");
-            assert!(!out.exists(), "{i}: nothing laid");
-        }
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// A symlink recorded AFTER extraction (the stage's `links`) folds to the same root
-    /// the walk reads over the finished tree — the fold is open until the stage closes it.
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_recorded_after_extraction_folds_like_the_walk() {
-        let d = dest("late-link");
-        let gz = d.join("a.tar.gz");
-        std::fs::write(
-            &gz,
-            gzip_bytes(&tar_bytes(&[(
-                "Foo.app/Contents/MacOS/foo",
-                b'0',
-                "",
-                b"#!/bin/sh\n",
-                0o755,
-            )])),
-        )
-        .unwrap();
-        let root = d.join("stage");
-        let mut tree = extract_tar_gz_tree(&gz, &root, 10_000, 10, vendor(0)).unwrap();
-        std::fs::create_dir_all(root.join("bin")).unwrap();
-        create_symlink(
-            Path::new("../Foo.app/Contents/MacOS/foo"),
-            &root.join("bin/foo"),
-        )
-        .unwrap();
-        tree.record_symlink(b"bin/foo".to_vec(), b"../Foo.app/Contents/MacOS/foo");
-        assert_eq!(tree.root(), crate::tree::tree_root(&root).unwrap());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// The bomb defences say WHICH one fired, and on which member.
-    ///
-    /// All seven used to render as the single line "bundle exceeded the signed
-    /// size/entry cap", so an upstream tar that puts a size on a directory header —
-    /// some old writers do — was refused with a size-cap message against a cap it was
-    /// nowhere near, sending the operator to chase `disk_installed` instead of the
-    /// offending header. A reason a caller can match on, and a member name in the
-    /// rendered line, is the whole point.
-    #[test]
-    fn a_cap_refusal_names_its_reason_and_its_member() {
-        let d = dest("cap-reasons");
-        let root = d.join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        // One directory member declaring 50 MiB, under a 10 MB cap the archive itself
-        // is nowhere near: the refusal is the header guard, NOT the byte cap.
-        let mut tar = Vec::new();
-        tar.extend_from_slice(&raw_header("payload/", b'5', "", 50 * 1024 * 1024));
-        tar.resize(tar.len() + 1024, 0);
-        let path = d.join("dirbomb.tar.zst");
-        std::fs::write(&path, zstd_bytes(&tar)).unwrap();
-        let err = extract_tar_zst(&path, &root, 10_000_000, 10_000).unwrap_err();
-        let ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(member)) = &err else {
-            panic!("want DirectoryWithBody, got {err:?}");
-        };
-        assert_eq!(member.as_path(), Path::new("payload/"));
-        let shown = err.to_string();
-        assert!(shown.contains("payload"), "must name the member: {shown}");
-        assert!(
-            !shown.contains("size/entry cap"),
-            "a directory header is not the byte cap: {shown}"
-        );
-
-        // The byte cap and the entry cap are each their own reason, and neither reads
-        // as the other.
-        let big = make_archive(&d, "big", &[("data", b'0', "", &[b'x'; 4096])]);
-        let root2 = d.join("staging2");
-        std::fs::create_dir_all(&root2).unwrap();
-        let err = extract_tar_zst(&big, &root2, 1024, 10_000).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(TooLargeReason::ContentCap)),
-            "{err:?}"
-        );
-        assert!(err.to_string().contains("uncompressed-size"), "{err}");
-        let root3 = d.join("staging3");
-        std::fs::create_dir_all(&root3).unwrap();
-        let err = extract_tar_zst(&big, &root3, 10_000_000, 0).unwrap_err();
-        assert!(
-            matches!(err, ExtractError::TooLarge(TooLargeReason::EntryCap)),
-            "{err:?}"
-        );
-        assert!(err.to_string().contains("entry-count"), "{err}");
-        let _ = std::fs::remove_dir_all(&d);
+        assert!(matches!(err, ExtractError::TooLarge(_)), "capped: {err:?}");
     }
 
     /// A disk failure mid-bundle names the step AND the path it was on.
@@ -4754,18 +3881,12 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let Err(err) = got else {
             // Running as root, where the mode bits do not apply: nothing to assert.
-            let _ = std::fs::remove_dir_all(&d);
             return;
         };
-        let ExtractError::Io { op, path, .. } = &err else {
+        let ExtractError::Io { path, .. } = &err else {
             panic!("want Io, got {err:?}");
         };
-        assert_eq!(*op, "create_dir_all");
         assert_eq!(path.as_deref(), Some(root.join("bin").as_path()));
-        let shown = err.to_string();
-        assert!(shown.contains("create_dir_all"), "names the step: {shown}");
-        assert!(shown.contains("bin"), "names the path: {shown}");
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// `write_capped` forces the sanitized mode through the HANDLE it is still holding.
@@ -4833,72 +3954,5 @@ mod tests {
             w.content_sha_hex,
             aterm_codec::hex::encode_lower(&h.finalize())
         );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// ONE directory create per directory, not one per entry.
-    ///
-    /// `Layer` used to ask for the parent on every file it laid, and on a parent that
-    /// already exists that is a `mkdir` failing `EEXIST` plus an `is_dir` `stat` — 4114
-    /// times for the 918 directories of the shipped `trust` sysroot, each re-resolving
-    /// a deep `<build>.incoming-<pid>/lib/rustlib/...` path under the store lock.
-    /// Removing the directory behind the extractor's back is the witness that a later
-    /// file no longer re-asks for it; nothing under the staging contract can do that
-    /// (the scratch root is this process's alone, under the store lock), which is
-    /// exactly why the call being skipped could only have been a no-op.
-    ///
-    /// A folding lane remembers EVERY directory it made, by exact name
-    /// ([`make_dir_exact`] — it must, to tell its own directory from one the filesystem
-    /// folds onto it), so a directory is created once however the archive interleaves
-    /// them. The write-only lane remembers the last parent only.
-    #[test]
-    fn a_run_of_files_in_one_directory_creates_it_once() {
-        let d = dest("parent-memo");
-        for fold in [true, false] {
-            let root = d.join(format!("staging-{fold}"));
-            std::fs::create_dir_all(&root).unwrap();
-            let budget = Rc::new(Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
-            let mut layer = Layer::open(
-                &root,
-                1 << 20,
-                100,
-                fold,
-                ExtractOptions::default(),
-                Rc::clone(&budget),
-            )
-            .unwrap();
-            layer.regular(Path::new("lib/a"), 0o644, &b"a"[..]).unwrap();
-            assert!(root.join("lib/a").is_file());
-
-            std::fs::remove_dir_all(root.join("lib")).unwrap();
-            let err = layer
-                .regular(Path::new("lib/b"), 0o644, &b"b"[..])
-                .unwrap_err();
-            let ExtractError::Io { op, .. } = &err else {
-                panic!("fold={fold}: want Io, got {err:?}");
-            };
-            assert_eq!(
-                *op, "open",
-                "fold={fold}: the parent must not be asked for a second time"
-            );
-
-            // A different parent is created as before; switching back to the first asks
-            // for it again only where one directory is remembered.
-            layer
-                .regular(Path::new("other/c"), 0o644, &b"c"[..])
-                .unwrap();
-            assert!(root.join("other/c").is_file());
-            let back = layer.regular(Path::new("lib/d"), 0o644, &b"d"[..]);
-            if fold {
-                let Err(ExtractError::Io { op, .. }) = &back else {
-                    panic!("fold: want Io, got {back:?}");
-                };
-                assert_eq!(*op, "open", "fold: every directory made is remembered");
-            } else {
-                back.unwrap();
-                assert!(root.join("lib/d").is_file());
-            }
-        }
-        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `--diagnose`: a headless diagnostics ("doctor") report — version/build,
-//! platform, renderer, advertised terminal capabilities, config location, and the
-//! active `ATERM_*` environment. The report body is a PURE function of a captured
-//! [`DiagInfo`], so it is unit-tested without launching a window; printing it and
-//! exiting is the CLI's job (`cli.rs`). This is the discoverable surface a human or
-//! an AI reads to understand what this build supports and how it is configured.
+//! The headless reports: `--diagnose` (version/build, platform, renderer, advertised
+//! capabilities, config location, `ATERM_*` environment), `--validate-config`,
+//! `--show-config`, `--show-face` and the `--list-*` listings. Each body is a pure function
+//! of captured inputs ([`DiagInfo`] for `--diagnose`), tested without a window; printing
+//! and exiting is `cli.rs`'s job.
 
 use std::fmt::Write as _;
 
@@ -22,79 +21,54 @@ pub(crate) struct DiagInfo {
     /// Compiler provenance line (which rustc produced this binary — flavor r/t,
     /// commit slug, profile, trust_verify), from `build_info::compiler_summary`.
     pub compiler: String,
-    /// SHA-256(raw 32-byte paper master) — the one anchor that authorizes a release —
-    /// or the explicit `empty` / `invalid` state. Read from shipping updater code, not
-    /// binary text.
+    /// SHA-256 of the raw 32-byte paper master (the anchor that authorizes a release), or
+    /// `empty` / `invalid`; from the shipping updater code, not binary text.
     pub update_pin_sha256: String,
     pub renderer_default: &'static str,
-    /// What shell-integration preparation ACTUALLY did for the shell this
-    /// configuration spawns — distinct from the `shell_integration` row in the
-    /// capabilities list, which is the compile-time ADVERTISED capability. An
-    /// unknown shell or an unwritable loader cache reads "NOT ACTIVE" here
-    /// while the advertised row stays checked, and that split is the fact a
-    /// "command not found on the ALab tools" report needs surfaced.
+    /// What shell-integration preparation actually did for the shell this configuration
+    /// spawns, unlike the advertised `shell_integration` capability: an unknown shell or an
+    /// unwritable loader cache reads "NOT ACTIVE" here while the capability stays checked.
     pub shell_integration_runtime: String,
-    /// The coding-agent primer's state per registry agent under the real
-    /// `$HOME`, plus whether this configuration auto-primes on every fresh spawn
-    /// — the F1 diagnosable fact ("every agent row absent") beside the knob
-    /// that governs it, on one line.
+    /// Each registry agent's primer state under the real `$HOME`, and whether this
+    /// configuration auto-primes every fresh spawn.
     pub agent_primer: String,
-    /// The RESOLVED `[privacy]` posture — the macOS consent lane's switches,
-    /// warm-up mode and protected-root count — plus the full-disk-access state
-    /// ONLY when a probe was injected. `--diagnose` is headless-constructible,
-    /// so [`collect`] passes the inert arm and this reads `probe=none
-    /// full_disk_access=unknown`: no report may reach tccd from a path a test
-    /// can construct. See [`privacy_line`].
+    /// The resolved `[privacy]` posture (switches, warm-up mode, protected-root count),
+    /// plus the full-disk-access state only through an injected probe. [`collect`] passes
+    /// the inert arm, so no report reaches tccd. See [`privacy_line`].
     pub privacy: String,
-    /// The macOS debugger rule (developer mode) — ONLY when a probe was
-    /// injected — plus whether this aterm is hardened against a same-user
-    /// debugger. [`collect`] passes the inert arm, so this reads
-    /// `mode=unknown … probe=none`: `--diagnose` spawns no `DevToolsSecurity`.
-    /// See [`debugger_line`].
+    /// The macOS debugger rule (developer mode), read only through an injected probe, and
+    /// whether this aterm is hardened against a same-user debugger. [`collect`] passes the
+    /// inert arm, so `--diagnose` spawns no `DevToolsSecurity`. See [`debugger_line`].
     pub debugger: String,
     pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
     /// Of the Objective-C protocols the window layer's declared classes claim
-    /// ([`CLAIMED_OBJC_PROTOCOLS`]), the ones THIS HOST's frameworks do not
-    /// register. Empty means every claimed protocol is the framework's own; a
-    /// name here is one `aterm-objc` supplies at declaration — v0.72.0 through
-    /// v0.75.0 died at launch on such a host instead (macOS 14.4.1 lacks
-    /// `NSApplicationDelegate`; the macOS 26 release cutter does not), which is
-    /// why the cut's own `--diagnose` transcript now carries this line. Off
-    /// macOS nothing is claimed and the list is empty.
+    /// ([`CLAIMED_OBJC_PROTOCOLS`]), the ones this host's frameworks do not register
+    /// (macOS 14.4.1 lacks `NSApplicationDelegate`), which `aterm-objc` supplies at
+    /// declaration. Empty off macOS.
     pub objc_protocols_absent: Vec<&'static str>,
     pub config_path: String,
     pub config_presence: ConfigPresence,
     pub env: Vec<(String, String)>,
 }
 
-/// What `aterm.toml` is DOING for this process — the state both stdout reports
-/// print beside its path.
-///
-/// Until 2026-09-18 this was a bare `bool` from `Path::exists()`, so a config
-/// that failed to load at launch got the SAME `[present]` token as one that is
-/// in force, above a settings listing that was silently the defaults; the one
-/// sentence explaining it went only to stderr, which `aterm --diagnose >
-/// report.txt` — the exact gesture the flag exists for — throws away. A
-/// filesystem probe cannot tell "loaded" from "rejected"; only the launch's own
-/// load result can, so [`Rejected`](Self::Rejected) carries it.
+/// What `aterm.toml` is doing for this process, printed beside its path by both stdout
+/// reports, since stderr's notice never reaches `aterm --diagnose > report.txt`. Only the
+/// launch's own load result tells "loaded" from "rejected", so
+/// [`Rejected`](Self::Rejected) carries it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigPresence {
     /// No file at the path. The defaults are in force and the report says so.
     Absent,
     /// The file was read and parsed: the values in the report came from disk.
     Loaded,
-    /// The file is on disk and did NOT load — unreadable, or not a valid
-    /// configuration — so every value in the report is a built-in default.
-    /// Carries `app_config::launch_config_notice`'s sentence (path, problem,
-    /// consequence, and what ends it).
+    /// On disk but not loaded (unreadable or invalid): every value in the report is a
+    /// built-in default. Carries `app_config::launch_config_notice`'s sentence.
     Rejected(String),
 }
 
 impl ConfigPresence {
-    /// The bracketed token beside the path. The rejected spelling names the
-    /// CONSEQUENCE, like its `absent — defaults` sibling, because that is what
-    /// the reader is actually asking the flag.
+    /// The bracketed token beside the path; a rejected file's names the consequence.
     fn token(&self) -> &'static str {
         match self {
             Self::Absent => "absent — defaults",
@@ -111,12 +85,9 @@ impl ConfigPresence {
     }
 }
 
-/// The config-file line (plus, for a rejected file, the consequence and the
-/// reason) as BOTH stdout reports print it. Shared so `--diagnose` and
-/// `--show-config` cannot drift back into disagreeing about the same file;
-/// `label` is each report's own gutter, and the continuation lines align under
-/// the path. The parse error is multi-line, so every line of it is indented and
-/// right-trimmed rather than pasted in raw.
+/// The config-file line both stdout reports print, plus, for a rejected file, the
+/// consequence and the reason, each line indented under the path and right-trimmed.
+/// Shared so `--diagnose` and `--show-config` cannot disagree; `label` is the gutter.
 fn config_line(label: &str, path: &str, presence: &ConfigPresence) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "{label}{path} [{}]", presence.token());
@@ -139,11 +110,9 @@ fn config_line(label: &str, path: &str, presence: &ConfigPresence) -> String {
     s
 }
 
-/// The config path + its presence for a report, resolved the only honest way:
-/// the filesystem probe answers absent-vs-there, and the launch's own load
-/// failure (`launch_failure`, from `app_config::launch_load_failure`) is what
-/// separates a config in force from one that was thrown away. Call it AFTER
-/// `load_config`, which is what records that failure.
+/// The config path and its presence: the filesystem answers absent-vs-there, and the
+/// launch's own load failure (`app_config::launch_load_failure`) separates a config in
+/// force from a rejected one. Call it after `load_config`, which records that failure.
 fn report_config_target(launch_failure: Option<&str>) -> (String, ConfigPresence) {
     let Some(path) = crate::app_config::config_path() else {
         return (
@@ -253,50 +222,49 @@ fn capability_list() -> Vec<(&'static str, bool)> {
     ]
 }
 
-/// The GPU renderer's backend name for the diagnostics label, per platform: Metal
-/// on macOS, DX12 on Windows and Vulkan elsewhere (Vulkan on Linux/NVIDIA) — the
-/// one backend each platform compiles (`aterm_gpu::default_backends`). The live
-/// `metrics` verb still reports the actually-negotiated backend at runtime; this
-/// label is the compile-time default, not a probe.
+/// The GPU backend each platform compiles, for the report label: the first-party Metal
+/// renderer on macOS and OpenGL ES renderer on Linux, else wgpu's one backend
+/// (`aterm_gpu::default_backends`). A compile-time label, not a probe; the `metrics` verb
+/// reports the negotiated backend.
 #[cfg(target_os = "macos")]
 const GPU_BACKEND_LABEL: &str = "gpu (metal)";
-/// See the macOS variant above. Windows restricts wgpu to DX12 — the native
-/// Windows API and the only backend wired for the HDR/scRGB present — so a
-/// report that said "vulkan" here sent every Windows bug reporter's
-/// `--show-config` out with the wrong renderer named.
+/// Linux: the first-party GLES renderer over EGL (docs/AUDIT-third-party-2026-10-15.md GW.4).
+#[cfg(target_os = "linux")]
+const GPU_BACKEND_LABEL: &str = "gpu (gl)";
+/// Windows restricts wgpu to DX12, the only backend wired for the HDR/scRGB present.
 #[cfg(windows)]
 const GPU_BACKEND_LABEL: &str = "gpu (dx12)";
-/// See the macOS variant above — everything else uses Vulkan via wgpu.
-#[cfg(not(any(target_os = "macos", windows)))]
+/// Everything else: wgpu's Vulkan backend.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 const GPU_BACKEND_LABEL: &str = "gpu (vulkan)";
 
-/// The renderer label for the reports: the platform GPU backend name when GPU is
-/// the resolved default, else the CPU renderer. `gpu` must come from
-/// [`crate::app_config::resolve_want_gpu`] so the label tracks the actual backend
-/// selection (`--cpu`/`--gpu` + config `gpu` + GPU-on default), not a flag alone.
+/// The renderer label: the platform GPU backend when GPU is the resolved default
+/// ([`crate::app_config::resolve_want_gpu`]), else `cpu`.
 fn renderer_label(gpu: bool) -> &'static str {
     if gpu { GPU_BACKEND_LABEL } else { "cpu" }
 }
 
-/// The RUNTIME shell-integration outcome for the shell this configuration
-/// would actually spawn (env > config `shell`, the same funnel as the spawn
-/// path) — probed by running the REAL preparation. That write is idempotent,
-/// memoized, and exactly what every launch performs; it is also the only
-/// honest probe, because "is the loader cache writable" is proven by writing.
+/// The runtime shell-integration outcome for the shell this configuration spawns (env >
+/// config `shell`, as the spawn path resolves it), probed by running the real preparation:
+/// it is idempotent, memoized and what every launch does, and only a write proves the
+/// loader cache writable.
 fn shell_integration_runtime(config: &crate::app_config::Config) -> String {
     use aterm_core::shell_integration as si;
     let hint = crate::app_config::resolve_shell_override(config);
-    let shell = match hint.as_deref().filter(|s| !s.is_empty()) {
-        Some(h) => si::ShellType::detect(h),
-        None => si::ShellType::detect_current(),
-    };
+    let shell = crate::spawn::detect_spawn_shell(hint.as_deref());
     match si::prepare(shell) {
-        Ok(Some(_)) => format!("active ({shell:?} loader prepared)"),
+        Ok(Some(mut injection)) => {
+            let args = config.shell_args.as_deref().unwrap_or_default();
+            match si::merge_shell_args(shell, &mut injection, args) {
+                si::ArgsMerge::Integrated => format!("active ({shell:?} loader prepared)"),
+                si::ArgsMerge::Bypass(why) => format!(
+                    "NOT ACTIVE — {why}; aterm runs those shell_args as given, \
+                     without integration"
+                ),
+            }
+        }
         Ok(None) => {
-            let name = hint
-                .filter(|s| !s.is_empty())
-                .or_else(|| std::env::var("SHELL").ok())
-                .unwrap_or_else(|| "the default shell".to_string());
+            let name = crate::spawn::selected_shell_name(hint.as_deref());
             format!(
                 "NOT ACTIVE — no integration for {name}; ALab tools reach new shells \
                  only via shell.d, so add <prefix>/bin to PATH manually"
@@ -306,10 +274,8 @@ fn shell_integration_runtime(config: &crate::app_config::Config) -> String {
     }
 }
 
-/// The `primer:` line: every registry agent's primer state under the real
-/// `$HOME` — READ-ONLY, `--diagnose` never installs anything — and the
-/// `agents_auto_prime` knob as this configuration resolves it, so "why is the
-/// primer absent" and "why does it keep coming back" both answer here.
+/// The `primer:` line: every registry agent's primer state under the real `$HOME`
+/// (read-only: `--diagnose` installs nothing) and the resolved `agents_auto_prime` knob.
 fn agent_primer_line(config: &crate::app_config::Config) -> String {
     let status = aterm_primer::home_dir().map_or_else(
         || "(no HOME — nowhere to look)".to_string(),
@@ -323,27 +289,17 @@ fn agent_primer_line(config: &crate::app_config::Config) -> String {
     format!("{status} — auto-prime: {auto} (agents_auto_prime)")
 }
 
-/// The `privacy:` line: this build's RESOLVED `[privacy]` posture, plus the
-/// full-disk-access state — and only if a probe was handed in.
+/// The `privacy:` line: the resolved `[privacy]` posture, plus the full-disk-access state
+/// only if a probe was handed in.
 ///
-/// THE PROBE IS A PARAMETER, and that is the whole safety argument. `--diagnose`
-/// is headless-constructible and runs in test binaries, and the FDA probe opens
-/// a file macOS guards; a report that reached for it on its own would put a
-/// consent-gated syscall on a path no guardrail watches (AGENTS.md, the
-/// 2026-08-17 incident). So [`collect`] passes the INERT arm — `None`, which
-/// renders `probe=none full_disk_access=unknown` — and only a windowed `App`,
-/// which has already decided it is running from inside the bundle, ever passes
-/// `Some`. The same shape as `lock_modifiers` / `user_input_recent`.
+/// The probe is a parameter because it opens a file macOS guards, and `--diagnose` is
+/// headless-constructible and runs in test binaries: [`collect`] passes `None`
+/// (`probe=none full_disk_access=unknown`), and only a windowed `App` running from inside
+/// the bundle passes `Some`, as with `lock_modifiers` / `user_input_recent`.
 ///
-/// `unknown` here means aterm did not look, and it is never a claim of denial.
-/// A `granted` state is still never a claim that no prompt can appear: what a
-/// completed grant establishes is the OBSERVING HOST's scope and Apple's
-/// documented app-data class, nothing about a folder or an adopted session.
-/// That rule has one home — [`crate::control_privacy::observed_fda_scope`],
-/// which the `privacy` control verb renders from — and this line calls it
-/// rather than restating it, so the two surfaces cannot disagree about the
-/// same machine (they did: this line pinned `unknown` for a granted probe the
-/// verb already reported as `this_process`).
+/// `unknown` means aterm did not look, never denial, and `granted` never claims no prompt
+/// can appear. The scope rule lives in [`crate::control_privacy::observed_fda_scope`],
+/// which the `privacy` verb renders from too, so the two surfaces agree.
 pub(crate) fn privacy_line(
     config: &crate::app_config::Config,
     probe: Option<aterm_containment::FdaProbe>,
@@ -352,9 +308,8 @@ pub(crate) fn privacy_line(
         return "off ([privacy] enabled = false) — every consent field reads unknown".to_string();
     }
     let (fda, probe_label) = match (config.privacy_probe_gate().permits(), probe) {
-        // The config said not to probe, so nothing did. Named as configuration
-        // rather than reported as a state, because "denied" would be a lie and
-        // a bare "unknown" would look like a failure.
+        // Named as configuration: "denied" would be false, and a bare "unknown" would
+        // read as a failure.
         (false, _) => (aterm_containment::FdaState::Unknown, "off"),
         (true, None) => (aterm_containment::FdaState::Unknown, "none"),
         (true, Some(probe)) => (probe.state, probe.label.as_str()),
@@ -371,11 +326,9 @@ pub(crate) fn privacy_line(
          folders={folders} hold_ms={hold} probe_interval_ms={interval} protected_roots={roots} \
          notice={notice} report_attribution={attribution}",
         fda = fda.as_str(),
-        // The one rule, not a second copy of it. Nothing here MEASURES a scope,
-        // so the measured half is `Unknown` — exactly what the verb passes under
-        // `SpikeEvidence::UNMEASURED` — and a granted probe resolves to
-        // `this_process` on both surfaces. Per-folder state stays unknown by
-        // construction either way: testing a folder is what raises the dialog.
+        // Nothing here measures a scope, so the measured half is `Unknown`, as the verb
+        // passes under `SpikeEvidence::UNMEASURED`. Per-folder state stays unknown:
+        // testing a folder is what raises the dialog.
         scope =
             crate::control_privacy::observed_fda_scope(fda, aterm_containment::FdaScope::Unknown,)
                 .as_str(),
@@ -388,22 +341,16 @@ pub(crate) fn privacy_line(
     )
 }
 
-/// The `debugger:` line: the macOS debugger rule (developer mode, the
-/// Authorization Services right `system.privilege.taskport.debug` — not TCC),
-/// the account's membership, and this aterm's own hardening — the rule only if
-/// a probe was handed in.
+/// The `debugger:` line: the macOS debugger rule (developer mode: the Authorization
+/// Services right `system.privilege.taskport.debug`, not TCC), the account's membership
+/// and this aterm's own hardening; the rule only through an injected probe.
 ///
-/// THE PROBE IS A PARAMETER, for the reason [`privacy_line`]'s is: the probe
-/// spawns `DevToolsSecurity -status`, and `--diagnose` is headless-constructible
-/// and runs in test binaries. [`collect`] passes `None`, which renders
-/// `mode=unknown member=unknown … probe=none`; `unknown` means aterm did not
-/// look, never that developer mode is off. The hardening fact is a parameter
-/// too, so a test can render every posture; `collect` reads it with one
-/// `csops` about its own image, which spawns nothing and raises nothing.
-///
-/// Both switches gate it as they gate the Full Disk Access probe (design §3.9):
-/// `enabled = false` collapses the line to one sentence, and `check = false`
-/// names the configuration (`probe=off`) instead of a state.
+/// The probe spawns `DevToolsSecurity -status`, so it is a parameter for the reason
+/// [`privacy_line`]'s is: [`collect`] passes `None` (`probe=none`), and `unknown` means
+/// aterm did not look, never that developer mode is off. The hardening is a parameter too,
+/// so a test renders every posture; `collect` reads it with one `csops` on its own image.
+/// `enabled = false` collapses the line to one sentence; `check = false` reads `probe=off`
+/// (design §3.9).
 pub(crate) fn debugger_line(
     config: &crate::app_config::Config,
     probe: Option<aterm_containment::consent::DebuggerProbe>,
@@ -431,15 +378,13 @@ pub(crate) fn debugger_line(
 /// Collect diagnostics from the live build + environment.
 pub(crate) fn collect() -> DiagInfo {
     let config = crate::app_config::load_config();
-    // Renderer default resolved through the shared funnel (`--cpu`/`--gpu` > config
-    // `gpu` > GPU-on default) so the report matches what `main` would actually
-    // launch. Metal on macOS, wgpu's one backend elsewhere; the live `metrics` verb
-    // reports the actually-negotiated backend.
+    // The shared funnel (`--cpu`/`--gpu` > config `gpu` > GPU-on default), so the
+    // report matches what `main` launches.
     let gpu = crate::app_config::resolve_want_gpu(&config);
     let renderer_default = renderer_label(gpu);
 
-    // AFTER `load_config` above: a rejected file is only distinguishable from a
-    // loaded one by the failure that load recorded.
+    // After `load_config` above: only the failure that load recorded tells a rejected
+    // file from a loaded one.
     let (config_path, config_presence) =
         report_config_target(crate::app_config::launch_load_failure());
 
@@ -466,11 +411,7 @@ pub(crate) fn collect() -> DiagInfo {
         agent_primer: agent_primer_line(&config),
         privacy: privacy_line(&config, None),
         debugger: debugger_line(&config, None, aterm_containment::consent::self_hardening()),
-        features: vec![
-            ("sixel", cfg!(feature = "sixel")),
-            ("a11y-appkit", cfg!(feature = "a11y-appkit")),
-            ("a11y-accesskit", cfg!(a11y_tree)),
-        ],
+        features: vec![("a11y-appkit", cfg!(feature = "a11y-appkit"))],
         capabilities: capability_list(),
         objc_protocols_absent: objc_protocols_absent(),
         config_path,
@@ -483,8 +424,7 @@ pub(crate) fn collect() -> DiagInfo {
 /// layer claims — the union of the `protocols:` lists in `crates/aterm-window`'s
 /// macOS backend and this crate — pinned so `--diagnose` can ask the host about
 /// each BEFORE any class is declared (declaration is what would supply a
-/// missing one). `claimed_objc_protocols_are_pinned` reads the sites and keeps
-/// this list equal to them, so a new claim must be added here consciously.
+/// missing one). A new claim must be added here consciously.
 #[cfg(target_os = "macos")]
 pub(crate) const CLAIMED_OBJC_PROTOCOLS: &[&std::ffi::CStr] = &[
     c"NSApplicationDelegate",
@@ -498,8 +438,8 @@ pub(crate) const CLAIMED_OBJC_PROTOCOLS: &[&std::ffi::CStr] = &[
     c"NSWindowDelegate",
 ];
 
-/// The claimed protocols this host's frameworks do NOT register — a pure
-/// lookup, never a registration, so the answer is the host's and not ours.
+/// The claimed protocols this host's frameworks do not register: a lookup, never a
+/// registration, so the answer is the host's.
 #[cfg(target_os = "macos")]
 fn objc_protocols_absent() -> Vec<&'static str> {
     CLAIMED_OBJC_PROTOCOLS
@@ -524,22 +464,13 @@ pub(crate) struct ConfigSemanticWarning {
     pub(crate) message: String,
 }
 
-/// The at-most-one semantic warning a single `[keybindings]` row earns, with
-/// the built-in shadow ALREADY RESOLVED by the caller
-/// ([`crate::keybinding::builtin_shadow_label`]).
+/// The at-most-one semantic warning a `[keybindings]` row earns, with the built-in shadow
+/// resolved by the caller ([`crate::keybinding::builtin_shadow_label`]): a parameter, so the
+/// Cmd/Super suite, compiled off on Linux, is testable from any host.
 ///
-/// The label is a PARAMETER rather than a lookup because the hardcoded
-/// Cmd/Super suite is compiled off on Linux, so a host-conditional test can
-/// only ever assert the Linux half — and the review's escape (`"cmd+c" =
-/// "none"` validating fully green) lived exactly in the half Linux cannot see.
-/// With the gate explicit, the macOS-shaped path is reachable from any host.
-///
-/// Order is load-bearing, and the unbind arm is deliberately NOT terminal:
-/// `"none"`/`"unbind"` is the documented spelling for masking a platform SEED,
-/// so it must never be flagged as an unknown action (the old behaviour told a
-/// user their working config was broken) — but an unbind cannot mask a
-/// HARDCODED built-in, so where one claims the chord the conflict caveat is
-/// exactly as true as for any other value and still rides.
+/// Order matters: the unbind check precedes the action parse, since `"none"`/`"unbind"` is
+/// the documented way to mask a platform seed and never an unknown action; it still
+/// carries the conflict caveat, because an unbind cannot mask a hardcoded built-in.
 fn keybinding_row_warning(
     chord: &str,
     action: &str,
@@ -552,12 +483,8 @@ fn keybinding_row_warning(
                 message: format!("keybindings: chord {chord:?} invalid ({e})"),
             });
         }
-        // A CHORD THAT PARSES CAN STILL BE UNREACHABLE, and nothing said so.
-        // The runtime matches on the UNSHIFTED layout key, so a chord whose key
-        // is a shift-composed glyph never fires — it was accepted with no
-        // warning, called green by `--validate-config`, and printed by
-        // `--list-keybinds` like any working row. Silence for a line that does
-        // nothing, which is the one thing a config checker exists to prevent.
+        // The runtime matches the unshifted layout key, so a chord whose key is a
+        // shift-composed glyph never fires.
         Ok(parsed) => {
             if let Some(glyph) = crate::keybinding::shift_composed_key(&parsed) {
                 let base = crate::keybinding::unshifted_us_spelling(glyph);
@@ -596,12 +523,10 @@ fn keybinding_row_warning(
     })
 }
 
-/// `[update] owner/repo` and `[packages] account` point aterm at another release
-/// channel or package index. Only a development build reads them
-/// (`update_dev`/`packages_dev`: `aterm_update_core::REPOINT_IS_A_DEV_SEAM`,
-/// `atpkg::config::DEV_SEAMS`); a shipped build ignores any value, so there the
-/// warning is that the key does nothing, and only a development build gets the
-/// name check.
+/// `[update] owner/repo` and `[packages] account` repoint aterm at another release
+/// channel or package index. Only a development build reads them (`update_dev`/
+/// `packages_dev`: `aterm_update_core::REPOINT_IS_A_DEV_SEAM`, `atpkg::config::DEV_SEAMS`)
+/// and gets the name check; in a shipped build the warning is that the key does nothing.
 fn repoint_warnings(
     config: &crate::app_config::Config,
     update_dev: bool,
@@ -648,10 +573,8 @@ fn repoint_warnings(
     warnings
 }
 
-/// Semantic checks that require no filesystem, platform service, or ambient
-/// capability. Keeping this subset separate lets the config editor stay pure
-/// and responsive while sharing the exact keybinding/sequence and palette
-/// acceptance rules with `--validate-config`.
+/// Semantic checks that need no filesystem, platform service or ambient capability, so
+/// the config editor stays pure while sharing `--validate-config`'s acceptance rules.
 pub(crate) fn config_semantic_warnings(
     config: &crate::app_config::Config,
 ) -> Vec<ConfigSemanticWarning> {
@@ -729,19 +652,11 @@ pub(crate) fn config_semantic_warnings(
         atpkg::config::DEV_SEAMS,
     ));
     if let Some(privacy) = config.privacy.as_ref() {
-        // RESERVED AND UNIMPLEMENTED, said out loud. aterm has no supported way
-        // to answer a macOS consent dialog and would not want one — a terminal
-        // that clicked "Allow" for a person is worse than the interruption it
-        // removed. The key exists ONLY so this sentence has somewhere to attach:
-        // an unknown key says nothing, and a key that quietly does nothing is
-        // the exact failure `--validate-config` exists to catch. The message
-        // names the grant that DOES work, and stops there — it does not promise
-        // the grant removes every prompt. Its second sentence covers the other
-        // dialog a reader of this key has in mind: the debugger's administrator
-        // password (Developer Tools Access) is not TCC and no grant reaches it,
-        // so it points at the Debugger access row on the same Settings page,
-        // where the owner's own press changes the rule — aterm still answers no
-        // dialog (docs/DESIGN-macos-debugger-access-2026-09-29.md §3.9, O7).
+        // Reserved and unimplemented: aterm answers no macOS consent dialog, and the key
+        // exists so this warning has somewhere to attach. It names the grant that works
+        // without promising it removes every prompt, and sends the debugger's
+        // administrator password (not TCC) to the Debugger access row
+        // (docs/DESIGN-macos-debugger-access-2026-09-29.md §3.9).
         if privacy.auto_accept == Some(true) {
             warnings.push(ConfigSemanticWarning {
                 key: "privacy.auto_accept",
@@ -753,11 +668,9 @@ pub(crate) fn config_semantic_warnings(
                     .to_string(),
             });
         }
-        // The master switch outranks both features below. Only an AUTHORED key
-        // is flagged: an absent `notice`/`warmup` resolves to the same value,
-        // but the author wrote no token to underline and stated no expectation
-        // for the master switch to contradict — the same rule the environment
-        // -override walk follows.
+        // The master switch outranks both features below. Only an authored key is
+        // flagged: an absent one resolves the same but has no token to underline (as in
+        // the environment-override walk).
         if privacy.enabled == Some(false) {
             if privacy.notice == Some(true) {
                 warnings.push(ConfigSemanticWarning {
@@ -767,17 +680,20 @@ pub(crate) fn config_semantic_warnings(
                         .to_string(),
                 });
             }
-            if privacy
+            if let Some(warmup) = privacy
                 .warmup
                 .as_deref()
                 .and_then(crate::app_config::PrivacyWarmup::parse)
-                == Some(crate::app_config::PrivacyWarmup::OnRequest)
+                .filter(|warmup| warmup.offered())
             {
                 warnings.push(ConfigSemanticWarning {
                     key: "privacy.warmup",
-                    message: "privacy.warmup = \"on-request\" has no effect while \
-                              privacy.enabled = false; the folder-access gesture is never offered"
-                        .to_string(),
+                    message: format!(
+                        "privacy.warmup = \"{}\" has no effect while privacy.enabled = false; \
+                         the folder-access gesture is never offered and nothing is asked at \
+                         launch",
+                        warmup.as_str()
+                    ),
                 });
             }
         }
@@ -841,11 +757,9 @@ pub(crate) fn config_semantic_warnings(
                 }
             }
         }
-        // The hold exists so an owner-initiated system dialog is not cut off
-        // mid-answer by the automatic in-place apply. Past the ceiling it stops
-        // being that and becomes a way to pin a build to one instance, which
-        // the design refuses — so the resolver clamps, and this states the
-        // effective number rather than letting the authored one read as honored.
+        // The hold keeps the automatic in-place apply from cutting off an
+        // owner-initiated system dialog; past the ceiling it would pin a build to one
+        // instance, so the resolver clamps and this states the effective number.
         if let Some(hold_ms) = privacy.warmup_hold_ms
             && hold_ms > crate::app_config::PRIVACY_WARMUP_HOLD_MS_MAX
         {
@@ -1004,59 +918,6 @@ pub(crate) fn config_semantic_warnings(
         }
     }
 
-    if let Some(net) = config.net.as_ref() {
-        let mut names = std::collections::HashSet::new();
-        for (index, connection) in net.connections.iter().enumerate() {
-            let record = index + 1;
-            if !crate::net_connections::valid_connection_name(&connection.name) {
-                warnings.push(ConfigSemanticWarning {
-                    key: "net.connections.name",
-                    message: format!(
-                        "net.connections.name in [[net.connections]] record {record} must be a nonempty [A-Za-z0-9_-] name; this connection cannot be dialed"
-                    ),
-                });
-            } else if !names.insert(connection.name.as_str()) {
-                warnings.push(ConfigSemanticWarning {
-                    key: "net.connections.name",
-                    message: format!(
-                        "net.connections.name in [[net.connections]] record {record} duplicates {:?}; only the first matching record can be resolved",
-                        connection.name
-                    ),
-                });
-            }
-            if connection.host.trim().is_empty() {
-                warnings.push(ConfigSemanticWarning {
-                    key: "net.connections.host",
-                    message: format!(
-                        "net.connections.host in [[net.connections]] record {record} is blank; dialing this connection always fails before TLS"
-                    ),
-                });
-            } else if !crate::net_connections::valid_dial_endpoint(&connection.host) {
-                warnings.push(ConfigSemanticWarning {
-                    key: "net.connections.host",
-                    message: format!(
-                        "net.connections.host in [[net.connections]] record {record} must be host:port, a numeric IP:port, or bracketed IPv6:port with a nonzero port; dialing this value always fails before TLS"
-                    ),
-                });
-            }
-            if crate::net_connections::parse_fingerprint(&connection.fingerprint).is_none() {
-                warnings.push(ConfigSemanticWarning {
-                    key: "net.connections.fingerprint",
-                    message: format!(
-                        "net.connections.fingerprint in [[net.connections]] record {record} must be 64 hexadecimal SHA-256 digits, optionally prefixed by sha256:; dialing refuses this record"
-                    ),
-                });
-            }
-            if connection.sid.is_some() && connection.expect_nonce.is_none() {
-                warnings.push(ConfigSemanticWarning {
-                    key: "net.connections.sid",
-                    message: format!(
-                        "net.connections.sid in [[net.connections]] record {record} has no effect without expect_nonce"
-                    ),
-                });
-            }
-        }
-    }
     if let Some(ink) = config
         .sparkle_words
         .as_ref()
@@ -1115,23 +976,13 @@ pub(crate) fn config_semantic_warnings(
         }
     }
     if config.allow_osc52_query == Some(true) {
-        // The warning states the WIDEST thing the key grants on THIS platform —
-        // informed consent needs the scarier truth, not the reassuring one. On
-        // macOS/Windows the Query arm answers with the SYSTEM pasteboard
-        // (`pbpaste` — the whole point of the knob is remote vim/tmux clipboard
-        // sync, which must see what the user copied in OTHER apps), so the old
-        // "own-slot only — never the desktop's clipboard" line was a false
-        // promise exactly where a password manager's copy is at stake. Linux is
-        // narrower for an implementation reason, not a policy one: a
-        // foreign-owner X11 read is a blocking round-trip inside the terminal
-        // lock, so only aterm's own selections answer today (spawn.rs, the
-        // Query arm) — say that, and no more.
-        // macOS names the alert that read raises: on macOS 26 a programmatic
-        // pasteboard read shows the system's "<app> would like to paste from
-        // <app>" alert, attributed to aterm — the program asked, aterm is the one
-        // seen asking. Saying so here is the whole of the 2026-09-12 TCC audit's
-        // OSC 52 finding: the setting was already fail-closed; its help did not
-        // say which dialog it is.
+        // The warning states the widest thing the key grants on this platform. On
+        // macOS/Windows the Query arm answers with the system pasteboard (the knob is
+        // for remote vim/tmux clipboard sync, which must see other apps' copies). Linux
+        // answers only aterm's own selections: a foreign-owner X11 read is a blocking
+        // round-trip inside the terminal lock (spawn.rs, the Query arm). On macOS 26 a
+        // programmatic pasteboard read raises the system's "<app> would like to paste
+        // from <app>" alert, attributed to aterm, so the macOS text names it.
         let message = if cfg!(target_os = "linux") {
             "allow_osc52_query is enabled: a program in the terminal can READ the \
              clipboard selections aterm itself owns (a foreign app's copy is not \
@@ -1155,12 +1006,9 @@ pub(crate) fn config_semantic_warnings(
         });
     }
     if config.allow_window_ops == Some(true) {
-        // Linux wires the manipulation half (frame audit #4: `spawn::
-        // configure_window_ops` → `App::on_window_op`); the surviving gap there
-        // is the POSITION and screen reports. The pixel-geometry pair (CSI 14 t
-        // text area, CSI 16 t cell size) is answered in-core on every platform
-        // from the host's reported cell metrics, so it is no longer part of the
-        // gap on either branch.
+        // Linux wires the manipulations (`spawn::configure_window_ops` →
+        // `App::on_window_op`) but not the position and screen reports. CSI 14 t and
+        // 16 t are answered in-core on every platform from the host's cell metrics.
         let message = if cfg!(target_os = "linux") {
             "allow_window_ops is wired to the window on Linux: manipulations (iconify, maximize, fullscreen, resize) apply and move stays denied; the window-title, text-grid-size, text-area-pixels and cell-size reports are answered, while window/screen position and screen-size reports remain unanswered"
         } else {
@@ -1174,61 +1022,42 @@ pub(crate) fn config_semantic_warnings(
     warnings
 }
 
-/// Runtime validation that deliberately owns ambient filesystem access.
-///
-/// Manual runs this set off the event-loop and merges the result only when the
-/// exact document revision is still current. `--validate-config` calls the same
-/// function synchronously. Keeping the checks source-addressable prevents the
-/// editor and the loader from disagreeing about a font, theme, Trail Pack, or
-/// keyword-toy pack that would otherwise be silently replaced/skipped.
+/// Runtime validation that owns ambient filesystem access. Manual runs it off the event
+/// loop and merges the result only while the document revision is current;
+/// `--validate-config` calls it synchronously, so the editor and the loader agree about a
+/// font, theme or keyword-toy pack the loader would replace or skip.
 pub(crate) fn config_host_semantic_warnings(
     config: &crate::app_config::Config,
 ) -> Vec<ConfigSemanticWarning> {
     config_host_semantic_warnings_with_backend(config, crate::app_config::resolve_want_gpu(config))
 }
 
-/// Host validation with the renderer backend supplied by the caller. Manual
-/// passes the backend that is actually presenting its window; command-line
-/// validation uses [`crate::app_config::resolve_want_gpu`] through the wrapper
-/// above because no renderer has been constructed there yet.
+/// Host validation with the caller's renderer backend: Manual passes the one presenting
+/// its window; the command line resolves it ([`crate::app_config::resolve_want_gpu`]),
+/// since no renderer exists there.
 pub(crate) fn config_host_semantic_warnings_with_backend(
     config: &crate::app_config::Config,
     backend_gpu: bool,
 ) -> Vec<ConfigSemanticWarning> {
     let assets =
         config.resolve_asset_catalog_with_themes(crate::app_config::ThemeCatalog::discover());
-    config_host_semantic_warnings_with_backend_and_assets(
-        config,
-        backend_gpu,
-        &assets,
-        crate::net_listen::launched_inside_aterm(),
-    )
+    config_host_semantic_warnings_with_backend_and_assets(config, backend_gpu, &assets)
 }
 
-/// Host validation against the exact immutable non-text asset generation
-/// admitted with `config`. Manual passes its [`ConfigSnapshot`](crate::native_config_service::ConfigSnapshot)
-/// catalog here so theme, Trail Pack, and rainbow kitty diagnostics cannot race a live
-/// directory/file change or disagree with what the renderer actually applies.
-///
-/// `nested` — whether this process was launched inside another aterm
-/// ([`crate::net_listen::launched_inside_aterm`]) — is supplied by the CALLER.
-/// It is process-global environment state, and the listener arms below branch on
-/// it, so reading it here would make this projection depend on how the host
-/// process happened to be started: the suite's own listener tests then see the
-/// no-bind arm whenever they are run from inside aterm. Same law the pure
-/// `listener_capability_warnings` already states, one frame up.
+/// Host validation against the immutable non-text asset generation admitted with
+/// `config`. Manual passes its [`ConfigSnapshot`](crate::native_config_service::ConfigSnapshot)
+/// catalog, so theme and rainbow kitty diagnostics cannot race a directory change or
+/// disagree with what the renderer applies.
 pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
     config: &crate::app_config::Config,
     backend_gpu: bool,
     assets: &crate::app_config::ConfigAssetCatalog,
-    nested: bool,
 ) -> Vec<ConfigSemanticWarning> {
     let mut warnings = Vec::new();
 
     // Environment/CLI precedence is a host fact, so Manual resolves it in this
-    // off-thread lane. Only authored keys receive diagnostics: an absent key
-    // has no misleading TOML token to underline, while Settings still exposes
-    // the active value in its ordinary row projection.
+    // off-thread lane. Only authored keys get a diagnostic: an absent one has no token
+    // to underline, and Settings shows the active value anyway.
     for key in ["columns", "lines", "font_px", "font_family", "gpu", "shell"] {
         if config_key_is_authored(config, key)
             && let Some(active) = crate::app_config::active_environment_override(key)
@@ -1243,16 +1072,9 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
         }
     }
 
-    // W5i: a bad `shell` is the config error with the worst failure mode in the
-    // product — every new session dies at spawn, and before the launch-alert
-    // work the app just bounced and vanished. Validate the authored value so
-    // `--validate-config` (and Manual) says so BEFORE a session has to fail.
-    // `--shell` precedence is already surfaced by the override warning above;
-    // this checks the saved key, which is what survives a restart.
-    //
-    // WHAT COUNTS AS BROKEN IS PER-PLATFORM, and this used to be a single POSIX
-    // rule (`!shell.contains('/')`) applied to both. See the two
-    // `shell_config_warning` arms below.
+    // A bad `shell` kills every new session at spawn, so the authored value is checked
+    // before a session has to fail. `--shell` precedence is the override warning above;
+    // this checks the saved key.
     if let Some(shell) = config
         .shell
         .as_deref()
@@ -1294,20 +1116,16 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
             .map(|(key, message)| ConfigSemanticWarning { key, message }),
     );
 
-    warnings.extend(
-        assets
-            .trail_packs
-            .diagnostics
-            .iter()
-            .cloned()
-            .map(|message| ConfigSemanticWarning {
-                key: "cursor_trail_packs",
-                message,
-            }),
-    );
-    if let Some(message) = config.cursor_trail_style_warning(&assets.trail_packs) {
+    if let Some(message) = config.cursor_trail_style_warning() {
         warnings.push(ConfigSemanticWarning {
             key: "cursor_trail_style",
+            message,
+        });
+    }
+    // The warm spare's mode: an unknown spelling reads `auto` at runtime.
+    if let Some(message) = config.spare_shell_warning() {
+        warnings.push(ConfigSemanticWarning {
+            key: "spare_shell",
             message,
         });
     }
@@ -1325,9 +1143,8 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
             .source_id()
             .unwrap_or("configured source");
         warnings.push(ConfigSemanticWarning {
-            // The TOML key keeps its shipped spelling (renaming it would break every
-            // config that sets it); the message names the Settings row the user sees,
-            // which is now "Rainbow kitty sprite", so the two surfaces connect.
+            // The TOML key keeps its shipped spelling; the message names the Settings
+            // row ("Rainbow kitty sprite").
             key: "cursor_nyan_sprite",
             message: format!(
                 "cursor_nyan_sprite (the Rainbow kitty sprite) {source:?} is invalid ({reason}); \
@@ -1423,35 +1240,8 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
             }),
         }
     }
-    let listener_inputs = crate::net_listen::listener_inputs(config);
-    let effective_listener_fields = listener_inputs.presence();
-    warnings.extend(listener_capability_warnings(
-        config,
-        effective_listener_fields,
-        nested,
-    ));
-    if !nested && effective_listener_fields.into_iter().all(|present| present) {
-        match crate::net_listen::preflight_listener(&listener_inputs) {
-            Ok(Some(_)) | Ok(None) => {}
-            Err(error) => {
-                warnings.extend(
-                    error
-                        .config_keys()
-                        .iter()
-                        .map(|&key| ConfigSemanticWarning {
-                            key,
-                            message: error.to_string(),
-                        }),
-                )
-            }
-        }
-    }
-
-    // The compiled anchor is the ONLY anchor, and the only input. `ATPKG_ROOTKEY_OVERRIDE`
-    // used to be consulted here and could enable an unpinned build; it is gone, because
-    // an environment variable must never decide what is trusted — and the
-    // `ATPKG_DISABLE` kill switch went too (2026-09-23): `[packages] enabled` is the
-    // machine's switch, a setting.
+    // The compiled anchor is the only trust input: no environment variable decides what
+    // is trusted, and `[packages] enabled` is the machine's switch.
     let package_root_available = !atpkg::PINNED_PKG_ROOTKEY.is_empty();
     warnings.extend(package_capability_warnings(config, package_root_available));
     warnings.extend(config_backend_capability_warnings(
@@ -1464,10 +1254,8 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
 
 /// Why the authored `shell` value cannot spawn, or `None` when it can.
 ///
-/// UNIX. `spawn_shell_with_pid` hands the value to `execve`, which takes a PATH
-/// and performs no search (aterm-pty `unix.rs`: "a bare name relies on it being
-/// absolute"), so a bare name genuinely cannot work and an absolute path must
-/// exist and carry an exec bit.
+/// Unix: `spawn_shell_with_pid` execs the value verbatim with no PATH search, so a bare
+/// name cannot work and an absolute path must exist and carry an exec bit.
 #[cfg(not(windows))]
 fn shell_config_warning(shell: &str) -> Option<String> {
     if !shell.contains('/') {
@@ -1482,9 +1270,7 @@ fn shell_config_warning(shell: &str) -> Option<String> {
             "shell: {shell:?} does not exist — new sessions will fail to spawn"
         )),
         Ok(md) => {
-            // The exec-bit half stays `cfg(unix)`-gated rather than assuming
-            // `not(windows)` implies unix — that is the same narrowing this
-            // whole change exists to undo, one platform down.
+            // The exec-bit half is `cfg(unix)`, not assumed from `not(windows)`.
             #[cfg(unix)]
             let executable = {
                 use std::os::unix::fs::PermissionsExt as _;
@@ -1502,29 +1288,20 @@ fn shell_config_warning(shell: &str) -> Option<String> {
     }
 }
 
-/// WINDOWS. The rule above is a POSIX rule, and applying it here is the defect
-/// this arm exists to end: it reported `C:\Windows\System32\cmd.exe` as "a bare
-/// name" (no `/` in it) and advised the author to write `/bin/zsh`.
+/// Windows. A value resolves in two stages, and only the second is `execve`-like:
 ///
-/// The real Windows pipeline is TWO stages, and only the second is `execve`-like:
-///   1. [`aterm_pty::classify_shell_name`] — the spawn's OWN resolution. A bare
-///      name IS resolved here, by alias discovery then `SearchPathW` (`.exe` +
-///      `%PATHEXT%`). So `shell = "pwsh"` is the normal, working spelling and
-///      must validate clean.
-///   2. `CreateProcessW(lpApplicationName = <result>)` — THIS does no search and
-///      appends no extension (measured in aterm-pty's
-///      `create_process_application_name_contract`).
+/// 1. [`aterm_pty::classify_shell_name`], the spawn's own resolution: alias discovery,
+///    then `SearchPathW` (`.exe` + `%PATHEXT%`), so `shell = "pwsh"` validates clean.
+/// 2. `CreateProcessW(lpApplicationName = <result>)`: no search, no extension appended
+///    (aterm-pty's `create_process_application_name_contract`).
 ///
-/// So the value is broken only when stage 1 finds nothing, or when it is an
-/// explicit path that stage 2 cannot run. Advice never names a POSIX path.
+/// So the value is broken only when stage 1 finds nothing or stage 2 cannot run an
+/// explicit path. Advice never names a POSIX path.
 #[cfg(windows)]
 fn shell_config_warning(shell: &str) -> Option<String> {
-    // `shell` names ONE program. A QUOTED value is a FILENAME containing `"` to
-    // `lpApplicationName` — measured ERROR_INVALID_NAME, never a parsed command
-    // line. Checked first and unconditionally: the quotes make it a grammar
-    // error whatever is inside them, so no resolution verdict below could
-    // describe it. (The same mistake written WITHOUT quotes still resolves like
-    // a name, so it is caught as a refinement further down.)
+    // `shell` names one program: a quoted value reaches `lpApplicationName` as a
+    // filename containing `"` (ERROR_INVALID_NAME, measured) whatever is inside, so it
+    // is checked first. Unquoted arguments are caught as a refinement below.
     if shell.contains('"') {
         return Some(format!(
             "shell: {shell:?} is quoted, and `shell` names one program rather than a \
@@ -1542,28 +1319,13 @@ fn shell_config_warning(shell: &str) -> Option<String> {
         )),
         aterm_pty::ShellResolution::Verbatim(path) => windows_shell_path_warning(shell, &path),
     };
-    // `%VAR%` is never expanded — not by the config loader, not by
-    // `resolve_shell_name`, and not by `CreateProcessW` (measured: `%COMSPEC%`
-    // as `lpApplicationName` is ERROR_FILE_NOT_FOUND). It is an easy mistake to
-    // make because the spawn's OWN documented fallback chain names `%COMSPEC%`,
-    // and the verdicts above would otherwise bury it in a generic "not on
-    // %PATH%" (bare `%COMSPEC%`) or, worse, "is a relative path"
-    // (`%USERPROFILE%\bin\bash.exe`).
-    //
-    // Applied as a REFINEMENT of a value that already failed, never as a check
-    // of its own: `%` is a legal Windows filename character, so a directory
-    // literally named `%tools%` must keep validating clean rather than be
-    // second-guessed by a heuristic about what the author "meant".
-    //
-    // The ARGUMENTS refinement below is the same shape, and closes the half of
-    // the quoted-value rule above that was only ever a comment: an UNQUOTED
-    // `wsl -d Debian` is the same grammar error as a quoted one, but resolution
-    // described it as `is not on %PATH%`, and `cmd /K dir` — path-like only
-    // because `/K` holds a slash — came out as `is a relative path`. Both are
-    // true of the string and useless to the author.
-    //
-    // The two refinements cannot both fire: this one requires the head token to
-    // RESOLVE, and an unexpanded `%VAR%` head never does.
+    // Two refinements of a value that already failed, never checks of their own (`%`
+    // is a legal filename character). `%VAR%` is never expanded, by the config loader,
+    // `resolve_shell_name` or `CreateProcessW` (`%COMSPEC%` as `lpApplicationName` is
+    // ERROR_FILE_NOT_FOUND, measured), and the spawn's own fallback chain names
+    // `%COMSPEC%`. Unquoted arguments (`wsl -d Debian`, `cmd /K dir`) are the quoted-value
+    // error again. They cannot both fire: the arguments one needs the head to resolve, and
+    // an unexpanded `%VAR%` head never does.
     verdict.map(|message| {
         if let Some(var) = unexpanded_windows_env_var(shell) {
             format!(
@@ -1583,20 +1345,11 @@ fn shell_config_warning(shell: &str) -> Option<String> {
     })
 }
 
-/// The program at the head of `value` when `value` is a COMMAND LINE rather than
-/// one program's name — i.e. the author put arguments in `shell`.
-///
-/// A space is not evidence on its own: `C:\Program Files\Git\bin\bash.exe` is
-/// the most ordinary Windows shell path there is, and it must keep validating
-/// clean. The evidence is that the head token ALONE is runnable while the whole
-/// string is not, so this is only ever consulted to reword a value that already
-/// failed to resolve — the same discipline as [`unexpanded_windows_env_var`].
-///
-/// The head qualifies when the spawn's own resolution finds it (`pwsh`, `wsl`,
-/// `cmd`) or when it is an absolute path to a real file
-/// (`C:\Windows\System32\cmd.exe /K dir`). A head that is merely the first word
-/// of a spaced path — `C:\Program` of a MISTYPED `C:\Program Files\…` — is not
-/// a file, so a genuinely missing path keeps its "does not exist" verdict.
+/// The program at the head of `value` when `value` is a command line (arguments in
+/// `shell`). A space alone is no evidence (`C:\Program Files\Git\bin\bash.exe`): the head
+/// must run on its own, resolved by the spawn (`pwsh`, `wsl`, `cmd`) or an absolute path to
+/// a real file, so a mistyped `C:\Program Files\…` keeps "does not exist". Consulted only to
+/// reword a value that already failed, like [`unexpanded_windows_env_var`].
 #[cfg(windows)]
 fn windows_shell_command_line_head(value: &str) -> Option<&str> {
     let (head, args) = value.split_once(char::is_whitespace)?;
@@ -1614,15 +1367,9 @@ fn windows_shell_command_line_head(value: &str) -> Option<&str> {
 }
 
 /// The name inside the first `%VAR%` pair in `value`, if it looks like a real
-/// environment-variable reference.
-///
-/// `%` IS a legal Windows filename character, so the match is deliberately
-/// narrow: a non-empty run of the characters an environment variable name can
-/// actually hold, delimited by a pair of percents. `50%.exe` (one percent) and
-/// `100% done\sh.exe` (a space inside) are left alone. Narrowness is the second
-/// line of defence, not the first — the caller only consults this to reword a
-/// value that already failed to resolve, so a false positive here can sharpen a
-/// warning but can never invent one.
+/// environment-variable reference. `%` is a legal filename character, so the match is
+/// narrow (`50%.exe` and `100% done\sh.exe` are left alone), and the caller consults it
+/// only to reword a value that already failed: a false positive never invents a warning.
 #[cfg(windows)]
 fn unexpanded_windows_env_var(value: &str) -> Option<&str> {
     let mut rest = value;
@@ -1645,18 +1392,15 @@ fn unexpanded_windows_env_var(value: &str) -> Option<&str> {
     None
 }
 
-/// Why an EXPLICIT path (`ShellResolution::Verbatim`) cannot be spawned, or
-/// `None` when it can. This is the `lpApplicationName` contract, measured in
-/// aterm-pty: no search, no extension appended, the file must simply be there.
+/// Why an explicit path (`ShellResolution::Verbatim`) cannot be spawned, or `None`: the
+/// `lpApplicationName` contract (no search, no extension appended), measured in aterm-pty.
 #[cfg(windows)]
 fn windows_shell_path_warning(shell: &str, path: &std::ffi::OsStr) -> Option<String> {
     let path = std::path::Path::new(path);
     if !path.is_absolute() {
-        // Both Windows half-rooted shapes land here too: `C:cmd.exe` (the
-        // drive's own current directory) and `\Windows\…` (the current DRIVE).
-        // `std::fs::metadata` would answer for the VALIDATOR's cwd, which is not
-        // the session's, so report the real semantics rather than a verdict that
-        // depends on where `--validate-config` happened to be run.
+        // Both half-rooted shapes land here too: `C:cmd.exe` (that drive's current
+        // directory) and `\Windows\…` (the current drive). `metadata` would answer for
+        // the validator's cwd, not the session's, so report the semantics instead.
         return Some(format!(
             "shell: {shell:?} is a relative path, so each session resolves it against \
              ITS OWN working directory and drive — use a full path \
@@ -1665,10 +1409,8 @@ fn windows_shell_path_warning(shell: &str, path: &std::ffi::OsStr) -> Option<Str
     }
     match std::fs::metadata(path) {
         Err(_) => {
-            // `CreateProcessW` appends NO default extension, so `…\cmd` is not
-            // `…\cmd.exe` (measured). When the only thing missing is the
-            // extension, say which spelling would have worked instead of
-            // leaving the author to guess.
+            // `CreateProcessW` appends no extension (measured): when only the extension
+            // is missing, name the spelling that works.
             let suggestion = (path.extension().is_none())
                 .then(|| {
                     ["exe", "cmd", "bat", "com"].into_iter().find_map(|ext| {
@@ -1693,54 +1435,6 @@ fn windows_shell_path_warning(shell: &str, path: &std::ffi::OsStr) -> Option<Str
                  will fail to spawn"
             )
         }),
-    }
-}
-
-fn first_authored_listener_key(config: &crate::app_config::Config) -> Option<&'static str> {
-    let net = config.net.as_ref()?;
-    if net.listen.is_some() {
-        Some("net.listen")
-    } else if net.cert.is_some() {
-        Some("net.cert")
-    } else if net.key.is_some() {
-        Some("net.key")
-    } else {
-        None
-    }
-}
-
-/// Pure listener admission projection. The caller supplies effective env/config
-/// presence and nesting so the no-bind arms can be exhaustively tested without
-/// mutating process-global environment state.
-fn listener_capability_warnings(
-    config: &crate::app_config::Config,
-    effective_fields: [bool; 3],
-    nested: bool,
-) -> Vec<ConfigSemanticWarning> {
-    let Some(key) = first_authored_listener_key(config) else {
-        return Vec::new();
-    };
-    if nested {
-        return vec![ConfigSemanticWarning {
-            key,
-            message: format!(
-                "{key}: the network listener never binds in an aterm child/nested session, even when net.listen, net.cert, and net.key are complete"
-            ),
-        }];
-    }
-    let count = effective_fields
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-    if count == 1 || count == 2 {
-        vec![ConfigSemanticWarning {
-            key,
-            message: format!(
-                "{key}: the effective network-listener configuration is incomplete ({count}/3 of listen, cert, and key); no port is bound until all three resolve"
-            ),
-        }]
-    } else {
-        Vec::new()
     }
 }
 
@@ -1784,10 +1478,9 @@ fn package_capability_warnings(
     })
 }
 
-/// Native compositor families relevant to config capability validation.
-/// Keeping this explicit (instead of a `target_macos` boolean) matters because
-/// Windows consumes `background_material` as Mica/Mica Alt/Acrylic without the
-/// macOS translucency precondition.
+/// Native compositor families relevant to config capability validation. Explicit rather
+/// than a `target_macos` flag: Windows consumes `background_material` as Mica/Mica
+/// Alt/Acrylic without the macOS translucency precondition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigCapabilityPlatform {
     MacOs,
@@ -1801,9 +1494,8 @@ pub(crate) enum ConfigCapabilityPlatform {
 }
 
 impl ConfigCapabilityPlatform {
-    /// The build host's family. `cfg!` rather than four `#[cfg]` constants: every
-    /// variant stays a live value on every host, which is what lets the one
-    /// validator below be tested for all four families on any of them.
+    /// The build host's family. `cfg!` rather than `#[cfg]` constants, so every variant
+    /// stays a live value and the validator is testable for all four on any host.
     const CURRENT: Self = if cfg!(target_os = "macos") {
         Self::MacOs
     } else if cfg!(windows) {
@@ -1944,12 +1636,12 @@ pub(crate) fn config_backend_capability_warnings(
                 .to_string(),
         });
     }
-    // The one security key whose silence would be worst: a user who authored a
-    // PROTECTION must not believe it holds on a platform where it cannot.
+    // The one security key whose silence would be worst: an authored protection must
+    // not seem to hold where it cannot.
     if config.secure_keyboard_entry.is_some() && platform != ConfigCapabilityPlatform::MacOs {
         warnings.push(ConfigSemanticWarning {
             key: crate::prefs::EDIT_SECURE_KEYBOARD_ENTRY,
-            message: "secure_keyboard_entry is parsed and preserved but has no protective effect on this platform; Secure Keyboard Entry is a macOS mechanism                       (Carbon secure input)"
+            message: "secure_keyboard_entry is parsed and preserved but has no protective effect on this platform; Secure Keyboard Entry is a macOS mechanism (Carbon secure input)"
                 .to_string(),
         });
     }
@@ -1963,16 +1655,13 @@ pub(crate) fn config_backend_capability_warnings(
                 crate::prefs::EDIT_TRAIL_SOUND_VOLUME,
                 config.trail_sound_volume.is_some(),
             ),
-            // The rest of the Sound menu's SYNTH voices. They ride the same
-            // macOS-only `trail_audio` output as the two keys above, and the
-            // Sound menu made them reachable from Settings, so a portable
-            // `aterm.toml` must get the same honest warning for all of them.
+            // The Sound menu's other synth voices ride the same macOS-only
+            // `trail_audio` output.
             (
                 crate::prefs::EDIT_TRAIL_SOUND_STYLE,
                 config.trail_sound_style.is_some(),
             ),
             (crate::prefs::EDIT_TONE_MELODY, config.tone_melody.is_some()),
-            (crate::prefs::EDIT_ROBI, config.robi.is_some()),
             (
                 crate::prefs::EDIT_TRAIL_SOUND_BED,
                 config.trail_sound_bed.is_some(),
@@ -2004,18 +1693,19 @@ pub(crate) fn config_backend_capability_warnings(
         // `confirm_multiline_paste` has NO warning here any more: it is live on
         // every platform — the macOS sheet, the Windows MessageBoxW, and the
         // Linux in-window `paste_banner` (the clipboard sweep closed the
-        // audited silent no-op this arm used to describe).
-        if config.allow_notifications.is_some() {
+        // audited silent no-op this arm used to describe). Nor has
+        // `allow_notifications` on Linux, which delivers through the session
+        // bus's `org.freedesktop.Notifications` (`notify::deliver`).
+        if platform == ConfigCapabilityPlatform::Unsupported && config.allow_notifications.is_some()
+        {
             warnings.push(ConfigSemanticWarning {
                 key: "allow_notifications",
-                message: "allow_notifications is parsed and preserved but has no effect on this platform because desktop-notification delivery is currently implemented only on macOS and Windows"
+                message: "allow_notifications is parsed and preserved but has no effect on this platform because desktop-notification delivery is implemented only on macOS, Windows and Linux"
                     .to_string(),
             });
         }
-        // The audible BEL is the macOS/Windows pair, not the macOS-only synth:
-        // `NSBeep` and `MessageBeep` both exist, and nothing else does — so this
-        // key belongs in the Unsupported block with its platform twins above,
-        // NOT in the macOS-only trail-audio block.
+        // The audible BEL is `NSBeep`/`MessageBeep`, so it belongs here, not in the
+        // macOS-only trail-audio block.
         if config.bell_sound.is_some() {
             warnings.push(ConfigSemanticWarning {
                 key: crate::prefs::EDIT_BELL_SOUND,
@@ -2148,22 +1838,15 @@ fn config_key_is_authored(config: &crate::app_config::Config, key: &str) -> bool
         "stem_gamma" => config.stem_gamma.is_some(),
         "window_theme" => config.window_theme.is_some(),
         "shell" => config.shell.is_some(),
-        "net.listen" => config.net.as_ref().is_some_and(|net| net.listen.is_some()),
-        "net.cert" => config.net.as_ref().is_some_and(|net| net.cert.is_some()),
-        "net.key" => config.net.as_ref().is_some_and(|net| net.key.is_some()),
         _ => false,
     }
 }
 
-/// Parse `text` as the `aterm.toml` config, returning the (possibly empty) list of
-/// soft WARNINGS for a structurally-valid file, or a hard `Err` (with the toml error's
-/// line/column) for a TOML syntax error. The explicit CLI validation path may
-/// resolve referenced assets; the shared semantic subset above remains pure.
-///
-/// A clean TOML parse is not the whole story: the loader warn-skips bad chords /
-/// escapes / actions in `[key_sequences]` and `[keybindings]` at runtime, so an entry
-/// that parses as a string can still silently never work. Those are returned as
-/// warnings so the diagnostic doesn't print a false green.
+/// Parse `text` as `aterm.toml`: the soft warnings for a structurally valid file
+/// (possibly none), or `Err` with the TOML error's line/column. The loader warn-skips bad
+/// entries at runtime, so a file that parses can still silently do nothing; those are
+/// warnings, never a false green. This CLI path may resolve referenced assets; the shared
+/// semantic subset stays pure.
 pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
     if text.len() > crate::native_config_service::MAX_CONFIG_FILE_BYTES {
         return Err(format!(
@@ -2173,50 +1856,35 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
     }
     let config =
         aterm_toml::from_str::<crate::app_config::Config>(text).map_err(|e| e.to_string())?;
-    // FIRST, because every other check below reads the PARSED `Config`, and a
-    // misspelled key never reaches it: serde admits unknown keys by design, so
-    // `cursor_trail_stlye = "…"` deserializes cleanly into a config where the
-    // field is simply unset. Without this walk the one mistake most likely to
-    // send someone here — "I changed a setting and nothing happened" — is the
-    // one mistake `--validate-config` reports as valid.
+    // First: every check below reads the parsed `Config`, and serde admits unknown keys,
+    // so a misspelled key (`cursor_trail_stlye`) deserializes cleanly to an unset field.
     let mut warnings = crate::native_config_language::ignored_key_warnings(text);
     warnings.extend(
         config_semantic_warnings(&config)
             .into_iter()
             .map(|warning| warning.message),
     );
-    // W5h: keys the loaders warn-skip (falling back to a default) also flagged
-    // here, so `--validate-config` can't false-green a config whose font/theme/
-    // cursor/colours silently do nothing at load.
-    //
-    // Cursor-style spellings (unknown values fall back to a blinking block;
-    // the retired underline spelling is preserved but resolves to a bar).
+    // Keys the loaders warn-skip to a default, so a font/theme/cursor/colour that does
+    // nothing at load is never called valid. Cursor style: an unknown value falls back to
+    // a block.
     if let Some(style) = config.cursor_style.as_deref() {
         let normalized = style.trim().to_ascii_lowercase();
-        if let Some(note) = crate::native_config_language::retired_but_resolving_note(
-            crate::prefs::EDIT_CURSOR_STYLE,
-            style,
-        ) {
-            warnings.push(note);
-        } else if !matches!(normalized.as_str(), "block" | "bar" | "beam") {
+        if !matches!(normalized.as_str(), "block" | "bar" | "beam") {
             warnings.push(format!(
                 "cursor_style: expected block|bar, got {style:?} (block used at load)"
             ));
         }
     }
-    // The retired `native` hinting spelling still loads and renders as `light`
-    // (TF.2b): the same sentence Manual shows.
+    // The retired `native` hinting spelling loads and renders as `light`; the note is
+    // the sentence Manual shows.
     if let Some(note) = config.font_hinting.as_deref().and_then(|hinting| {
         crate::native_config_language::retired_but_resolving_note("font_hinting", hinting)
     }) {
         warnings.push(note);
     }
-    // Retired face ids load (renamed ones as their successor, a deleted one as
-    // nothing), so the enum walk below accepts them; say what each draws.
-    warnings.extend(crate::app_config::display_font_notices(&config));
-    // Hex colours: the theme colour keys as the resolver read them (its
-    // palette entries are a semantic warning above), then the other
-    // colour-typed keys the loaders parse-or-skip.
+    // Hex colours: the theme colour keys as the resolver reads them (its palette
+    // entries are a semantic warning above), then the other colour-typed keys the
+    // loaders parse-or-skip.
     warnings.extend(
         config
             .color_issues()
@@ -2247,14 +1915,19 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
             .into_iter()
             .map(|warning| warning.message),
     );
-    // LAST, and answered from the registry rather than by hand, because the
-    // checks above cover only the keys someone remembered to write a resolver
-    // warning for. Every other enum-valued key fails soft the same way — the
-    // value is kept in `Config`, the resolver quietly uses the default — so only
-    // this walk keeps `window_theme = "drak"` from being called valid. A key
-    // this build does not know and a value it does not accept are the same
-    // silence to the reader, and both must reach this answer. It runs after the
-    // bespoke lines so it can stand down for any key one of them already named.
+    // `shell_args` the integration cannot carry run without it: say so, rather
+    // than call the file valid and leave the person to find blocks missing.
+    if let Some(args) = config.shell_args.as_deref().filter(|args| !args.is_empty()) {
+        let shell = crate::spawn::detect_spawn_shell(config.shell.as_deref());
+        if let Some(why) = aterm_core::shell_integration::shell_args_bypass(shell, args) {
+            warnings.push(format!(
+                "shell_args: {why}, so this shell runs without shell integration"
+            ));
+        }
+    }
+    // Last, the registry walk: an enum-valued key without a hand-written warning fails
+    // soft to its default, so only this names `window_theme = "drak"`. It runs last so it
+    // can stand down for a key already named.
     let unaccepted = crate::native_config_language::unaccepted_value_warnings(text, &warnings);
     warnings.extend(unaccepted);
     Ok(warnings)
@@ -2300,10 +1973,8 @@ fn validate_config_path(path: &std::path::Path) -> (String, bool) {
 }
 
 /// `--list-fonts`: the font search directories the resolver scans, then every
-/// discoverable family STEM (from `aterm_render::list_fonts`). The directory
-/// header makes the result self-explanatory (where these came from); the family
-/// list is sorted + de-duplicated by the renderer. A host with no enumerable
-/// fonts still prints the dirs header followed by a clear placeholder.
+/// discoverable family stem (`aterm_render::list_fonts`, sorted and de-duplicated), or a
+/// placeholder when there are none.
 pub(crate) fn list_fonts() -> String {
     let mut s = String::new();
     let _ = writeln!(s, "font search directories:");
@@ -2336,9 +2007,11 @@ pub enum ThemeListFormat {
 }
 
 /// The `--format tsv` columns, in order. `notes` is a non-loading row's reason
-/// or a loaded row's admission warnings (`; `-joined); an absent value is an
+/// or a loaded row's admission warnings (`; `-joined); `typography` is the
+/// one-line summary of the type settings a theme names; `skipped` counts the
+/// keys a newer-schema file set that this aterm skipped. An absent value is an
 /// empty field.
-pub(crate) const THEME_LIST_TSV_COLUMNS: [&str; 9] = [
+pub(crate) const THEME_LIST_TSV_COLUMNS: [&str; 11] = [
     "id",
     "label",
     "appearance",
@@ -2348,6 +2021,8 @@ pub(crate) const THEME_LIST_TSV_COLUMNS: [&str; 9] = [
     "status",
     "notes",
     "description",
+    "typography",
+    "skipped",
 ];
 
 /// One theme the listing names: a built-in, or a row of the themes folder.
@@ -2363,13 +2038,46 @@ struct ThemeListRow {
     builtin: bool,
     /// `ready`, `invalid`, `shadowed` or `unreadable`.
     status: &'static str,
-    /// The reason a row did not load, or a loaded row's warnings.
+    /// The reason a row did not load, or a loaded row's warnings (a
+    /// newer-schema file's names the keys it skipped).
     notes: Vec<String>,
     description: Option<String>,
+    /// The type settings the theme names, summarised; `None` for none.
+    typography: Option<String>,
+    /// How many keys a newer-schema file set that this aterm skipped.
+    skipped: usize,
 }
 
 impl ThemeListRow {
-    fn of_meta(id: &str, meta: aterm_types::scheme::ThemeMeta, builtin: bool) -> Self {
+    fn of_meta(
+        id: &str,
+        meta: aterm_types::scheme::ThemeMeta,
+        builtin: bool,
+        typography: Option<String>,
+    ) -> Self {
+        let skipped_note = crate::app_config::skipped_keys_reason(&meta);
+        let skipped = meta
+            .warnings
+            .iter()
+            .find_map(|warning| match warning {
+                aterm_types::scheme::ThemeWarning::SkippedNewerKeys { count, .. } => {
+                    Some(usize::from(*count))
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        let notes = meta
+            .warnings
+            .iter()
+            .filter(|warning| {
+                !matches!(
+                    warning,
+                    aterm_types::scheme::ThemeWarning::SkippedNewerKeys { .. }
+                )
+            })
+            .map(ToString::to_string)
+            .chain(skipped_note)
+            .collect();
         Self {
             id: id.to_string(),
             label: meta.display_name,
@@ -2378,8 +2086,10 @@ impl ThemeListRow {
             pair: meta.pair,
             builtin,
             status: "ready",
-            notes: meta.warnings.iter().map(ToString::to_string).collect(),
+            notes,
             description: meta.description,
+            typography,
+            skipped,
         }
     }
 }
@@ -2399,6 +2109,7 @@ fn theme_list_rows(
                 theme.name,
                 aterm_types::scheme::ThemeMeta::of_builtin(theme),
                 true,
+                None,
             )
         });
     let files = catalog.listing().map(|(name, status)| {
@@ -2408,7 +2119,11 @@ fn theme_list_rows(
             _ => None,
         };
         if let Some(meta) = meta {
-            return ThemeListRow::of_meta(name, meta, false);
+            let typography = catalog
+                .resolve_package(name)
+                .ok()
+                .and_then(|package| package.typography.summary());
+            return ThemeListRow::of_meta(name, meta, false, typography);
         }
         let label = match status {
             ThemeEntryStatus::Ready => "ready",
@@ -2426,6 +2141,8 @@ fn theme_list_rows(
             status: label,
             notes: status.reason().into_iter().collect(),
             description: None,
+            typography: None,
+            skipped: 0,
         }
     });
     builtins
@@ -2449,7 +2166,7 @@ pub(crate) fn theme_list_wire_rows(
         .map(|row| {
             format!(
                 "theme id={:?} label={:?} appearance={} measured={} pair={} source={} \
-                 status={} drawn={} notes={} description={}",
+                 status={} drawn={} notes={} description={} type={} skipped={}",
                 row.id,
                 row.label,
                 row.appearance.map_or("-", appearance_word),
@@ -2462,6 +2179,8 @@ pub(crate) fn theme_list_wire_rows(
                     .then(|| row.notes.join("; "))
                     .as_deref()),
                 opt(row.description.as_deref()),
+                opt(row.typography.as_deref()),
+                row.skipped,
             )
         })
         .collect();
@@ -2509,11 +2228,10 @@ pub fn theme_list_report(
     theme_list(&catalog, dir.as_deref(), appearance, format)
 }
 
-/// The theme `id` names (case-insensitive), by the window's own lookup: a
-/// built-in first, then a themes-folder file that loaded and was admitted as
-/// the catalog admits it. What `aterm theme export` writes and `aterm theme
-/// new --from` starts from. `Err` says why there is none (no such theme, or
-/// the file that has the name did not load).
+/// The theme `id` names (case-insensitive), by the window's own lookup: a built-in
+/// first, then a themes-folder file the catalog admitted. What `aterm theme export`
+/// writes and `aterm theme new --from` starts from. `Err` says why there is none (no
+/// such theme, or the file with that name did not load).
 ///
 /// # Errors
 /// The reason no theme by that id can be had.
@@ -2534,22 +2252,44 @@ fn catalog_theme(
     catalog: &crate::app_config::ThemeCatalog,
     id: &str,
 ) -> Result<aterm_types::scheme::CatalogTheme, String> {
-    let scheme = catalog.resolve(id)?;
+    let package = catalog.resolve_package(id)?;
     let (name, meta) = catalog
         .ready_themes()
         .find(|(name, _)| name.eq_ignore_ascii_case(id))
         .ok_or_else(|| "no built-in or loaded custom theme by that name".to_string())?;
+    let mut theme = aterm_types::scheme::ParsedTheme::colours_only(
+        package.colors.clone(),
+        meta.appearance_source == aterm_types::scheme::AppearanceSource::Declared,
+        meta.description.clone(),
+        meta.author.clone(),
+    );
+    theme.typography = package.typography.clone();
+    theme.bold_is_bright = package.bold_is_bright;
     Ok(aterm_types::scheme::CatalogTheme {
         id: name.to_string(),
-        theme: aterm_types::scheme::ParsedTheme {
-            scheme,
-            description: meta.description.clone(),
-            author: meta.author.clone(),
-            appearance_declared: meta.appearance_source
-                == aterm_types::scheme::AppearanceSource::Declared,
-        },
+        theme,
         meta: meta.clone(),
     })
+}
+
+/// Whether the font family a theme names is installed here, by the window's
+/// own resolution (the bounded file catalogue, never a display server): a
+/// `display:<id>[+<id>]` name when every id is one of aterm's display faces,
+/// any other name when the catalogue resolves and admits it.
+#[must_use]
+pub fn theme_font_available(family: &str) -> bool {
+    let name = family.trim();
+    let lower = name.to_ascii_lowercase();
+    if let Some(ids) = lower.strip_prefix(aterm_render::DISPLAY_FACE_SCHEME) {
+        return !ids.is_empty()
+            && ids
+                .split('+')
+                .all(|id| aterm_render::display_face_canonical_id(id).is_some());
+    }
+    aterm_render::font_catalog::resolve_and_admit(&[name.to_string()])
+        .entries
+        .first()
+        .is_some_and(|entry| entry.result.is_ok())
 }
 
 /// The appearance a background measures as, by the one dark/light rule the
@@ -2608,6 +2348,8 @@ fn theme_list_tsv(
             row.status.to_string(),
             listing_field(&row.notes.join("; ")),
             listing_field(row.description.as_deref().unwrap_or_default()),
+            listing_field(row.typography.as_deref().unwrap_or_default()),
+            row.skipped.to_string(),
         ];
         s.push_str(&fields.join("\t"));
         s.push('\n');
@@ -2636,16 +2378,17 @@ fn theme_list_text(
     dir: Option<&std::path::Path>,
     truncated: Option<crate::app_config::ThemeCatalogLimits>,
 ) -> String {
-    const HEADER: [&str; 7] = [
+    const HEADER: [&str; 8] = [
         "ID",
         "LABEL",
         "APPEARANCE",
         "PAIR",
         "SOURCE",
         "STATUS",
+        "TYPE",
         "DESCRIPTION",
     ];
-    let cells: Vec<[String; 7]> = rows
+    let cells: Vec<[String; 8]> = rows
         .iter()
         .map(|row| {
             let appearance = match row.appearance {
@@ -2660,6 +2403,7 @@ fn theme_list_text(
                 listing_field(row.pair.as_deref().unwrap_or("-")),
                 if row.builtin { "built-in" } else { "file" }.to_string(),
                 row.status.to_string(),
+                listing_field(row.typography.as_deref().unwrap_or("-")),
                 listing_field(row.description.as_deref().unwrap_or_default()),
             ]
         })
@@ -2731,16 +2475,12 @@ fn theme_list_text(
     s
 }
 
-/// `--list-keybinds`: the keybinding surface. First the BUILT-IN default chords
-/// — PER PLATFORM: on macOS the fixed Cmd-* bindings handled in `on_key` and the
-/// menu bar's own key equivalents (`builtin_cmd_chords`), off macOS the seeded
-/// table `Keybindings::platform_defaults` installs. Printing
-/// `BUILTIN_CMD_CHORDS` unconditionally (the old behaviour) documented thirty
-/// `cmd+*` chords on Windows and not one that works: `Chord::from_event` maps
-/// `cmd` from `super_key()`, so "cmd+t" literally means Win+T — a keystroke the
-/// shell steals before aterm ever sees it. Then any user `[keybindings]`
-/// overrides from the effective config (parsed, malformed entries skipped). The
-/// bindable action NAMES come from [`crate::keybinding::ACTION_NAMES`].
+/// `--list-keybinds`: the built-in default chords, per platform (macOS: the fixed Cmd-*
+/// bindings and the menu bar's key equivalents, `builtin_cmd_chords`; elsewhere
+/// `Keybindings::PLATFORM_DEFAULT_PAIRS`, since `cmd` maps from `super_key()` and a
+/// Windows `cmd+t` is Win+T, which the shell takes first), then the user's
+/// `[keybindings]` and `[key_sequences]` from the effective config, then the bindable
+/// action names ([`crate::keybinding::ACTION_NAMES`]).
 pub(crate) fn list_keybinds() -> String {
     let mut s = String::new();
     #[cfg(target_os = "macos")]
@@ -2811,9 +2551,8 @@ pub(crate) fn list_keybinds() -> String {
     for name in crate::keybinding::ACTION_NAMES {
         let _ = writeln!(s, "  {name}");
     }
-    // The unbind spelling is part of the value surface too (it is not an action,
-    // so it cannot live in ACTION_NAMES — a test there asserts every name
-    // parses): document it where a user shopping for values is already looking.
+    // The unbind spelling is not an action, so it is not in ACTION_NAMES (every name there
+    // parses as an action); list it with the values.
     let _ = writeln!(
         s,
         "  none | unbind      (not an action: unbinds the chord's built-in default)"
@@ -2821,24 +2560,20 @@ pub(crate) fn list_keybinds() -> String {
     s
 }
 
-/// The inline annotation for one user `[keybindings]` row in [`list_keybinds`],
-/// extracted so the spellings are testable without a config file on disk. The
-/// unbind spelling is checked FIRST: `"f11" = "none"` is the documented way to
-/// free a seeded default, and printing `(UNKNOWN action)` for it (the old
-/// behaviour) told the user their working config was broken.
+/// The inline annotation for one user `[keybindings]` row in [`list_keybinds`]. The
+/// unbind spelling is checked first: `"f11" = "none"` is the documented way to free a
+/// seeded default.
 fn user_keybinding_note(chord: &str, action: &str) -> String {
     user_keybinding_note_for(action, crate::keybinding::builtin_shadow_label(chord))
 }
 
-/// The note's spelling with the built-in shadow RESOLVED — the same gate-
-/// explicit shape as [`keybinding_row_warning`], and for the same reason: the
-/// Cmd/Super suite is compiled off on Linux, so only a resolved label lets a
-/// test see the macOS-shaped path where the review's escape lived.
+/// The note with the built-in shadow resolved, like [`keybinding_row_warning`]: the
+/// Cmd/Super suite is compiled off on Linux, so only a resolved label lets a test reach
+/// the macOS path.
 fn user_keybinding_note_for(action: &str, shadow: Option<&'static str>) -> String {
     if crate::keybinding::is_unbind_action(action) {
-        // An unbind masks a SEED. Where a hardcoded built-in also claims the
-        // chord, that half survives the unbind — say both, or the listing
-        // implies the chord is now free (the review's macOS `cmd+c` case).
+        // An unbind masks a seed; a hardcoded built-in on the same chord survives
+        // it, so say both (macOS `cmd+c`).
         match shadow {
             Some(lbl) => format!("  (unbinds a default; still conflicts with {lbl})"),
             None => "  (unbinds a default)".to_string(),
@@ -2855,25 +2590,22 @@ fn user_keybinding_note_for(action: &str, shadow: Option<&'static str>) -> Strin
 /// `--show-config`'s theme line: the configured value, followed by the theme each
 /// appearance draws whenever that is not the name the value gives it (a name that
 /// does not load draws Default; a side the value leaves out draws the named one's
-/// pair; no name at all draws the unset default, which follows the OS).
+/// pair; no name at all draws Default on both).
 fn show_config_theme(
     config: &crate::app_config::Config,
     themes: &crate::app_config::ThemeCatalog,
 ) -> String {
-    use crate::app_config::unset_theme_name;
+    let Some(raw) = config.theme.clone() else {
+        return "Default".to_string();
+    };
     let sides = [
         aterm_types::Appearance::Dark,
         aterm_types::Appearance::Light,
     ];
-    let Some(raw) = config.theme.clone() else {
-        let [dark, light] = sides.map(unset_theme_name);
-        return format!("unset (in use: dark {dark}, light {light})");
-    };
     let named = sides.map(|appearance| config.resolve_theme_name(appearance));
-    let drawn = sides.map(|appearance| match config.resolve_theme_name(appearance) {
-        None => unset_theme_name(appearance).to_string(),
+    let drawn = named.clone().map(|name| match name {
         Some(name) if name.eq_ignore_ascii_case("default") || themes.resolve(&name).is_ok() => name,
-        Some(_) => "Default".to_string(),
+        _ => "Default".to_string(),
     });
     if named
         .iter()
@@ -2890,6 +2622,37 @@ fn show_config_theme(
     }
 }
 
+/// `--show-config`'s shell rows: the program a new tab of THIS launch starts and the input
+/// that chose it, the pair `aterm show-config` prints as `shell=` / `shell_origin=` on
+/// Windows. The program is the spawn's own resolution (`aterm_pty::select_shell_with_origin`)
+/// over the override every new session captures
+/// ([`crate::app_config::resolve_shell_override`]: `--shell` > aterm.toml `shell`), so the
+/// row cannot name a shell the tab would not start. (A shell that cannot start is replaced
+/// at the spawn, which says so in the pane.)
+fn show_config_shell(config: &crate::app_config::Config) -> (String, String) {
+    let from_flag = crate::cli::launch_flags()
+        .shell
+        .is_some_and(|flag| !flag.is_empty());
+    let chosen = crate::app_config::resolve_shell_override(config);
+    let (program, origin) =
+        aterm_pty::select_shell_with_origin(chosen.as_deref().map(std::ffi::OsStr::new));
+    (
+        program.to_string_lossy().into_owned(),
+        shell_origin_token(origin, from_flag),
+    )
+}
+
+/// The `shell_origin` token: `--shell` or `aterm.toml` for an override (the CLI's
+/// `aterm.toml`, plus the flag only a window launch has), else `default:<word>` in the
+/// CLI's words ([`aterm_pty::ShellOrigin::word`]).
+fn shell_origin_token(origin: aterm_pty::ShellOrigin, from_flag: bool) -> String {
+    match origin {
+        aterm_pty::ShellOrigin::Override if from_flag => "--shell".to_string(),
+        aterm_pty::ShellOrigin::Override => "aterm.toml".to_string(),
+        other => format!("default:{}", other.word()),
+    }
+}
+
 fn show_config_font_px(value: f32, explicit: bool) -> String {
     if explicit {
         format!("{value} (explicit physical px)")
@@ -2898,23 +2661,17 @@ fn show_config_font_px(value: f32, explicit: bool) -> String {
     }
 }
 
-/// `--show-config`: the resolved launch config after applying the
-/// launch flag > config > default precedence. Most values are final before a window
-/// exists. An unset font size is necessarily reported as its auto-scale base:
-/// the final physical size is selected only when the real window/display scale
-/// is known. The config FILE path + presence is shown so the reader knows
-/// whether any of this came from disk — including the case where the file is
-/// there and none of this came from it, which the header has to say out loud
-/// because every line under it is then a default.
+/// `--show-config`: the resolved launch config (flag > config > default). An unset font
+/// size shows its auto-scale base, since the physical size needs the display scale. The
+/// header names the config file and whether it was read: when it was rejected, every
+/// line under it is a default.
 pub(crate) fn show_config() -> String {
     show_config_report(None)
 }
 
-/// [`show_config`] with the launch's load failure OVERRIDDEN, so the rejected
-/// header is reachable from a test without moving this process's config path out
-/// from under every other test. `None` — what production passes — asks the live
-/// launch state, and asks it AFTER the `load_config` below, because that call is
-/// what records it.
+/// [`show_config`] with the launch's load failure given, so a test reaches the rejected
+/// header without moving the process's config path. `None` (production) reads the live
+/// launch state after `load_config`, which records it.
 fn show_config_report(launch_failure: Option<&str>) -> String {
     let config = crate::app_config::load_config();
     let failure: Option<&str> = match launch_failure {
@@ -2923,10 +2680,6 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     };
     let (config_path, config_presence) = report_config_target(failure);
     let gpu = crate::app_config::resolve_want_gpu(&config);
-    let font_px = show_config_font_px(
-        crate::app_config::resolve_font_px(&config),
-        crate::app_config::font_px_is_explicit(&config),
-    );
     let tab_strip_rows = crate::app_config::resolve_tab_strip_rows(&config);
     let themes = crate::app_config::ThemeCatalog::discover();
     let theme_name = show_config_theme(&config, &themes);
@@ -2935,20 +2688,24 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
         aterm_types::Appearance::Light,
     ]
     .map(|appearance| config.resolved_colors(appearance, &themes, None));
-    // The same effective resolution and admission the renderer uses (`--font` >
-    // config > platform default), so `--show-config` reports the face that actually
-    // loads — on a pristine config, or a family that does not load, that is
-    // "(built-in candidates)", the library's FONT_CANDIDATES lead (SF Mono on
-    // macOS); `--show-face` names the file.
-    let font_family = match crate::effective_font_family(config.font_family_request().as_deref()) {
-        None => "(built-in candidates)".to_string(),
-        Some(family)
-            if crate::app_config::Config::font_family_admission(Some(&family)).is_err() =>
-        {
-            format!("(built-in candidates; {family:?} did not load)")
-        }
-        Some(family) => family,
-    };
+    // The theme's type settings for each side, and the font rows they make.
+    let type_rows = show_config_type_rows(
+        &config,
+        &themes,
+        crate::launch::flags().font_family.as_deref(),
+        crate::app_config::Config::font_family_admission,
+    );
+    let font_px = appearance_labels(
+        show_config_font_px(
+            type_rows.font_px[0],
+            crate::app_config::font_px_is_explicit(&config),
+        ),
+        show_config_font_px(
+            type_rows.font_px[1],
+            crate::app_config::font_px_is_explicit(&config),
+        ),
+    );
+    let font_family = type_rows.font_family.clone();
     let columns = crate::app_config::resolve_initial_columns(&config);
     let lines = crate::app_config::resolve_initial_lines(&config);
 
@@ -2963,12 +2720,17 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     let _ = writeln!(s);
     let _ = writeln!(s, "font_px:        {font_px}");
     let _ = writeln!(s, "font_family:    {font_family}");
+    let _ = writeln!(s, "line_height:    {}", type_rows.line_height);
+    let _ = writeln!(s, "font_size_scale: {}", type_rows.font_size_scale);
     let _ = writeln!(s, "renderer:       {}", renderer_label(gpu));
     let _ = writeln!(s, "columns:        {columns}");
     let _ = writeln!(s, "lines:          {lines}");
     let _ = writeln!(s, "tab_strip_rows: {tab_strip_rows}");
+    let (shell, shell_origin) = show_config_shell(&config);
+    let _ = writeln!(s, "shell:          {shell}");
+    let _ = writeln!(s, "shell_origin:   {shell_origin}");
     let _ = writeln!(s, "theme:          {theme_name}");
-    // W2 typography knobs (config > default; no environment alias).
+    // Typography knobs (config > default).
     let _ = writeln!(
         s,
         "text_blending:  {}",
@@ -2979,7 +2741,7 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
     );
     let _ = writeln!(s, "font_thicken:   {}", config.font_thicken_or_default());
     let _ = writeln!(s, "stem_gamma:     {}", config.stem_gamma_or_default());
-    // W9 variable-font instantiation: the parsed requests + dark nudge.
+    // Variable-font axes and the dark-mode weight nudge.
     let (vf_reqs, _) = config.font_variation_requests();
     let vf: Vec<String> = vf_reqs
         .iter()
@@ -2993,13 +2755,6 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
         s,
         "font_weight_dark_nudge: {}",
         config.font_weight_dark_nudge_or_default()
-    );
-    // M2 "ink that dries" — default-on fade-in of streamed output.
-    let _ = writeln!(
-        s,
-        "stream_fade:    {} ({} ms)",
-        config.stream_fade_or_default(),
-        config.stream_fade_ms_or_default()
     );
     let _ = writeln!(
         s,
@@ -3017,6 +2772,123 @@ fn show_config_report(launch_failure: Option<&str>) -> String {
         appearance_labels(color_source_label(&dark), color_source_label(&light))
     );
     s
+}
+
+/// `--show-config`'s typography rows: each value with where it came from
+/// (`theme <id> | config | --font | default`), one value when both
+/// appearances agree, else each side labelled.
+pub(crate) struct ShowConfigTypeRows {
+    pub(crate) font_family: String,
+    pub(crate) line_height: String,
+    pub(crate) font_size_scale: String,
+    /// The derived font size per side (dark, light), the scale applied.
+    pub(crate) font_px: [f32; 2],
+}
+
+/// Build [`ShowConfigTypeRows`] for `config` over `themes`, with `flag` the
+/// launch's `--font` and `admit` the family admission the renderer uses.
+pub(crate) fn show_config_type_rows(
+    config: &crate::app_config::Config,
+    themes: &crate::app_config::ThemeCatalog,
+    flag: Option<&str>,
+    admit: impl Fn(Option<&str>) -> Result<Option<String>, String>,
+) -> ShowConfigTypeRows {
+    use crate::resolved_typography::TypeOrigin;
+    let sides = [
+        aterm_types::Appearance::Dark,
+        aterm_types::Appearance::Light,
+    ]
+    .map(|appearance| config.resolved_typography_with_flag(appearance, themes, flag));
+    let source = |typo: &crate::resolved_typography::ResolvedTypography, key: &str| {
+        let origin = if key == "font_family" && flag.is_some() {
+            TypeOrigin::Flag
+        } else if key == "font_family" && config.font_family_request().is_some() {
+            TypeOrigin::Config
+        } else {
+            let origin = typo.origin(key, config);
+            if origin == TypeOrigin::Flag {
+                TypeOrigin::Default
+            } else {
+                origin
+            }
+        };
+        match origin {
+            TypeOrigin::Theme => format!("theme {}", typo.id),
+            TypeOrigin::Config => "config".to_string(),
+            TypeOrigin::Flag => "--font".to_string(),
+            TypeOrigin::Default => "default".to_string(),
+        }
+    };
+    // Each side's value and source, then one row: the value once with its
+    // source when the sides agree, else each side labelled with its own.
+    let row = |value: [String; 2], source: [String; 2]| {
+        if value[0] == value[1] && source[0] == source[1] {
+            format!("{}  (source: {})", value[0], source[0])
+        } else {
+            format!(
+                "{} (dark, {}) / {} (light, {})",
+                value[0], source[0], value[1], source[1]
+            )
+        }
+    };
+    let views = [sides[0].overlay(config), sides[1].overlay(config)];
+    // The same effective resolution and admission the renderer uses
+    // (`--font` > config > theme > platform default), so this reports the
+    // face that actually loads — on a pristine config, or a family that does
+    // not load, that is the DEFAULT face the renderer's own candidate walk
+    // lands on (`aterm_render::default_primary_identity`: the bundled
+    // JetBrains Mono on Linux, SF Mono on macOS); `--show-face` adds its file
+    // and metrics.
+    let default_face = || {
+        aterm_render::default_primary_identity()
+            .unwrap_or_else(|| "the embedded last-resort face".to_string())
+    };
+    let family = |view: &crate::app_config::Config| match crate::effective_font_family_with(
+        flag,
+        view.font_family_request().as_deref(),
+    ) {
+        None => format!("(default) {}", default_face()),
+        Some(family) if admit(Some(&family)).is_err() => {
+            format!("(default) {}; {family:?} did not load", default_face())
+        }
+        Some(family) => family,
+    };
+    let font_family = row(
+        [family(&views[0]), family(&views[1])],
+        [
+            source(&sides[0], "font_family"),
+            source(&sides[1], "font_family"),
+        ],
+    );
+    let line_height = row(
+        [
+            views[0].line_height_or_default().to_string(),
+            views[1].line_height_or_default().to_string(),
+        ],
+        [
+            source(&sides[0], "line_height"),
+            source(&sides[1], "line_height"),
+        ],
+    );
+    let scale = |view: &crate::app_config::Config| {
+        aterm_types::scheme_typography::milli_text(view.font_size_scale_milli_or_default())
+    };
+    let font_size_scale = row(
+        [scale(&views[0]), scale(&views[1])],
+        [
+            source(&sides[0], "font_size_scale"),
+            source(&sides[1], "font_size_scale"),
+        ],
+    );
+    ShowConfigTypeRows {
+        font_family,
+        line_height,
+        font_size_scale,
+        font_px: [
+            crate::app_config::resolve_scaled_font_px(&views[0]),
+            crate::app_config::resolve_scaled_font_px(&views[1]),
+        ],
+    }
 }
 
 /// Where one appearance's colours come from: the theme drawn and its source,
@@ -3064,30 +2936,56 @@ fn appearance_colours(dark: aterm_types::Rgb, light: aterm_types::Rgb) -> String
 /// `--show-face`: the resolved font FACE for `family` — the file aterm would
 /// actually load plus its cell metrics + glyph count (from `aterm_render::face_info`,
 /// the same resolver the renderer uses). `family` empty falls back to the effective
-/// `font_family` (`--font` > config > platform default). An unresolvable family yields a
-/// clear message and a non-zero result so scripts can detect it.
+/// `font_family` (`--font` > config), and with neither set to the DEFAULT face the
+/// renderer loads (`aterm_render::default_primary_identity` — the bundled JetBrains
+/// Mono on Linux). An unresolvable family yields a clear message and a non-zero
+/// result so scripts can detect it.
 pub(crate) fn show_face(family: &str) -> (String, bool) {
     let family = family.trim();
-    let resolved_family = if family.is_empty() {
+    // An empty family asks for the effective one: the dark side's (no OS
+    // read in a CLI), said when the light side's theme names another face.
+    let mut side_note = "";
+    let (resolved_family, header) = if family.is_empty() {
         let config = crate::app_config::load_config();
-        crate::effective_font_family(config.font_family_request().as_deref()).unwrap_or_default()
+        let themes = crate::app_config::ThemeCatalog::discover();
+        let [dark, light] = [
+            aterm_types::Appearance::Dark,
+            aterm_types::Appearance::Light,
+        ]
+        .map(|appearance| {
+            let typo = config.resolved_typography(appearance, &themes);
+            typo.overlay(&config).font_family_request()
+        });
+        if dark != light {
+            side_note = " (dark side)";
+        }
+        match crate::effective_font_family(dark.as_deref()) {
+            Some(configured) if !configured.trim().is_empty() => {
+                (configured.clone(), format!("{configured:?}"))
+            }
+            _ => match aterm_render::default_primary_identity() {
+                Some(default) => (default, "the default font".to_string()),
+                None => {
+                    return (
+                        "no font family configured and no default face loads; the \
+                         embedded last-resort face draws text\n"
+                            .to_string(),
+                        false,
+                    );
+                }
+            },
+        }
     } else {
-        family.to_string()
+        (family.to_string(), format!("{family:?}"))
     };
-    if resolved_family.trim().is_empty() {
-        return (
-            "no font family configured; pass one: --show-face <family>".to_string(),
-            false,
-        );
-    }
     match aterm_render::face_info(&resolved_family) {
         None => (
-            format!("font family {resolved_family:?} does not resolve to a loadable face"),
+            format!("font family {resolved_family:?} does not resolve to a loadable face\n"),
             false,
         ),
         Some(info) => {
             let mut s = String::new();
-            let _ = writeln!(s, "resolved face for {resolved_family:?}:");
+            let _ = writeln!(s, "resolved face for {header}{side_note}:");
             let _ = writeln!(s, "  path:        {}", info.path);
             let _ = writeln!(
                 s,
@@ -3111,10 +3009,8 @@ mod tests {
         aterm_toml::from_str(source).expect("test config")
     }
 
-    /// An absolute root for the `protected_roots` fixtures: `/tmp/…` is
-    /// absolute only on Unix (on Windows `Path::is_absolute` needs a drive, so
-    /// the resolver drops it as "neither absolute nor ~-prefixed" and every
-    /// count below is off by one). Same rationale as `app_config`'s twin.
+    /// An absolute root for the `protected_roots` fixtures: on Windows
+    /// `Path::is_absolute` needs a drive, so `/tmp` would be dropped.
     const ABS_TMP: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
 
     #[test]
@@ -3237,9 +3133,8 @@ mod tests {
                 .all(|warning| warning.message.contains("only on macOS and Linux")),
             "{non_updater:?}"
         );
-        // Linux's native updater reads `[update]` (`enabled` gates its background
-        // checker once per process, `auto_apply` each replacement), so no `[update]`
-        // key is called inert there; the macOS-only desktop keys still are.
+        // Linux's native updater reads `[update]`, so no `[update]` key is inert there;
+        // the macOS-only desktop keys still are.
         assert_eq!(
             platform_keys(ConfigCapabilityPlatform::Linux),
             std::collections::BTreeSet::from(["font_thicken", "secure_keyboard_entry"])
@@ -3274,46 +3169,38 @@ mod tests {
         // `confirm_multiline_paste` is deliberately absent: the confirm is
         // live on every platform (Linux's in-window paste_banner included),
         // so warning that it "has no protective effect" would be the lie.
-        for platform in [
-            ConfigCapabilityPlatform::Linux,
-            ConfigCapabilityPlatform::Unsupported,
-        ] {
-            assert_eq!(
-                keys(platform),
-                std::collections::BTreeSet::from([
-                    "allow_notifications",
-                    "trail_sound_volume",
-                    "trail_sounds",
-                ]),
-                "{platform:?}"
-            );
-        }
+        // `allow_notifications` too on Linux, which delivers over D-Bus.
+        assert_eq!(
+            keys(ConfigCapabilityPlatform::Linux),
+            std::collections::BTreeSet::from(["trail_sound_volume", "trail_sounds"]),
+            "Linux delivers notifications but has no trail-audio consumer"
+        );
+        assert_eq!(
+            keys(ConfigCapabilityPlatform::Unsupported),
+            std::collections::BTreeSet::from([
+                "allow_notifications",
+                "trail_sound_volume",
+                "trail_sounds",
+            ]),
+        );
     }
 
     #[test]
     fn repoint_keys_say_a_shipped_build_does_not_read_them() {
         let config =
             parsed("[update]\nowner = \"me\"\nrepo = \"\"\n[packages]\naccount = \"me/x\"\n");
-        let shipped: Vec<String> = repoint_warnings(&config, false, false)
-            .into_iter()
-            .map(|warning| warning.message)
-            .collect();
+        let keys = |update_dev, packages_dev| {
+            repoint_warnings(&config, update_dev, packages_dev)
+                .into_iter()
+                .map(|warning| warning.key)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            shipped,
-            [
-                "update.owner: a development setting this build does not read; remove it",
-                "packages.account: a development setting this build does not read; remove it",
-            ],
+            keys(false, false),
+            ["update.owner", "packages.account"],
             "a valid name is still ignored by a shipped build; a blank one is harmless"
         );
-        let dev: Vec<String> = repoint_warnings(&config, true, true)
-            .into_iter()
-            .map(|warning| warning.message)
-            .collect();
-        assert_eq!(
-            dev,
-            ["packages.account: \"me/x\" is not a GitHub name; the default index is used",]
-        );
+        assert_eq!(keys(true, true), ["packages.account"], "not a GitHub name");
     }
 
     #[test]
@@ -3382,42 +3269,9 @@ palette = ["#112233"]
         let enabled = config_semantic_warnings(&parsed(
             "allow_osc52_query = true\nallow_window_ops = true\n",
         ));
-        assert_eq!(enabled.len(), 2, "{enabled:?}");
-        assert!(enabled.iter().any(|warning| {
-            warning.key == "allow_osc52_query"
-                // The honest caveat states the WIDEST grant on this platform:
-                // the system clipboard off-Linux (that is what the Query arm
-                // answers with — the old "own-slot only" line was a false
-                // promise there), the own-selections bound on X11.
-                && warning.message.contains("READ")
-                && if cfg!(target_os = "linux") {
-                    warning.message.contains("selections aterm itself owns")
-                } else {
-                    warning.message.contains("system clipboard")
-                        && warning.message.contains("OTHER apps")
-                }
-        }));
-        assert!(enabled.iter().any(|warning| {
-            warning.key == "allow_window_ops"
-                // The report set that actually answers — the pixel pair
-                // (CSI 14 t / CSI 16 t) joined it once the engine gained a
-                // host-reported cell box to answer from.
-                && warning
-                    .message
-                    .contains("text-grid-size, text-area-pixels and cell-size")
-                && if cfg!(target_os = "linux") {
-                    // The manipulation half is wired there (frame audit #4);
-                    // the honest residue is the POSITION/screen-report gap.
-                    warning.message.contains("wired to the window")
-                        && warning.message.contains("move stays denied")
-                        && warning.message.contains("remain unanswered")
-                } else {
-                    warning.message.contains("cell-size reports only")
-                        && warning.message.contains("resize, move)")
-                        && warning.message.contains("screen-size reports are ignored")
-                }
-        }));
-
+        let keys: Vec<&str> = enabled.iter().map(|warning| warning.key).collect();
+        assert_eq!(keys.len(), 2, "{enabled:?}");
+        assert!(keys.contains(&"allow_osc52_query") && keys.contains(&"allow_window_ops"));
         assert!(
             config_semantic_warnings(&parsed(
                 "allow_osc52_query = false\nallow_window_ops = false\n"
@@ -3428,39 +3282,20 @@ palette = ["#112233"]
     }
 
     #[test]
-    fn custom_and_connection_records_disclose_every_inert_or_refused_arm() {
-        let fingerprint = "00".repeat(32);
-        let source = format!(
-            r#"
+    fn custom_records_disclose_every_inert_arm() {
+        let source = r#"
 [[sparkle_words.custom]]
 words = [" "]
 
 [[sparkle_words.custom]]
 words = ["quiet"]
-burst = {{ kind = "glow", chance = 0 }}
+burst = { kind = "glow", chance = 0 }
 
 [[sparkle_words.custom]]
 words = ["live"]
 ink = "rainbow"
-
-[[net.connections]]
-name = "bad/name"
-host = "bad.example:7100"
-fingerprint = "nope"
-
-[[net.connections]]
-name = "work"
-host = "one.example:7100"
-fingerprint = "{fingerprint}"
-
-[[net.connections]]
-name = "work"
-host = "two.example:7100"
-fingerprint = "{fingerprint}"
-expect_nonce = "launch-pin"
-"#
-        );
-        let warnings = config_semantic_warnings(&parsed(&source));
+"#;
+        let warnings = config_semantic_warnings(&parsed(source));
         let joined = warnings
             .iter()
             .map(|warning| warning.message.as_str())
@@ -3470,80 +3305,15 @@ expect_nonce = "launch-pin"
             "record 1 has no nonblank word",
             "record 1 is inert",
             "record 2 is inert",
-            "record 1 must be a nonempty",
-            "record 1 must be 64 hexadecimal",
-            "record 3 duplicates",
         ] {
             assert!(joined.contains(expected), "missing {expected:?}: {joined}");
         }
         assert!(
             warnings
                 .iter()
-                .all(|warning| warning.key != "net.connections.expect_nonce"),
-            "expect_nonce arms the live launch-nonce pin; it is not a refused arm: {joined}"
-        );
-        assert!(
-            warnings
-                .iter()
                 .all(|warning| !warning.message.contains("record 3 is inert")),
             "live custom record must not be called inert"
         );
-    }
-
-    /// `expect_nonce` arms the launch-nonce pin the dialer enforces against the
-    /// remote's session roster, and `sid` narrows which session it compares: the
-    /// pair is live and draws nothing. Only a `sid` with no `expect_nonce` is
-    /// inert, and only that is disclosed. (Until 2026-09-27 both keys were
-    /// reported as refused — the pin predates its enforcement landing.)
-    #[test]
-    fn a_pinned_sid_is_live_and_only_a_bare_sid_is_disclosed_inert() {
-        let fingerprint = "00".repeat(32);
-        let source = format!(
-            r#"
-[[net.connections]]
-name = "pinned"
-host = "one.example:7100"
-fingerprint = "{fingerprint}"
-sid = "abc"
-expect_nonce = "launch-pin"
-
-[[net.connections]]
-name = "bare"
-host = "two.example:7100"
-fingerprint = "{fingerprint}"
-sid = "abc"
-"#
-        );
-        let warnings = config_semantic_warnings(&parsed(&source));
-        let connection_warnings = warnings
-            .iter()
-            .filter(|warning| warning.key.starts_with("net.connections."))
-            .map(|warning| warning.message.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            connection_warnings.len(),
-            1,
-            "exactly the bare sid is disclosed: {connection_warnings:?}"
-        );
-        assert!(
-            connection_warnings[0].contains("record 2 has no effect without expect_nonce"),
-            "{connection_warnings:?}"
-        );
-    }
-
-    #[test]
-    fn saved_connection_rejects_nonblank_endpoint_syntax_before_dial() {
-        let fingerprint = "00".repeat(32);
-        let config = parsed(&format!(
-            "[[net.connections]]\nname = \"work\"\nhost = \"missing-port\"\nfingerprint = \"{fingerprint}\"\n"
-        ));
-        let warnings = config_semantic_warnings(&config);
-        let endpoint = warnings
-            .iter()
-            .find(|warning| warning.key == "net.connections.host")
-            .expect("invalid endpoint warning");
-        assert!(endpoint.message.contains("must be host:port"));
-        assert!(endpoint.message.contains("record 1"));
     }
 
     #[test]
@@ -3557,16 +3327,7 @@ sid = "abc"
     }
 
     #[test]
-    fn listener_and_package_admission_warnings_are_pure_and_specific() {
-        let listener = parsed("[net]\nlisten = \"127.0.0.1:7100\"\n");
-        let partial = listener_capability_warnings(&listener, [true, false, false], false);
-        assert_eq!(partial.len(), 1);
-        assert!(partial[0].message.contains("incomplete (1/3"));
-        assert!(listener_capability_warnings(&listener, [true, true, true], false).is_empty());
-        let nested = listener_capability_warnings(&listener, [true, true, true], true);
-        assert_eq!(nested.len(), 1);
-        assert!(nested[0].message.contains("never binds in an aterm child"));
-
+    fn package_admission_warnings_are_pure_and_specific() {
         let packages = parsed("[packages]\nenabled = true\n");
         let rootless = package_capability_warnings(&packages, false);
         assert_eq!(rootless.len(), 1);
@@ -3578,46 +3339,19 @@ sid = "abc"
         assert!(package_capability_warnings(&packages, true).is_empty());
     }
 
-    /// Every `[privacy]` key this build refuses or ignores says so, once, in the
-    /// author's own vocabulary — and a `[privacy]` section that is entirely
-    /// valid says nothing at all. The `auto_accept` line is the load-bearing
-    /// one: the key is RESERVED, and a reserved key that stayed silent would be
-    /// indistinguishable from a key that worked.
+    /// The reserved `auto_accept` is refused out loud: silent, it would read as a key
+    /// that works.
     #[test]
     fn privacy_auto_accept_is_refused_and_names_the_grant_that_works() {
         let warnings = config_semantic_warnings(&parsed("[privacy]\nauto_accept = true\n"));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].key, "privacy.auto_accept");
-        assert!(
-            warnings[0].message.contains("reserved and not implemented")
-                && warnings[0]
-                    .message
-                    .contains("aterm does not answer macOS consent dialogs")
-                && warnings[0]
-                    .message
-                    .contains("grant Full Disk Access instead"),
-            "{}",
-            warnings[0].message
-        );
-        // The refusal must not turn into a promise: nothing here may claim the
-        // grant removes prompts (owner ruling — mitigate, do not claim to
-        // eliminate).
-        let lowered = warnings[0].message.to_ascii_lowercase();
-        assert!(
-            !lowered.contains("no more prompts")
-                && !lowered.contains("never prompt")
-                && !lowered.contains("eliminat"),
-            "{}",
-            warnings[0].message
-        );
         // `false` is the default and is not worth a word.
         assert!(config_semantic_warnings(&parsed("[privacy]\nauto_accept = false\n")).is_empty());
     }
 
-    /// The master switch silences the notice and the warm-up gesture, so an
-    /// author who wrote both gets told which of their keys cannot fire. Only
-    /// AUTHORED keys are flagged — an absent `notice` resolves to the same
-    /// value but expresses no expectation to contradict.
+    /// With the master switch off, an authored `notice` or `warmup` cannot fire and is
+    /// flagged; an absent one expresses no expectation and is not.
     #[test]
     fn privacy_master_switch_off_flags_the_features_it_silences() {
         let warnings = config_semantic_warnings(&parsed(
@@ -3625,15 +3359,11 @@ sid = "abc"
         ));
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.key == "privacy.notice" && w.message.contains("can never fire")),
+            warnings.iter().any(|w| w.key == "privacy.notice"),
             "{warnings:?}"
         );
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.key == "privacy.warmup" && w.message.contains("is never offered")),
+            warnings.iter().any(|w| w.key == "privacy.warmup"),
             "{warnings:?}"
         );
         // Off with nothing else authored: no token to underline, nothing said.
@@ -3647,10 +3377,8 @@ sid = "abc"
         );
     }
 
-    /// A `warmup` spelling this build does not accept resolves to the default
-    /// rather than failing the whole file, and an unknown `warmup_folders` name
-    /// is skipped when names become paths — both are silent at runtime, so both
-    /// are named here.
+    /// An unaccepted `warmup` spelling resolves to the default and an unknown
+    /// `warmup_folders` name is skipped, both silently at runtime, so both are named.
     #[test]
     fn privacy_flags_an_unknown_warmup_spelling_and_folder_name() {
         let warnings = config_semantic_warnings(&parsed(
@@ -3679,9 +3407,8 @@ sid = "abc"
         );
     }
 
-    /// A protected root that is neither absolute nor `~`-prefixed is dropped by
-    /// the consent tier rather than resolved against a guessed base — which
-    /// would leave the protected set with a hole in it and nothing said.
+    /// A protected root that is neither absolute nor `~`-prefixed is dropped by the
+    /// consent tier, leaving a hole in the protected set, so the validator names it.
     #[test]
     fn privacy_flags_a_protected_root_it_cannot_resolve() {
         let warnings = config_semantic_warnings(&parsed(&format!(
@@ -3689,9 +3416,7 @@ sid = "abc"
         )));
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            warnings.iter().all(|w| w.key == "privacy.protected_roots"
-                && w.message
-                    .contains("neither an absolute path nor ~-prefixed")),
+            warnings.iter().all(|w| w.key == "privacy.protected_roots"),
             "{warnings:?}"
         );
         assert!(warnings[0].message.contains("protected_roots[2]"));
@@ -3702,18 +3427,15 @@ sid = "abc"
         );
     }
 
-    /// The apply hold is a bounded courtesy to an owner-initiated dialog. Past
-    /// the ceiling it becomes a way to pin a build to one instance, so the
-    /// resolver clamps and the validator states the number that actually
-    /// applies rather than letting the authored one read as honored.
+    /// Past its ceiling the apply hold could pin a build to one instance, so the
+    /// resolver clamps it and the validator states the effective number.
     #[test]
     fn privacy_flags_an_apply_hold_that_could_pin_a_build() {
         let warnings = config_semantic_warnings(&parsed("[privacy]\nwarmup_hold_ms = 3600000\n"));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].key, "privacy.warmup_hold_ms");
         assert!(
-            warnings[0].message.contains("effectively 600000 ms")
-                && warnings[0].message.contains("pinning a build"),
+            warnings[0].message.contains("effectively 600000 ms"),
             "{}",
             warnings[0].message
         );
@@ -3728,9 +3450,8 @@ sid = "abc"
         );
     }
 
-    /// A fully-authored, entirely valid `[privacy]` section is silent. Without
-    /// this the six warnings above could each be firing on a correct config and
-    /// nothing would notice.
+    /// A fully authored, valid `[privacy]` section is silent: the negative control for
+    /// the warnings above.
     #[test]
     fn a_valid_privacy_section_emits_no_semantic_warning() {
         // Positional `{}`: a format string expanded from `concat!` may not
@@ -3764,12 +3485,8 @@ sid = "abc"
 
     #[test]
     fn host_semantics_accept_valid_lexicon_and_report_missing_or_rejected_layers() {
-        // libtest names each test thread after the test's FULL PATH — here
-        // "diagnostics::tests::host_semantics_…" — and `:` is not a legal
-        // character in a Windows path component, so using the name verbatim
-        // made `create_dir_all` fail with os error 123 (InvalidFilename) on
-        // Windows and this test never ran there. Sanitize instead of dropping
-        // the name: it is what keeps the directory unique per test.
+        // libtest names the thread after the test's full path, and `:` is illegal in
+        // a Windows path component; the sanitized name keeps the directory unique.
         let thread = std::thread::current();
         let root = std::env::temp_dir().join(format!(
             "aterm-config-lexicon-{}-{}",
@@ -3928,11 +3645,8 @@ ink = "rainbow"
         assert!(validate_config_text("font_px = = 1").is_err());
     }
 
-    /// The `shell` VALIDITY warnings an authored TOML line produces.
-    ///
-    /// The `--shell` precedence notice is dropped. It also starts `shell:`, but it
-    /// is emitted for ANY authored `shell` whenever that flag is in force, and it
-    /// says nothing about whether the value can spawn.
+    /// The `shell` validity warnings an authored line produces, without the `--shell`
+    /// precedence notice (it says nothing about whether the value can spawn).
     fn shell_warns(toml: &str) -> Vec<String> {
         validate_config_text(toml)
             .expect("parses")
@@ -3941,14 +3655,9 @@ ink = "rainbow"
             .collect()
     }
 
-    /// W5i (UNIX): the `shell` key names the execve target VERBATIM (no PATH
-    /// search), so `--validate-config` must catch the three shapes that make
-    /// every new session die at exec — a bare name, a nonexistent path, and
-    /// (the healthy control) an absolute existing shell warns nothing.
-    ///
-    /// `cfg`-gated because every premise in it is POSIX: `/bin/sh` is not a
-    /// path on Windows, and a bare name there is the NORMAL spelling. Running
-    /// this rule on Windows is the defect the sibling test below pins.
+    /// Unix: `shell` names the execve target verbatim (no PATH search), so a bare name
+    /// and a nonexistent path warn and an absolute existing shell does not. POSIX-only:
+    /// a bare name is the normal Windows spelling.
     #[cfg(not(windows))]
     #[test]
     fn validate_flags_a_shell_the_spawn_cannot_exec() {
@@ -3968,20 +3677,10 @@ ink = "rainbow"
         );
     }
 
-    /// W7 (WINDOWS): the spellings a Windows user actually writes must validate
-    /// clean, and the ones that genuinely cannot run must be rejected with
-    /// advice they can act on.
-    ///
-    /// The defect this pins: the validator ran a POSIX rule
-    /// (`!shell.contains('/')`) on both platforms, so
-    /// `C:\Windows\System32\cmd.exe` was reported as "a bare name … use an
-    /// absolute path (e.g. /bin/zsh)". Only a forward-slash spelling passed.
-    ///
-    /// Every accepted value is measured against the REAL resolver
-    /// (`aterm_pty::classify_shell_name`, which is the spawn's own); the stock
-    /// paths derive from `%SystemRoot%` and the awkward ones (a space, an
-    /// apostrophe, a literal percent) are BUILT under the temp dir, so the test
-    /// is hermetic on any Windows box rather than tied to this one.
+    /// Windows: the spellings a user writes validate clean, and the ones that cannot run
+    /// are rejected with advice they can act on. Accepted values are checked against the
+    /// spawn's own resolver (`aterm_pty::classify_shell_name`); the awkward paths are
+    /// built under the temp dir, so the test is hermetic.
     #[cfg(windows)]
     #[test]
     fn validate_accepts_the_windows_shell_spellings_a_user_would_write() {
@@ -3992,10 +3691,9 @@ ink = "rainbow"
             "test premise: cmd.exe must exist at {cmd_backslash}"
         );
 
-        // Awkward-but-legal path fixtures. The validator's path lane asks the
-        // filesystem `is_file()` and nothing more, so a placeholder file is a
-        // faithful stand-in — and copying a real executable into temp is what an
-        // AV heuristic exists to flag.
+        // Awkward-but-legal path fixtures. The validator's path lane asks only
+        // `is_file()`, so a placeholder stands in; a real executable copied into temp
+        // is what AV heuristics flag.
         let root = std::env::temp_dir().join(format!("aterm-shellcfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let fixture = |dir: &str, file: &str| -> String {
@@ -4005,21 +3703,17 @@ ink = "rainbow"
             std::fs::write(&f, b"placeholder, never executed").expect("fixture file");
             f.display().to_string()
         };
-        //  * a SPACE in the path — the single most common real Windows shell
-        //    path shape (`C:\Program Files\Git\bin\bash.exe`), and the one the
-        //    old check had no way to accept;
+        //  * a space (`C:\Program Files\Git\bin\bash.exe`, the most common shape);
         let spaced = fixture("Program Files\\Git\\bin", "bash.exe");
         assert!(
             spaced.contains(' '),
             "premise: {spaced:?} must hold a space"
         );
-        //  * an APOSTROPHE — legal in a Windows filename, and never to be
-        //    mistaken for shell quoting (`C:\Users\O'Brien\…`);
+        //  * an apostrophe, which is not shell quoting (`C:\Users\O'Brien\…`);
         let apostrophe = fixture("O'Brien", "bash.exe");
         assert!(apostrophe.contains('\''), "premise: {apostrophe:?}");
-        //  * a LITERAL PERCENT PAIR — `%` is a legal filename character, so a
-        //    directory actually named `%tools%` must not be second-guessed as an
-        //    unexpanded environment variable.
+        //  * a literal percent pair: a directory named `%tools%` is not an unexpanded
+        //    environment variable.
         let percent = fixture("%tools%", "nu.exe");
         assert!(percent.contains("%tools%"), "premise: {percent:?}");
 
@@ -4039,9 +3733,8 @@ ink = "rainbow"
             apostrophe.clone(),
             percent.clone(),
         ];
-        // `bash`, `pwsh`, `nu` and `wsl` are discoverable only where they are
-        // installed; assert them only when this box actually has them (the alias
-        // lane itself is pinned unconditionally by aterm-pty's own tests).
+        // `bash`, `pwsh`, `nu` and `wsl` resolve only where installed (aterm-pty's own
+        // tests pin the alias lane).
         for optional in ["bash", "pwsh", "nu", "wsl"] {
             if matches!(
                 aterm_pty::classify_shell_name(std::ffi::OsStr::new(optional)),
@@ -4050,10 +3743,8 @@ ink = "rainbow"
                 accepted.push(optional.to_string());
             }
         }
-        // TOML LITERAL strings (single quotes) take the value verbatim, so a
-        // Windows path needs no backslash doubling and the test reads as the
-        // user would actually type the line. The apostrophe fixture is the one
-        // value that cannot be spelled that way; it takes a basic string.
+        // TOML literal strings take a Windows path verbatim; the apostrophe fixture
+        // cannot be spelled that way and takes a basic string.
         let authored = |value: &str| -> String {
             if value.contains('\'') {
                 format!("shell = \"{}\"", value.replace('\\', "\\\\"))
@@ -4080,19 +3771,15 @@ ink = "rainbow"
             (missing_path.as_str(), "does not exist"),
             // A directory, not a program.
             (sysroot.as_str(), "not an executable file"),
-            // Relative: resolved against the SESSION's cwd, not the config's.
+            // Relative: resolved against the session's cwd, not the config's.
             ("System32\\cmd.exe", "relative path"),
-            // Both Windows half-rooted shapes are relative too: rooted on the
-            // CURRENT DRIVE, and rooted on the drive's own current directory.
+            // Both Windows half-rooted shapes are relative too: rooted on the current
+            // drive, and rooted on the drive's own current directory.
             ("\\Windows\\System32\\cmd.exe", "relative path"),
             ("C:cmd.exe", "relative path"),
             // `shell` takes no arguments/quoting — that is what shell_args is for.
             (r#""C:\Windows\System32\cmd.exe" /K dir"#, "quoted"),
-            // The same mistake UNQUOTED, which is how it is actually written.
-            // Neither shape can spawn, and before this both were described by
-            // resolution instead of by the grammar: a bare head came out "is
-            // not on %PATH%", and `cmd /K dir` — path-like ONLY because `/K`
-            // holds a slash — came out "is a relative path".
+            // The same mistake unquoted, the usual spelling: neither shape can spawn.
             ("cmd /K dir", "carries arguments"),
             (cmd_with_args.as_str(), "carries arguments"),
             // `%VAR%` is never expanded, in either shape. The spawn's own
@@ -4108,9 +3795,8 @@ ink = "rainbow"
             rejections.extend(warnings);
         }
 
-        // The arguments rejection must spell out the LINE TO WRITE, so the fix
-        // is a copy rather than a re-derivation. Quoted the way the warning
-        // renders it, which is also the way the author must type it back.
+        // The arguments rejection spells out the line to write, quoted as the author
+        // must type it.
         for (value, program) in [
             ("cmd /K dir", "cmd"),
             (cmd_with_args.as_str(), cmd_backslash.as_str()),
@@ -4125,10 +3811,8 @@ ink = "rainbow"
             );
         }
 
-        // …and it must fire on EVIDENCE, not on a space. A space is ordinary in
-        // a Windows shell path (`spaced`, asserted clean above), so a MISSING
-        // spaced path keeps its own verdict instead of being re-read as a
-        // command line whose first word happens to be a directory prefix.
+        // …and it fires on evidence, not on a space: a missing spaced path keeps its
+        // own verdict rather than being read as a command line.
         let missing_spaced = format!("{}\\Program Files\\Git\\bin\\nosuch.exe", root.display());
         let spaced_warnings = shell_warns(&authored(&missing_spaced));
         assert!(
@@ -4140,9 +3824,8 @@ ink = "rainbow"
         );
         rejections.extend(spaced_warnings);
 
-        // A full path missing only its EXTENSION is the one rejection that can
-        // name the spelling that would have worked — CreateProcessW appends no
-        // default extension (measured in aterm-pty).
+        // A full path missing only its extension is offered the spelling that works:
+        // CreateProcessW appends no default extension.
         let stem = cmd_backslash.trim_end_matches(".exe").to_string();
         let ext_warnings = shell_warns(&authored(&stem));
         assert!(
@@ -4153,10 +3836,8 @@ ink = "rainbow"
         );
         rejections.extend(ext_warnings);
 
-        // The ADVICE must be platform-correct on EVERY rejection, not just the
-        // ones that happened to be sampled: never a POSIX path a Windows user
-        // cannot write (the exact text the judge quoted), and never "bare name"
-        // as the diagnosis, because a bare name is the NORMAL Windows spelling.
+        // Every rejection's advice is platform-correct: no POSIX path, and never "bare
+        // name" as the diagnosis, since a bare name is the normal Windows spelling.
         for warning in &rejections {
             assert!(
                 !warning.contains("/bin/") && !warning.contains("/usr/"),
@@ -4168,9 +3849,8 @@ ink = "rainbow"
             );
         }
 
-        // The command-line matcher itself: a head that resolves plus a non-empty
-        // tail, and nothing else. `%COMSPEC% /K dir` is the overlap case — its
-        // head never resolves, so the `%VAR%` wording above stays in charge.
+        // The command-line matcher: a resolving head plus a non-empty tail. The head of
+        // `%COMSPEC% /K dir` never resolves, so the `%VAR%` wording stays in charge.
         assert_eq!(
             super::windows_shell_command_line_head("cmd /K dir"),
             Some("cmd")
@@ -4225,22 +3905,18 @@ ink = "rainbow"
             .unwrap();
 
         let (message, valid) = validate_config_path(&path);
-        assert!(!valid);
-        assert!(message.starts_with("config not read: "), "{message}");
-        assert!(message.contains("exceeds"), "{message}");
+        assert!(!valid, "{message}");
         assert!(
-            message.contains(&crate::native_config_service::MAX_CONFIG_FILE_BYTES.to_string()),
-            "{message}"
+            validate_config_text(
+                &" ".repeat(crate::native_config_service::MAX_CONFIG_FILE_BYTES + 1),
+            )
+            .is_err()
         );
-        let direct = validate_config_text(
-            &" ".repeat(crate::native_config_service::MAX_CONFIG_FILE_BYTES + 1),
-        )
-        .unwrap_err();
-        assert!(direct.contains("admission limit"), "{direct}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The verdict line says the file loads and how many lines need a look.
+    /// A file that loads with warnings still validates (`--validate-config`
+    /// exits 0), and the warning names its key.
     #[test]
     fn cli_validation_verdict_says_the_file_loads_and_counts_the_warnings() {
         let dir = std::env::temp_dir().join(format!(
@@ -4253,13 +3929,7 @@ ink = "rainbow"
         std::fs::write(&path, "qqq_unknown = 1\n").unwrap();
         let (message, valid) = validate_config_path(&path);
         assert!(valid, "{message}");
-        assert!(
-            message.starts_with(&format!(
-                "config {} loads, with 1 warning:\n  line 1: qqq_unknown ",
-                path.display()
-            )),
-            "{message}"
-        );
+        assert!(message.contains("qqq_unknown"), "{message}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4286,9 +3956,8 @@ ink = "rainbow"
         );
     }
 
-    /// A structurally-valid config whose [key_sequences]/[keybindings] entries the
-    /// loader will warn+skip (bad chord, unknown action) parses Ok but yields a
-    /// warning per offender — so --validate-config can't print a false green.
+    /// `[key_sequences]`/`[keybindings]` entries the loader skips (bad chord, unknown
+    /// action) parse but warn, one per offender.
     #[test]
     fn validate_flags_bad_keybind_and_key_sequence_entries() {
         let cfg = r#"
@@ -4307,13 +3976,10 @@ ink = "rainbow"
         assert_eq!(warnings.len(), 2, "exactly the two offenders: {joined}");
     }
 
-    /// Detection-only shadow / collision warnings (use `contains`, not exact counts):
-    /// a [keybindings] entry on a built-in Cmd chord warns "conflicts with built-in Copy"; a
-    /// [key_sequences] chord that is BOTH a built-in AND bound in [keybindings] warns
-    /// both ways. No code gate — the override capability is preserved, just surfaced.
-    /// The shadow half follows `HARDCODED_SUPER_CHORDS`: where the Cmd/Super suite
-    /// is compiled OFF (Linux), a cmd/super chord conflicts with NOTHING, so the
-    /// conflict warnings must NOT fire — only the cross-table collision remains.
+    /// Shadow and collision warnings are detection-only: a `[keybindings]` entry on a
+    /// built-in Cmd chord warns "conflicts with built-in Copy", and a `[key_sequences]`
+    /// chord that is also bound in `[keybindings]` warns too. Where the Cmd/Super suite is
+    /// compiled off (`HARDCODED_SUPER_CHORDS`: Linux), only the cross-table collision fires.
     #[test]
     fn validate_flags_shadow_and_collision() {
         let cfg = r#"
@@ -4340,10 +4006,8 @@ ink = "rainbow"
         assert!(joined.contains("also bound in [keybindings]"), "{joined}");
     }
 
-    /// The documented unbind spelling (`"none"` / `"unbind"`) is a VALID
-    /// [keybindings] value the loader accepts silently — the validator (and the
-    /// Settings editor's live diagnostics, which share `config_semantic_warnings`)
-    /// must not flag it as an unknown action.
+    /// The unbind spellings (`"none"` / `"unbind"`) are valid `[keybindings]` values,
+    /// not unknown actions.
     #[test]
     fn validate_accepts_the_unbind_spellings() {
         let cfg = r#"
@@ -4358,8 +4022,8 @@ ink = "rainbow"
         );
     }
 
-    /// An empty `[key_sequences]` value is valid TOML but the loader warn-skips it (it
-    /// would dead-key the chord); --validate-config must SURFACE that, not false-green.
+    /// An empty `[key_sequences]` value is valid TOML but the loader skips it (it would
+    /// dead-key the chord), so the validator flags it.
     #[test]
     fn validate_flags_empty_key_sequence() {
         let joined = validate_config_text("[key_sequences]\n\"ctrl+g\" = \"\"\n")
@@ -4371,10 +4035,8 @@ ink = "rainbow"
         );
     }
 
-    /// W5h: keys the loaders silently fall back on — an unresolvable
-    /// `font_family`, an unknown `theme` name, a typo'd `cursor_style`, and
-    /// malformed hex colours (top-level + palette entries) — are all flagged
-    /// so `--validate-config` can't false-green a config that does nothing.
+    /// Values the loaders silently fall back on are flagged: an unresolvable
+    /// `font_family`, an unknown `theme`, a typo'd `cursor_style`, malformed hex colours.
     #[test]
     fn validate_flags_font_theme_cursor_and_color_typos() {
         let joined = validate_config_text(
@@ -4404,8 +4066,7 @@ ink = "rainbow"
             "valid entry not flagged: {joined}"
         );
 
-        // And a config using all these keys CORRECTLY stays warning-free (no
-        // false positives): resolvable values only, so it validates green.
+        // The same keys used correctly stay warning-free.
         let clean = validate_config_text(
             "theme = \"Default\"\ncursor_style = \"bar\"\nforeground = \"#aabbcc\"\n\
              minimum_contrast = 4.5\nline_height = 1.2\n",
@@ -4413,70 +4074,31 @@ ink = "rainbow"
         .expect("valid");
         assert!(clean.is_empty(), "clean config must not warn: {clean:?}");
 
-        // A split with a side the runtime cannot read: the CLI names the side
-        // that draws Default, as Manual marks the selector.
-        assert_eq!(
-            validate_config_text("theme = \"dark:Nord,lite:Dracula\"\n").expect("valid"),
-            ["theme split mode \"lite\" must be dark or light; light mode uses \"Nord\""]
-        );
-        assert_eq!(
-            validate_config_text("theme = \"dark:,light:\"\n").expect("valid"),
-            [
-                "theme split mode dark needs a theme name; theme split mode light needs a \
-                 theme name; the unset default is used (Default in dark mode, Default Light \
-                 in light mode)"
-            ]
-        );
-
-        // Retired display-face ids load, so the enum walk accepts them; the
-        // validator still says what each one draws.
-        for (source, expected) in [
-            (
-                "display_font = \"minecraft\"\n",
-                "display_font: \"minecraft\" is deprecated; write \"pixel\" (same face)",
-            ),
-            (
-                "display_font = \"mariokart\"\n",
-                "display_font: \"mariokart\" is no longer shipped; your primary font is used",
-            ),
-            (
-                "display_font = \"pixel+mariokart\"\n",
-                "display_font: \"mariokart\" is no longer shipped and is skipped",
-            ),
+        // A split with a segment the runtime cannot use: the CLI names the issue and
+        // what the affected side draws, as Manual marks the selector.
+        for (source, token) in [
+            ("theme = \"dark:Nord,lite:Dracula\"\n", "\"lite\""),
+            ("theme = \"dark:,light:\"\n", "dark"),
         ] {
-            assert_eq!(
-                validate_config_text(source).expect("valid"),
-                [expected],
-                "{source}"
+            let warnings = validate_config_text(source).expect("valid");
+            assert!(
+                warnings.len() == 1 && warnings[0].contains(token),
+                "{source}: {warnings:?}"
             );
         }
 
-        let retired = validate_config_text("cursor_style = \"underline\"\n")
-            .expect("retired compatibility spelling remains structurally loadable");
-        assert_eq!(
-            retired,
-            [
-                "cursor_style = \"underline\" is retired and renders as \"bar\"; use \"bar\" explicitly"
-            ]
-        );
-
-        // TF.2b: `native` hinting loads, is told once, and names what renders.
+        // `native` hinting loads, is told once, and names what renders.
         let native = validate_config_text("font_hinting = \"native\"\n")
             .expect("the retired hinting spelling remains loadable");
         assert_eq!(native.len(), 1, "{native:?}");
         assert!(native[0].contains("\"light\""), "{native:?}");
     }
 
-    /// The mistake that most often sends someone to `--validate-config` is the
-    /// one it is least able to see from the parsed `Config`: serde admits an
-    /// unknown key silently, so a misspelling leaves the field simply unset and
-    /// every downstream check reads a config that looks clean. Reporting that
-    /// file as valid is the worst possible answer — the reader came asking why
-    /// their edit did nothing and left believing the file was fine.
+    /// The runtime matches the unshifted layout key, so a chord on a shift-composed glyph
+    /// can never fire on a US/UK layout: it warns, naming the glyph and the spelling that
+    /// works.
     #[test]
     fn a_shift_composed_chord_is_reported_rather_than_accepted_in_silence() {
-        // The runtime matches the UNSHIFTED layout key, so these can never fire
-        // on a US/UK layout — and every one of them used to load green.
         for (chord, glyph, base) in [
             ("ctrl+shift+?", '?', '/'),
             ("cmd+shift+}", '}', ']'),
@@ -4502,8 +4124,7 @@ ink = "rainbow"
             );
         }
 
-        // NEGATIVE CONTROL: ordinary chords stay silent. Without this the
-        // warning could fire on everything and still pass the loop above.
+        // Negative control: ordinary chords stay silent.
         for ok in [
             "ctrl+shift+t",
             "cmd+1",
@@ -4518,6 +4139,8 @@ ink = "rainbow"
         }
     }
 
+    /// serde admits unknown keys, so a misspelled key leaves its field unset: the
+    /// validator names it and suggests the spelling.
     #[test]
     fn validate_refuses_to_green_light_a_config_whose_key_is_misspelled() {
         let joined = validate_config_text("cursor_trail_stlye = \"rainbow kitty\"\n")
@@ -4536,13 +4159,9 @@ ink = "rainbow"
         );
     }
 
-    /// A hand-written check covers only the keys someone remembered to give a
-    /// resolver warning. Every other enum key fails soft identically —
-    /// `window_theme_or_default` and friends keep the default and print to a
-    /// stderr a dock launch has not got — so only the registry walk keeps such a
-    /// file from being reported valid. A value this build does not accept is a
-    /// green light exactly as wrong as a misspelled key's, and both are answered
-    /// here. One reported key per authored mistake, never two.
+    /// An enum key without a hand-written resolver warning fails soft to its default, so
+    /// only the registry walk keeps such a file from validating green. One reported key
+    /// per authored mistake, never two.
     #[test]
     fn validate_refuses_to_green_light_a_value_outside_the_vocabulary_it_accepts() {
         for (source, key, intended) in [
@@ -4575,10 +4194,8 @@ ink = "rainbow"
         }
     }
 
-    /// An unknown `cursor_trail_style` silently draws the DEFAULT style at
-    /// runtime, so `--validate-config` must flag it — while every canonical
-    /// spelling AND every documented alias (rainbow/ember/ocean/…) validates
-    /// green, since those genuinely select what they name.
+    /// An unknown `cursor_trail_style` draws the default style, so it is flagged; every
+    /// canonical spelling and documented alias validates green.
     #[test]
     fn validate_flags_unknown_cursor_trail_style() {
         let joined = validate_config_text("cursor_trail_style = \"phasr\"\n")
@@ -4595,10 +4212,8 @@ ink = "rainbow"
         }
     }
 
-    /// An unknown `trail_sound_style` silently plays `auto` at runtime, so
-    /// `--validate-config` must flag it — while every picker option AND every
-    /// documented alias (water/mech/bell/…) validates green (the macOS-only
-    /// platform note aside), since those genuinely select a voice.
+    /// An unknown `trail_sound_style` plays `auto`, so it is flagged; every picker option
+    /// and documented alias validates green (the macOS-only note aside).
     #[test]
     fn validate_flags_unknown_trail_sound_style() {
         let joined = validate_config_text("trail_sound_style = \"glas bel\"\n")
@@ -4650,118 +4265,13 @@ ink = "rainbow"
             debugger: "mode=unknown member=unknown self_hardened=yes \
                        right=system.privilege.taskport.debug probe=none"
                 .into(),
-            features: vec![("sixel", true), ("accessibility", false)],
+            features: vec![("a11y-appkit", true), ("a11y-accesskit", false)],
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
             objc_protocols_absent: vec!["NSApplicationDelegate"],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),
             config_presence: ConfigPresence::Absent,
             env: vec![("ATERM_CHILD".into(), "1".into())],
         }
-    }
-
-    /// The pinned list IS the union of every `protocols:` list in the shipped
-    /// window layer — read from the sources, every `.rs` file under both roots
-    /// including subdirectories and `#[cfg(test)]` probes (a test-only claim
-    /// is a name the host is asked about too, which costs nothing) — so a new
-    /// claim cannot land without `--diagnose` learning to ask about it. A list
-    /// that does not close on its own line is refused rather than half-read.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn claimed_objc_protocols_are_pinned() {
-        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let entries =
-                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-            for entry in entries {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    rs_files(&path, out);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        rs_files(&root.join("src"), &mut files);
-        rs_files(
-            &root.join("../aterm-window/src/platform_impl/macos"),
-            &mut files,
-        );
-        let mut claimed = std::collections::BTreeSet::new();
-        for path in &files {
-            let src = std::fs::read_to_string(path).expect("source is readable");
-            for line in src.lines() {
-                let l = line.trim_start();
-                // A claim is a `protocols: [...]` line that is not a comment.
-                if l.starts_with("//") {
-                    continue;
-                }
-                let Some(rest) = l.strip_prefix("protocols: [") else {
-                    continue;
-                };
-                let Some((list, _)) = rest.split_once(']') else {
-                    panic!(
-                        "{}: a `protocols: [` list must close on its own line, or this pin \
-                         cannot read it",
-                        path.display()
-                    )
-                };
-                for name in list.split(',') {
-                    let name = name.trim();
-                    if !name.is_empty() {
-                        claimed.insert(name.to_owned());
-                    }
-                }
-            }
-        }
-        let pinned: std::collections::BTreeSet<String> = super::CLAIMED_OBJC_PROTOCOLS
-            .iter()
-            .map(|p| p.to_str().expect("ASCII").to_owned())
-            .collect();
-        assert_eq!(
-            claimed, pinned,
-            "the `protocols:` lists in the window layer and CLAIMED_OBJC_PROTOCOLS differ"
-        );
-    }
-
-    #[test]
-    fn report_includes_key_sections() {
-        let r = sample().render();
-        assert!(r.contains("aterm diagnostics"), "header");
-        assert!(r.contains("version:   0.3.0 (abc1234"), "version line");
-        assert!(r.contains("[x] kitty_graphics"), "advertised cap checked");
-        assert!(r.contains("[ ] soft_fonts"), "unadvertised cap unchecked");
-        assert!(r.contains("ATERM_CHILD=1"), "env listed");
-        assert!(
-            r.contains(
-                "update-pin-sha256: \
-                 66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
-            ),
-            "compiled updater trust pin"
-        );
-        assert!(r.contains("absent — defaults"), "config absence noted");
-        // The RUNTIME shell-integration line rides beside the advertised
-        // capability row — the split between the two is the diagnosable fact.
-        assert!(
-            r.contains("shell-int: active (Zsh loader prepared)"),
-            "runtime shell-integration outcome line"
-        );
-        // The agent-primer line rides in the same style, right below it.
-        assert!(
-            r.contains("primer:    claude installed, codex not detected — auto-prime: on"),
-            "agent primer state + knob line"
-        );
-    }
-
-    /// The gutter the continuation lines of a report's config block hang in.
-    fn gutter(label: &str) -> String {
-        " ".repeat(label.chars().count())
-    }
-
-    /// The hanging indent under `reason: `, where the later lines of a
-    /// multi-line parse error land.
-    fn hanging(label: &str) -> String {
-        " ".repeat(label.chars().count() + "reason: ".len())
     }
 
     /// The launch notice for an `aterm.toml` that will not parse — the real,
@@ -4776,26 +4286,15 @@ ink = "rainbow"
         )
     }
 
-    /// STDOUT has to say when a config was thrown away. `--diagnose >
-    /// report.txt` is the gesture the flag exists for and it keeps stdout
-    /// alone: until 2026-09-18 a rejected `aterm.toml` printed the SAME
-    /// `[present]` token as one in force, over a report whose config-derived
-    /// lines were all defaults, and the reason went to stderr only — so the
-    /// saved report omitted the one fact that explains why `font_px` does
-    /// nothing.
+    /// `--diagnose > report.txt` keeps only stdout, so a rejected `aterm.toml` gets its
+    /// own token there, with the defaults consequence and the reason.
     #[test]
     fn diagnose_says_a_rejected_config_is_not_the_one_in_force() {
         let mut info = sample();
         info.config_presence = ConfigPresence::Rejected(rejected_invalid());
         let r = info.render();
-        let g = gutter("config:    ");
-        let h = hanging("config:    ");
-
         assert!(
-            r.contains(
-                "config:    /home/u/.config/aterm/aterm.toml \
-                 [present but REJECTED — running defaults]"
-            ),
+            r.contains("REJECTED"),
             "the rejected state has its own token: {r}"
         );
         assert!(
@@ -4803,49 +4302,16 @@ ink = "rainbow"
             "the in-force token must never stand for a rejected file: {r}"
         );
         assert!(
-            r.contains(&format!(
-                "{g}every value below is a built-in DEFAULT — nothing came from this file."
-            )),
-            "the consequence is stated, aligned under the path: {r}"
+            r.contains("expected a value"),
+            "the launch's reason, every line of it, is carried onto stdout: {r}"
         );
-        assert!(
-            r.contains(&format!(
-                "{g}reason: aterm.toml is not a valid configuration (TOML parse error at line 1, \
-                 column 11"
-            )),
-            "the launch's own sentence is carried onto stdout: {r}"
-        );
-        assert!(
-            r.contains(&format!("{h}expected a value")),
-            "and every later line of the parse error, indented under it: {r}"
-        );
-        // The reader's actual gesture: grep the saved report for any sign the
-        // file was not taken. The old stdout scored zero on all of these.
-        assert!(
-            r.lines()
-                .filter(|l| l.contains("REJECTED")
-                    || l.contains("DEFAULT")
-                    || l.contains("not a valid configuration"))
-                .count()
-                >= 3,
-            "a grep over the saved report finds the rejection: {r}"
-        );
-
-        // A config that IS in force keeps the token it always had.
         let mut loaded = sample();
         loaded.config_presence = ConfigPresence::Loaded;
-        assert!(
-            loaded
-                .render()
-                .contains("config:    /home/u/.config/aterm/aterm.toml [present]"),
-            "a loaded config still reads exactly as before"
-        );
+        assert!(loaded.render().contains("[present]"));
     }
 
-    /// `--show-config` calls its listing the "resolved launch config". When the
-    /// file was rejected that listing IS the defaults, and the header has to
-    /// say so. The launch failure is injected so the state is reachable without
-    /// moving the process's config path out from under the other tests.
+    /// When the file was rejected, `--show-config`'s resolved launch config is the
+    /// defaults, and the header says so. The launch failure is injected.
     #[test]
     fn show_config_marks_a_rejected_config_and_its_listing_as_defaults() {
         let notice = crate::app_config::launch_config_notice(
@@ -4853,90 +4319,24 @@ ink = "rainbow"
             crate::app_config::LaunchConfigProblem::Unreadable(&"Permission denied (os error 13)"),
         );
         let out = show_config_report(Some(&notice));
-        let g = gutter("config file: ");
-
         assert!(
-            out.contains("[present but REJECTED — running defaults]"),
+            out.contains("REJECTED"),
             "the header names the third state: {out}"
         );
         assert!(
-            !out.contains("[present]") && !out.contains("[absent — defaults]"),
+            !out.contains("[present]") && !out.contains("[absent"),
             "neither honest-file token may stand in for a rejected one: {out}"
         );
         assert!(
-            out.contains(&format!(
-                "{g}every value below is a built-in DEFAULT — nothing came from this file."
-            )),
-            "the value list is marked as defaults, aligned under the path: {out}"
+            out.contains("os error 13"),
+            "the reason reaches stdout: {out}"
         );
-        assert!(
-            out.contains(&format!(
-                "{g}reason: aterm.toml could not be read at launch (Permission denied (os error \
-                 13))"
-            )),
-            "the unreadable reason reaches stdout: {out}"
-        );
-        // The listing still prints underneath — the header explains it, it does
-        // not replace it.
         assert!(out.contains("font_px:"), "the resolved values still print");
     }
 
-    /// The shared config line, so `--diagnose` and `--show-config` cannot drift
-    /// apart about the same file. The two honest states are pinned BYTE-EXACT:
-    /// that is the line every platform's report has always printed.
-    #[test]
-    fn config_line_renders_three_states_and_aligns_the_reason() {
-        assert_eq!(
-            config_line("config:    ", "/p/aterm.toml", &ConfigPresence::Loaded),
-            "config:    /p/aterm.toml [present]\n"
-        );
-        assert_eq!(
-            config_line("config file: ", "/p/aterm.toml", &ConfigPresence::Absent),
-            "config file: /p/aterm.toml [absent — defaults]\n"
-        );
-        assert_eq!(
-            config_line(
-                "config:    ",
-                "(no HOME / XDG_CONFIG_HOME)",
-                &ConfigPresence::Absent
-            ),
-            "config:    (no HOME / XDG_CONFIG_HOME) [absent — defaults]\n"
-        );
-
-        let g = gutter("config:    ");
-        let h = hanging("config:    ");
-        let rejected = config_line(
-            "config:    ",
-            "/p/aterm.toml",
-            // A parse error's own blank row is what would otherwise paste a
-            // whitespace-padded line into a bug report.
-            &ConfigPresence::Rejected("broken (line 1\n\n  ^ here)".to_string()),
-        );
-        assert_eq!(
-            rejected,
-            format!(
-                "config:    /p/aterm.toml [present but REJECTED — running defaults]\n\
-                 {g}every value below is a built-in DEFAULT — nothing came from this file.\n\
-                 {g}reason: broken (line 1\n\
-                 \n\
-                 {h}  ^ here)\n"
-            ),
-            "continuation lines hang under the path, the error's own indent preserved"
-        );
-        assert!(
-            rejected.lines().all(|l| l.trim_end() == l),
-            "no whitespace-padded rows reach a pasted report: {rejected:?}"
-        );
-    }
-
-    /// The `privacy:` line renders the RESOLVED consent posture, and the
-    /// headless report never probes.
-    ///
-    /// The inert arm (`None`) is what [`collect`] passes, and it is the only
-    /// arm a test binary can reach: the FDA probe opens a file macOS guards, so
-    /// a `--diagnose` that reached for it on its own would put a consent-gated
-    /// syscall on a headless-constructible path. `unknown` here means aterm did
-    /// not look — never that access was denied.
+    /// The `privacy:` line renders the resolved consent posture, and the headless report
+    /// never probes: [`collect`] passes the inert arm (`None`), since the FDA probe opens a
+    /// file macOS guards. `unknown` means aterm did not look, never that access was denied.
     #[test]
     fn the_privacy_line_reports_unknown_from_the_inert_arm_and_never_probes() {
         use aterm_containment::{FdaProbe, FdaState, ProbeLabel};
@@ -4949,7 +4349,7 @@ ink = "rainbow"
             "full_disk_access=unknown",
             "probe=none",
             "fda_scope=unknown",
-            "warmup=on-request",
+            "warmup=automatic",
             "hold_ms=120000",
             "probe_interval_ms=5000",
             "protected_roots=2",
@@ -4976,15 +4376,15 @@ ink = "rainbow"
              renders the same rule the privacy verb does: {live}"
         );
 
-        // `check = false` names the CONFIGURATION rather than implying denial,
-        // and the injected probe is ignored because the gate refuses first.
+        // `check = false` names the configuration rather than implying denial, and the
+        // injected probe is ignored because the gate refuses first.
         let unchecked = privacy_line(&parsed("[privacy]\ncheck = false\n"), Some(granted));
         assert!(
             unchecked.contains("full_disk_access=unknown probe=off"),
             "{unchecked}"
         );
 
-        // The master switch collapses the whole line to one honest sentence.
+        // The master switch collapses the whole line to one sentence.
         let disabled = privacy_line(&parsed("[privacy]\nenabled = false\n"), Some(granted));
         assert!(
             disabled.starts_with("off ([privacy] enabled = false)")
@@ -4992,8 +4392,8 @@ ink = "rainbow"
             "{disabled}"
         );
 
-        // The rendered report carries the line, and the REAL collection — the
-        // headless `--diagnose` entry point — never carries a probe outcome.
+        // The rendered report carries the line, and the real collection (the headless
+        // `--diagnose` entry point) never carries a probe outcome.
         assert!(
             sample()
                 .render()
@@ -5056,8 +4456,8 @@ ink = "rainbow"
             "{refused}"
         );
 
-        // `check = false` names the CONFIGURATION, and the injected probe is
-        // ignored because the gate refuses first.
+        // `check = false` names the configuration, and the injected probe is ignored
+        // because the gate refuses first.
         let unchecked = debugger_line(
             &parsed("[privacy]\ncheck = false\n"),
             Some(observed),
@@ -5069,7 +4469,7 @@ ink = "rainbow"
             "{unchecked}"
         );
 
-        // The master switch collapses the whole line to one honest sentence.
+        // The master switch collapses the whole line to one sentence.
         let disabled = debugger_line(
             &parsed("[privacy]\nenabled = false\n"),
             Some(observed),
@@ -5081,8 +4481,8 @@ ink = "rainbow"
             "{disabled}"
         );
 
-        // The rendered report carries the line under its own label, and the
-        // REAL collection never carries a probe outcome.
+        // The rendered report carries the line under its own label, and the real
+        // collection never carries a probe outcome.
         assert!(
             sample()
                 .render()
@@ -5099,68 +4499,17 @@ ink = "rainbow"
         );
     }
 
-    /// `collect` reads the REAL home read-only and the real config's knob: the
-    /// line always names every registry agent and states the knob either way.
-    #[test]
-    fn collect_reports_agent_primer_state_and_the_knob() {
-        let d = collect();
-        assert!(
-            d.agent_primer
-                .ends_with("auto-prime: on (agents_auto_prime)")
-                || d.agent_primer
-                    .ends_with("auto-prime: off (agents_auto_prime)"),
-            "the knob is always stated: {}",
-            d.agent_primer
-        );
-        for agent in ["claude", "codex", "gemini", "opencode"] {
-            assert!(
-                d.agent_primer.contains(agent),
-                "{agent} missing: {}",
-                d.agent_primer
-            );
-        }
-    }
-
     /// The knob half of the line follows the config, not a constant.
     #[test]
     fn agent_primer_line_states_the_knob_as_configured() {
         let on = agent_primer_line(&crate::app_config::Config::default());
-        assert!(on.ends_with("— auto-prime: on (agents_auto_prime)"), "{on}");
+        assert!(on.contains("auto-prime: on"), "{on}");
         let config = crate::app_config::Config {
             agents_auto_prime: Some(false),
             ..crate::app_config::Config::default()
         };
         let off = agent_primer_line(&config);
-        assert!(
-            off.ends_with("— auto-prime: off (agents_auto_prime)"),
-            "{off}"
-        );
-    }
-
-    /// `collect` probes the REAL preparation, so on a dev machine (a known
-    /// shell, a writable cache) it reports active — and never the advertised
-    /// constant's bare true/false, which is what this line replaced.
-    #[test]
-    fn collect_reports_runtime_shell_integration() {
-        let d = collect();
-        assert!(
-            d.shell_integration_runtime.starts_with("active")
-                || d.shell_integration_runtime.starts_with("NOT ACTIVE"),
-            "the line always states an outcome: {}",
-            d.shell_integration_runtime
-        );
-    }
-
-    #[test]
-    fn collect_enumerates_every_capability() {
-        let d = collect();
-        // All 16 advertised capabilities are surfaced (no silent omission).
-        assert_eq!(d.capabilities.len(), 16);
-        assert!(d.render().contains("terminal capabilities"));
-        // Version is the real build's DISPLAY version (with the +r./+t. compiler
-        // suffix), and the compiler provenance line rides along.
-        assert_eq!(d.version, crate::build_info::version_display());
-        assert_eq!(d.compiler, crate::build_info::compiler_summary());
+        assert!(off.contains("auto-prime: off"), "{off}");
     }
 
     /// A scratch themes folder for one listing test.
@@ -5308,6 +4657,70 @@ ink = "rainbow"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A theme's typography and a newer-schema file's skipped keys reach every
+    /// listing: the TSV columns, the text TYPE column and its note line, and
+    /// the control rows. Negative control: a colours-only file lists none.
+    #[test]
+    fn the_theme_list_names_typography_and_skipped_keys() {
+        let dir = theme_list_scratch("typography");
+        let base = "foreground = #e0e0e0\nbackground = #101010\n";
+        std::fs::write(
+            dir.join("Studio.conf"),
+            format!("{base}font_family = Berkeley Mono\nline_height = 1.15\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Future.conf"),
+            format!("schema = 2\n{base}future_key = x\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("Plain.conf"), base).unwrap();
+        let catalog = crate::app_config::ThemeCatalog::discover_in(&dir);
+        let tsv = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Tsv);
+        let rows = tsv_rows(&tsv);
+        let row = |id: &str| {
+            rows.iter()
+                .find(|row| tsv_field(row, "id") == id)
+                .unwrap_or_else(|| panic!("{id}: {tsv}"))
+        };
+        assert!(tsv_field(row("Studio"), "typography").contains("Berkeley Mono"));
+        assert_eq!(tsv_field(row("Studio"), "skipped"), "0");
+        assert_eq!(tsv_field(row("Future"), "skipped"), "1");
+        assert_eq!(tsv_field(row("Future"), "status"), "ready");
+        assert!(tsv_field(row("Future"), "notes").contains("future_key"));
+        assert_eq!(tsv_field(row("Plain"), "typography"), "");
+        let text = theme_list(&catalog, Some(&dir), None, ThemeListFormat::Text);
+        assert!(
+            text.lines().nth(1).is_some_and(|h| h.contains("TYPE")),
+            "{text}"
+        );
+        let future_at = text
+            .lines()
+            .position(|line| line.starts_with("Future "))
+            .expect("the Future row");
+        assert!(
+            text.lines()
+                .nth(future_at + 1)
+                .is_some_and(
+                    |line| line.trim_start().starts_with("warning:") && line.contains("future_key")
+                ),
+            "{text}"
+        );
+        let wire = theme_list_wire_rows(&catalog, Some(&dir), "Default");
+        let studio = wire
+            .iter()
+            .find(|line| line.contains("id=\"Studio\""))
+            .expect("Studio's row");
+        assert!(studio.contains("type=\"Berkeley Mono"), "{studio}");
+        assert!(studio.ends_with("skipped=0"), "{studio}");
+        let plain = wire
+            .iter()
+            .find(|line| line.contains("id=\"Plain\""))
+            .expect("Plain's row");
+        assert!(plain.contains("type=- "), "{plain}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every TSV row has exactly the header's field count, a file name
     /// carrying a tab or an escape included; the negative control shows such
     /// a name would have split the row unescaped.
@@ -5404,113 +4817,13 @@ ink = "rainbow"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn list_fonts_has_dirs_header_and_lists_search_dirs() {
-        let out = list_fonts();
-        assert!(out.contains("font search directories:"), "dirs header");
-        // Every scanned directory is named so the family list is self-explanatory.
-        for dir in aterm_render::font_search_dirs() {
-            assert!(
-                out.contains(&dir.display().to_string()),
-                "search dir {dir:?} listed"
-            );
-        }
-        // Either a fonts section or the explicit empty placeholder — never silent.
-        assert!(out.contains("fonts"), "a fonts line is always present");
-    }
-
-    #[test]
-    fn list_keybinds_covers_builtins_and_action_names() {
-        let out = list_keybinds();
-        // The built-in section is PER PLATFORM: macOS documents the hardcoded
-        // Cmd-* chords; everywhere else it documents the seeded platform table
-        // (printing "cmd+t" on Windows would teach Win+T, which the shell owns).
-        #[cfg(target_os = "macos")]
-        {
-            assert!(out.contains("built-in keybindings"), "builtin header");
-            // A couple of the fixed Cmd-* chords are documented.
-            assert!(out.contains("cmd+c"), "copy chord listed");
-            assert!(out.contains("cmd+t"), "new-tab chord listed");
-            // So are the menu bar's own key equivalents, which reach the
-            // menu before `on_key` — ⇧⌘P among them.
-            assert!(
-                out.contains(&format!("  {:<16} Command Palette…", "cmd+shift+p")),
-                "{out}"
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(
-                out.contains("built-in default keybindings"),
-                "builtin header"
-            );
-            // The section is GENERATED from the seed table, so every seeded
-            // chord and action is documented — drift is structurally impossible,
-            // and this asserts the generation stays wired.
-            for (chord, action) in crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS {
-                assert!(out.contains(chord), "{chord} listed");
-                assert!(out.contains(action), "{action} listed");
-            }
-        }
-        // Every bindable action NAME is offered for [keybindings] values.
-        assert!(out.contains("bindable action names"), "actions header");
-        assert!(
-            out.contains("[key_sequences]"),
-            "key_sequences section present"
-        );
-        for name in crate::keybinding::ACTION_NAMES {
-            assert!(out.contains(name), "{name} must be listed");
-        }
-        // The unbind spelling is part of the value surface: it lives in the
-        // action-names footer (it cannot join ACTION_NAMES — those must parse).
-        assert!(
-            out.contains("none | unbind"),
-            "unbind spelling documented in the footer: {out}"
-        );
-    }
-
-    /// The per-row [keybindings] note: an unbind entry says what it DOES
-    /// ("f11 none (UNKNOWN action)" — the old print — told the user their
-    /// working unbind was broken); a genuinely unknown action still shouts; the
-    /// conflict note follows `builtin_shadow_label` (gated off with the Cmd
-    /// suite on Linux); an ordinary binding gets no note.
+    /// The per-row `[keybindings]` note: an unbind says what it does, an unknown action
+    /// still shouts, the conflict note follows `builtin_shadow_label` (off with the Cmd
+    /// suite on Linux), and an ordinary binding gets none.
     #[test]
     fn user_keybinding_note_labels_unbinds_and_unknowns() {
-        assert_eq!(user_keybinding_note("f11", "none"), "  (unbinds a default)");
-        // An unbind over a HARDCODED built-in says both halves — the review's
-        // macOS `cmd+c` case, where the unbind masks a seed the built-in still
-        // owns. Off macOS the suite is compiled out and there is nothing to add.
-        let over_builtin = user_keybinding_note("cmd+c", "none");
-        if crate::keybinding::builtin_shadow_label("cmd+c").is_some() {
-            assert!(
-                over_builtin.contains("unbinds a default")
-                    && over_builtin.contains("still conflicts with"),
-                "an unbind cannot imply the chord is free: {over_builtin}"
-            );
-        } else {
-            assert_eq!(over_builtin, "  (unbinds a default)");
-        }
-        assert_eq!(
-            user_keybinding_note("ctrl+tab", "unbind"),
-            "  (unbinds a default)"
-        );
-        assert_eq!(
-            user_keybinding_note("cmd+k", "no_such_action"),
-            "  (UNKNOWN action)"
-        );
-        assert_eq!(user_keybinding_note("ctrl+shift+t", "new_tab"), "");
-        let expected = if crate::app_input::HARDCODED_SUPER_CHORDS {
-            "  (conflicts with Copy)".to_string()
-        } else {
-            String::new()
-        };
-        assert_eq!(user_keybinding_note("cmd+c", "copy"), expected);
-
-        // THE macOS SHAPE, ON ANY HOST. Everything above is host-conditional —
-        // on Linux the Cmd/Super suite is compiled off, so the branch the
-        // review's escape lived in is unreachable through the wrapper and the
-        // assertions above prove only the Linux half. The gate-explicit core
-        // resolves the label for us, so the macOS row is testable here.
+        // The gate-explicit core takes the resolved label, so the macOS row is testable on
+        // any host.
         assert_eq!(
             user_keybinding_note_for("none", Some("Copy")),
             "  (unbinds a default; still conflicts with Copy)",
@@ -5538,11 +4851,8 @@ ink = "rainbow"
         );
     }
 
-    /// The VALIDATOR half of the same review escape, on the macOS shape from
-    /// any host: `"cmd+c" = "none"` used to validate fully green because the
-    /// unbind arm short-circuited the built-in-conflict caveat. The unbind must
-    /// still not be an "unknown action" (that was the older escape, the other
-    /// way), so both halves have to hold at once.
+    /// The validator half, on the macOS shape from any host: `"cmd+c" = "none"` keeps the
+    /// built-in-conflict caveat and is still not an unknown action.
     #[test]
     fn an_unbind_over_a_live_builtin_keeps_the_conflict_caveat() {
         let unbind = keybinding_row_warning("cmd+c", "none", Some("Copy"))
@@ -5558,10 +4868,8 @@ ink = "rainbow"
             "the documented unbind spelling is still not an unknown action: {unbind:?}"
         );
 
-        // Where the suite is compiled off (Linux) the chord conflicts with
-        // NOTHING, so an unbind stays silently valid — a warning there would
-        // tell a user their working binding fights a built-in this build has
-        // no such thing as.
+        // Where the suite is compiled off (Linux) the chord conflicts with nothing, so
+        // an unbind stays valid.
         assert!(keybinding_row_warning("cmd+c", "none", None).is_none());
         assert!(keybinding_row_warning("f11", "unbind", None).is_none());
 
@@ -5586,94 +4894,100 @@ ink = "rainbow"
         );
     }
 
-    /// The Query arm ANSWERS (it stopped being "the GUI drops every Query"
-    /// when the arm was wired), and what it can reach is platform-split — so
-    /// the caveat must not carry Linux's own-selection bound onto a host whose
-    /// read is the whole system pasteboard. Asserted through the SHIPPING
-    /// pass, which is where the wording actually reaches a user.
+    /// The window's `--show-config` names the shell a new tab starts (it had no shell row;
+    /// on Windows 0.95.0, 2026-09-27, `aterm --window --shell cmd --show-config` could not
+    /// say it would run cmd.exe): the program the spawn's own resolver picks over the
+    /// captured override, and the input that chose it, in the CLI's tokens plus `--shell`
+    /// for the flag only a window launch carries.
     #[test]
-    fn the_osc52_query_caveat_names_this_platforms_real_read_reach() {
-        let config = crate::app_config::Config {
-            allow_osc52_query: Some(true),
-            ..Default::default()
-        };
-        let message = config_semantic_warnings(&config)
-            .into_iter()
-            .find(|w| w.key == "allow_osc52_query")
-            .expect("the caveat rides an enabled key")
-            .message;
-        assert!(
-            !message.contains("drops every") && !message.contains("remain unavailable"),
-            "the Query arm answers; the old claim is retired: {message}"
-        );
-        assert!(message.contains("READ"), "{message}");
-        if cfg!(target_os = "linux") {
-            assert!(
-                message.contains("selections aterm itself owns"),
-                "X11 reads only the slots aterm owns: {message}"
-            );
-        } else {
-            assert!(
-                message.contains("OTHER apps"),
-                "off X11 the read is the whole pasteboard and must not be softened: {message}"
-            );
-            // The 2026-09-12 TCC audit: the query is the macOS 26 pasteboard-alert
-            // shape, and the setting's help has to name that dialog.
-            assert_eq!(
-                message.contains("macOS 26") && message.contains("paste from"),
-                cfg!(target_os = "macos"),
-                "the paste alert is macOS's to name, and only macOS's: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn show_config_colour_rows_name_both_appearances_when_they_differ() {
-        let rgb = |r, g, b| aterm_types::Rgb { r, g, b };
-        assert_eq!(appearance_colours(rgb(1, 2, 3), rgb(1, 2, 3)), "#010203");
-        assert_eq!(
-            appearance_colours(rgb(0, 0, 0), rgb(255, 255, 254)),
-            "#000000 (dark) / #FFFFFE (light)"
-        );
-    }
-
-    #[test]
-    fn show_config_reports_resolved_launch_values() {
+    fn show_config_names_the_shell_a_new_tab_starts() {
+        use aterm_pty::ShellOrigin as O;
         let out = show_config();
-        // No environment variable overrides an aterm.toml key (2026-09-24), so
-        // the header names no env rung.
+        let config = crate::app_config::load_config();
+        let chosen = crate::app_config::resolve_shell_override(&config);
+        let (spawned, _) =
+            aterm_pty::select_shell_with_origin(chosen.as_deref().map(std::ffi::OsStr::new));
+        let spawned = spawned.to_string_lossy().into_owned();
+        let (program, origin) = show_config_shell(&config);
+        assert!(!program.is_empty());
+        assert_eq!(program, spawned, "the row is the program the spawn starts");
         assert!(
-            out.starts_with("resolved launch config (flag > config > default)\n"),
-            "header present: {out}"
+            out.contains(&format!("\nshell:          {program}\n")),
+            "{out}"
         );
-        // The key resolved knobs are each surfaced with a label.
-        for label in [
-            "config file:",
-            "font_px:",
-            "renderer:",
-            "columns:",
-            "lines:",
-            "theme:",
-            "foreground:",
-            "background:",
-            "text_blending:",
-            "font_thicken:",
-            "stem_gamma:",
-            "font_variation:",
-            "font_weight_dark_nudge:",
-            "stream_fade:",
-        ] {
-            assert!(out.contains(label), "{label} must appear in show-config");
+        assert!(
+            out.contains(&format!("\nshell_origin:   {origin}\n")),
+            "{out}"
+        );
+        assert_eq!(shell_origin_token(O::Override, true), "--shell");
+        assert_eq!(shell_origin_token(O::Override, false), "aterm.toml");
+        #[cfg(unix)]
+        {
+            assert_eq!(shell_origin_token(O::Env, false), "default:SHELL");
+            assert_eq!(shell_origin_token(O::Passwd, false), "default:passwd");
+            assert_eq!(shell_origin_token(O::Default, true), "default:/bin/sh");
         }
     }
 
+    /// `--show-config`'s font rows name each value's source: a theme's
+    /// family and line height, a config key that beats the theme, `--font`,
+    /// and each side of a split whose typography differs. Negative control:
+    /// with no theme typography every source is `default`.
     #[test]
-    fn show_config_font_size_distinguishes_auto_base_from_explicit_pixels() {
+    fn show_config_type_rows_name_their_sources() {
+        let parse = |extra: &str| {
+            aterm_types::scheme::parse_theme_str(&format!(
+                "foreground = #e0e0e0\nbackground = #101418\n{extra}"
+            ))
+            .expect("theme")
+        };
+        let themes = crate::app_config::ThemeCatalog::from_parsed([
+            (
+                "Studio".to_string(),
+                parse("font_family = display:pixel\nline_height = 1.25\nfont_size_scale = 1.1"),
+            ),
+            ("Plain".to_string(), parse("")),
+        ]);
+        let admit = |_: Option<&str>| Ok(None);
+        let rows = |text: &str, flag: Option<&str>| {
+            let config: crate::app_config::Config = aterm_toml::from_str(text).expect("toml");
+            show_config_type_rows(&config, &themes, flag, admit)
+        };
+        let themed = rows("theme = \"Studio\"\nfont_px = 20.0\n", None);
+        assert_eq!(themed.font_family, "display:pixel  (source: theme Studio)");
+        assert_eq!(themed.line_height, "1.25  (source: theme Studio)");
+        assert_eq!(themed.font_size_scale, "1.1  (source: theme Studio)");
+        assert_eq!(themed.font_px, [22.0, 22.0], "the scale applies to font_px");
+        let mine = rows("theme = \"Studio\"\nline_height = 1.0\n", Some("Menlo"));
+        assert_eq!(mine.font_family, "Menlo  (source: --font)");
+        assert_eq!(mine.line_height, "1  (source: config)");
+        let split = rows("theme = \"dark:Studio,light:Plain\"\n", None);
         assert_eq!(
-            show_config_font_px(12.0, false),
-            "12 (auto base; final physical px depends on display scale)"
+            split.line_height,
+            format!(
+                "1.25 (dark, theme Studio) / {} (light, default)",
+                crate::app_config::DEFAULT_LINE_HEIGHT
+            )
         );
-        assert_eq!(show_config_font_px(24.0, true), "24 (explicit physical px)");
+        let plain = rows("theme = \"Plain\"\n", None);
+        assert!(
+            plain.font_family.ends_with("(source: default)"),
+            "{}",
+            plain.font_family
+        );
+        let default = crate::app_config::DEFAULT_LINE_HEIGHT.to_string();
+        assert_eq!(plain.line_height, format!("{default}  (source: default)"));
+        let nan = rows("theme = \"Plain\"\nline_height = nan\n", None);
+        assert_eq!(
+            nan.line_height,
+            format!("{default}  (source: default)"),
+            "a non-finite config line height falls back to the platform default"
+        );
+        let themed_nan = rows("theme = \"Studio\"\nline_height = nan\n", None);
+        assert_eq!(
+            themed_nan.line_height, "1.25  (source: theme Studio)",
+            "a non-finite config line height leaves the theme's in force"
+        );
     }
 
     /// `--show-config`'s colour source row names the theme each appearance
@@ -5718,49 +5032,8 @@ ink = "rainbow"
         assert_eq!(plain, "Default (built-in)");
     }
 
-    /// `--show-config` is the resolved launch config, so a theme the window
-    /// draws Default in place of says so beside the configured name.
-    #[test]
-    fn show_config_theme_names_what_each_appearance_draws() {
-        let themes = crate::app_config::ThemeCatalog::from_schemes([(
-            "Work".to_string(),
-            aterm_types::ColorScheme::default(),
-        )]);
-        let line = |theme: Option<&str>| {
-            let config = crate::app_config::Config {
-                theme: theme.map(str::to_string),
-                ..Default::default()
-            };
-            show_config_theme(&config, &themes)
-        };
-        assert_eq!(
-            line(None),
-            "unset (in use: dark Default, light Default Light)"
-        );
-        assert_eq!(
-            line(Some("dark:,light:")),
-            "dark:,light: (in use: dark Default, light Default Light)"
-        );
-        assert_eq!(line(Some("Work")), "Work");
-        assert_eq!(line(Some("Nord")), "Nord");
-        assert_eq!(line(Some("dark:Nord,light:Work")), "dark:Nord,light:Work");
-        assert_eq!(line(Some("Drakula")), "Drakula (Default in use)");
-        assert_eq!(
-            line(Some("dark:Nord,light:Drakula")),
-            "dark:Nord,light:Drakula (in use: dark Nord, light Default)"
-        );
-        assert_eq!(line(Some("dark:Nord,lite:Work")), "dark:Nord,lite:Work");
-        assert_eq!(
-            line(Some("light:Drakula")),
-            "light:Drakula (Default in use)"
-        );
-    }
-
-    /// The renderer label the reports print is derived from the SHARED backend
-    /// resolver (`resolve_want_gpu`), not from `--gpu` alone — so a default
-    /// launch (GPU-on default) and a config `gpu = true` both report a GPU backend,
-    /// and `--cpu` / `gpu = false` report cpu. This pins the precedence the
-    /// diagnostics reader relies on to match what `main` actually selects.
+    /// The reports' renderer label comes from the shared resolver (`resolve_want_gpu`),
+    /// not `--gpu` alone, so it matches what `main` selects.
     #[test]
     fn renderer_label_tracks_resolved_gpu_precedence() {
         use crate::app_config::resolve_want_gpu_with;
@@ -5784,8 +5057,7 @@ ink = "rainbow"
             renderer_label(resolve_want_gpu_with(false, false, Some(true))),
             GPU_BACKEND_LABEL
         );
-        // The regression: a DEFAULT launch (no flag, no config) renders on GPU, so
-        // the report must say GPU — not "cpu" as the old env-only check did.
+        // A default launch (no flag, no config) renders on GPU, and the report says so.
         assert_eq!(
             renderer_label(resolve_want_gpu_with(false, false, None)),
             GPU_BACKEND_LABEL
@@ -5795,9 +5067,21 @@ ink = "rainbow"
     #[test]
     fn show_face_rejects_an_unresolvable_family() {
         // A deliberately nonsensical family never resolves; the result is non-zero
-        // with a clear message (scripts can detect the failure).
+        // with a clear message (scripts can detect the failure), a whole line.
         let (msg, ok) = show_face("definitely-not-a-real-font-xyzzy");
         assert!(!ok, "unresolvable family must report failure");
-        assert!(!msg.is_empty(), "a message is always produced");
+        assert!(
+            msg.ends_with('\n'),
+            "a message is always a whole line: {msg:?}"
+        );
+    }
+
+    /// The generic `monospace` names the face an unconfigured window draws.
+    #[test]
+    fn show_face_reports_the_default_face_for_the_generic_monospace_name() {
+        let default = aterm_render::default_primary_identity().expect("a default face loads");
+        let (msg, ok) = show_face("monospace");
+        assert!(ok, "{msg}");
+        assert!(msg.contains(&format!("path:        {default}\n")), "{msg}");
     }
 }

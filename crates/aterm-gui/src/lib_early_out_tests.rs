@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::{App, Backend, RepaintKey, SelectionFingerprint, WindowId};
-use crate::app_render::{
-    project_asymmetric_pad_layout_key, should_repaint, should_repaint_or_recover,
-};
+use crate::app_render::{project_asymmetric_pad_layout_key, should_repaint};
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
 use aterm_render::{DamageOutcome, RenderInput};
@@ -107,7 +105,6 @@ pub(super) fn frame_key(
         scroll_frac_px: 0,
         relaunch_fp: 0,
         badge_fp: 0,
-        bubble_fp: 0,
         level_up_fp: 0,
         band_fp: 0,
         presence_fp: 0,
@@ -240,7 +237,7 @@ fn explicit_inactive_selection_focus_flip_invalidates_and_repaints() {
 /// Drives the `AsymmetricPadLayout` cache actions against the real `RepaintKey` comparison.
 /// The spec xref gate is its only caller.
 pub(super) fn run_asymmetric_pad_layout_conformance() {
-    let model = aterm_spec::derive::asymmetric_pad_layout_model();
+    let model = aterm_models_render::asymmetric_pad_layout_model();
     let picked = model
         .successors("PickLayout", &model.init_state())
         .into_iter()
@@ -337,17 +334,6 @@ fn dropped_surface_attempt_unstamps_same_key_for_retry() {
         should_repaint(stamp, key),
         "the same frame must be eligible on the very next redraw"
     );
-}
-
-/// A surface-recovery redraw bypasses an identical key, so unchanged cells cannot swallow the
-/// frame that fills newly exposed bands or acknowledges a CPU fallback.
-#[test]
-fn outstanding_recovery_bypasses_identical_repaint_key() {
-    let mut term = Terminal::new(4, 10);
-    let key = frame_key(&mut term, true, false, None);
-    assert!(!should_repaint(Some(key), key));
-    assert!(!should_repaint_or_recover(Some(key), key, false));
-    assert!(should_repaint_or_recover(Some(key), key, true));
 }
 
 /// A bare caret move changes the `RepaintKey`, so the redraw after a torn caret cannot

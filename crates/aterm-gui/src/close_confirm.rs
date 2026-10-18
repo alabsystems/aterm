@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows in-window close/quit confirmation banner: the destructive-close confirm composed
+//! The in-window close/quit confirmation banner (Windows, and Linux, which has no native dialog):
+//! the destructive-close confirm composed
 //! into the window's own top rows, as [`crate::paste_banner`] composes the multi-line-paste
 //! question. A native task-modal dialog would run its own message loop inside the call and stop
 //! winit's event loop, so every main-thread ctl verb would time out until a person clicked.
@@ -26,9 +27,10 @@
 //!
 //! The macOS `NSAlert` path is not immune — `menu::confirm` answers inside `runModal`, and
 //! control wakes queue behind that nested run loop (`menu::confirm_owner`) — but is out of this
-//! module's scope; the Linux titlebar-warning confirm never blocks.
+//! module's scope.
 
 use aterm_core::terminal::RenderCell;
+#[cfg(test)]
 use aterm_render::Theme;
 
 use crate::chrome_band;
@@ -48,6 +50,21 @@ pub(crate) enum CloseReplay {
     /// Quit the whole program (the Quit action): `App::on_quit_requested`, whose
     /// quit-scope barriers a window close does not run.
     Quit,
+    /// Close tab `tab` of window `wid`, a busy tab whose close leaves the window
+    /// standing (the strip ✕, a middle click, the tab menu):
+    /// `App::replay_deferred_handoff_tab_close`.
+    Tab {
+        wid: crate::WindowId,
+        tab: crate::tab_model::TabId,
+    },
+    /// Close pane `view` of tab `tab`, a busy pane whose close leaves the window
+    /// standing (Ctrl+Shift+W, Close Tab on a split or a non-last tab):
+    /// `App::replay_deferred_handoff_view_close`.
+    Pane {
+        wid: crate::WindowId,
+        tab: crate::tab_model::TabId,
+        view: crate::tab_model::ViewId,
+    },
 }
 
 /// One parked close/quit confirmation awaiting an answer. Held by `App` in
@@ -92,6 +109,8 @@ pub(crate) const NOTHING_PENDING: &str = "nothing is waiting for an answer";
 pub(crate) fn kind(prompt: &ConfirmPrompt) -> &'static str {
     match prompt.proceed {
         "Quit" => "quit",
+        crate::quit_safety::CLOSE_TAB => "close-tab",
+        crate::quit_safety::CLOSE_PANE => "close-pane",
         _ => "close-window",
     }
 }
@@ -101,6 +120,8 @@ pub(crate) fn kind(prompt: &ConfirmPrompt) -> &'static str {
 fn gesture(prompt: &ConfirmPrompt) -> &'static str {
     match prompt.proceed {
         "Quit" => "a quit",
+        crate::quit_safety::CLOSE_TAB => "a tab close",
+        crate::quit_safety::CLOSE_PANE => "a pane close",
         _ => "a window close",
     }
 }
@@ -265,9 +286,9 @@ pub(crate) fn banner_rows(
     prompt: &ConfirmPrompt,
     cols: usize,
     panel_rows: usize,
-    theme: Theme,
+    palette: impl Into<chrome_band::ChromePalette>,
 ) -> Vec<Vec<RenderCell>> {
-    let c = chrome_band::band_colors(theme);
+    let c = chrome_band::band_colors(palette);
     let mut rows: Vec<Vec<RenderCell>> = (0..panel_rows)
         .map(|r| blank_row(cols, c.label, c.bar_bg, r == 0))
         .collect();
@@ -324,7 +345,7 @@ pub(crate) fn banner_rows(
     }
     // `write_str` rebuilds every cell it touches without the overline, so the seam (the whole
     // top edge, one tone) is sealed after the words.
-    chrome_band::seal_band_top(&mut rows[0], c.label);
+    chrome_band::seal_band_top(&mut rows[0], c.seam);
     rows
 }
 

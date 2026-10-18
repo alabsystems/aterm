@@ -11,29 +11,35 @@
 //! blanked) or the TEXT view (comments blanked, literals kept), never prose. A
 //! rule about shipped code also drops every item whose `cfg` proves it
 //! test-only (the mask the censuses use). Beside it, from one walk of the
-//! checkout ([`walk`]: `vendor/`, build output and dot
-//! directories aside): every file's path (`key-material`'s key file names) and
-//! every shell, Python and JavaScript script, read as plain lines
-//! ([`Script`]) for the rules whose shapes live in scripts too.
+//! checkout ([`walk`]: `.git`, build output and what `.gitignore` keeps out
+//! by directory aside): every file's path, dot directories included
+//! (`key-material`'s key file names: `.cargo/machine.key` is one), and every
+//! shell, Python and JavaScript script outside `vendor/` and the dot
+//! directories, read as plain lines ([`Script`]) for the rules whose shapes
+//! live in scripts too.
 //!
 //! | rule                | keeps out |
 //! |---------------------|-----------|
-//! | `engine-platform`   | a platform API or a native link in an engine crate's shipped code |
+//! | `engine-platform`   | a platform API, a thread or a native link in an engine crate's shipped code (grouped `std::{…}` imports too) |
 //! | `renderer-terminal` | `aterm_core::Terminal` in the renderers (they read `RenderInput`) |
 //! | `dev-read`          | `fs::read*` of a `/dev/…` literal (a device never EOFs) |
 //! | `input-probe`       | the WindowServer-backed input-probe APIs |
 //! | `test-appkit-door`  | a `#[test]` reaching an AppKit call that opens WindowServer |
-//! | `shared-application`| `+[NSApplication sharedApplication]` outside the windowed-only fns |
-//! | `watch-hands`       | the upgrade watch typing, signalling or relaunching |
+//! | `shared-application`| `+[NSApplication sharedApplication]` in a fn that neither takes nor first fetches the `Windowed` proof (a shrinking list aside) |
 //! | `protected-folder`  | a TCC-protected folder path in aterm-gui or aterm-cli |
 //! | `runloop-timer`     | a run-loop timer outside `aterm_objc::wake_timer` |
 //! | `keeper-gui`        | a GUI framework, an ObjC send or winit in the PTY keeper's source |
-//! | `keeper-gui-deps`   | a GUI crate in the PTY keeper's process closure |
+//! | `keeper-gui-deps`   | a GUI crate in the PTY keeper's process closure, `Cargo.lock` walked transitively |
+//! | `keeper-no-mmap`    | a mapping call named in the PTY keeper's own source (a local `mmap` declaration; the region API is its clippy.toml's): it holds crash-restore regions unmapped |
+//! | `restore-stays-local` | aterm-restore in aterm-link's closure, or a socket named in aterm-restore's source: a crash-restore region never leaves the host |
 //! | `headless-lifeline` | a `--headless` launch in tests, tools or scripts that holds no lifeline |
+//! | `std-command`       | the `StdCommand` alias built, renamed or re-aliased outside aterm-uds |
 //! | `flock-door`        | an `flock` the clippy lint cannot name |
+//! | `supervise-fx`      | a clock read, a sleep, the pid, a delivery, the goal record or the ledger by path that skips the supervisor's `Fx` door; a look at the filesystem, a process, the kernel, the zone or the environment that skips a derived door (the policy probe or `Fx`'s) |
 //! | `store-current`     | a store `current` path run unresolved |
 //! | `key-material`      | a master phrase on the key surface, a key file in the checkout |
 //! | `devtools-door`     | a developer-mode change outside the owner's gesture; an admin-rights API |
+//! | `machines-root-door`| a root tool (`installer`, `pmset`, `/etc/sudoers.d`, …) or the machines agent outside aterm-machines |
 //! | `ffi-door`          | a WindowServer or process-creation `extern` declared outside its one file |
 //! | `handoff-name`      | a live-upgrade handoff variable spelled outside `HandoffName::new` |
 //! | `core-signal`       | a kill, abort or crash helper that ends a process by a core-dump signal |
@@ -41,6 +47,7 @@
 //! | `checked-mktemp`    | a scratch directory from an unchecked `$(cd "$(mktemp …)")` |
 //! | `installer-network` | a fetch in `tools/install.sh` outside `web_curl`, the GitHub API, `gh` |
 //! | `agent-gate`        | an agent tested by `==`, `matches!` or `if let` instead of an exhaustive `match` |
+//! | `slog-inert`        | a PTY write path or an input-verb request in the session log's code; `dispatch_mark` past its calls |
 //! | `licence-header`    | a `.rs` without its SPDX and copyright lines |
 //!
 //! [`run_guards`] returns typed [`Finding`]s; `aterm-census --guards` (and
@@ -60,9 +67,11 @@ mod graph;
 mod installer;
 mod keys;
 mod lifeline;
+mod machines;
 mod mint;
 mod mktemp;
 mod rules;
+mod slog_inert;
 
 /// One violation: where, which rule, and what the rule saw there.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,16 +106,20 @@ pub const GUARDS: &[Rule] = &[
     rules::INPUT_PROBE,
     graph::TEST_APPKIT_DOOR,
     graph::SHARED_APPLICATION,
-    graph::WATCH_HANDS,
     rules::PROTECTED_FOLDER,
     rules::RUNLOOP_TIMER,
     rules::KEEPER_GUI,
     rules::KEEPER_GUI_DEPS,
+    rules::KEEPER_NO_MMAP,
+    rules::RESTORE_STAYS_LOCAL,
     lifeline::HEADLESS_LIFELINE,
+    rules::STD_COMMAND,
     rules::FLOCK_DOOR,
+    rules::SUPERVISE_FX,
     rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
     doors::DEVTOOLS_DOOR,
+    machines::MACHINES_ROOT_DOOR,
     doors::FFI_DOOR,
     doors::HANDOFF_NAME,
     doors::CORE_SIGNAL,
@@ -114,6 +127,7 @@ pub const GUARDS: &[Rule] = &[
     mktemp::CHECKED_MKTEMP,
     installer::INSTALLER_NETWORK,
     agent_gate::AGENT_GATE,
+    slog_inert::SLOG_INERT,
     rules::LICENCE_HEADER,
 ];
 
@@ -244,12 +258,15 @@ pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
                 "the walk lost most of the tree (a wrong root or a moved crates/), so every \
                  guard held vacuously",
             ),
-            // Just below what the tree holds (38), so a walk that loses a few
-            // fails; a port or deletion that leaves fewer lowers it.
+            // The scripts the tree keeps (17): the installer, publish's config
+            // and transforms, the two hook stubs, the shell-integration
+            // scripts and their fixtures, and the wasm and site JavaScript. A
+            // walk that loses one fails; a port or deletion that leaves fewer
+            // lowers it.
             Floor::at_least(
                 "scripts the guards read",
                 report.scripts,
-                35,
+                17,
                 "the walk lost the scripts (a moved tools/, a narrowed script test), so the \
                  script rules held vacuously",
             ),
@@ -319,10 +336,10 @@ impl Corpus {
             files.push(SourceFile::new(rel, raw));
         }
         let mut paths = Vec::new();
-        walk(root, "", &mut paths)?;
+        walk(root, "", &Ignored::read(root), &mut paths)?;
         paths.sort();
         let mut scripts = Vec::new();
-        for rel in &paths {
+        for rel in paths.iter().filter(|rel| !in_dot_dir(rel)) {
             if let Some(script) = Script::read(root, rel)? {
                 scripts.push(script);
             }
@@ -371,19 +388,76 @@ impl Corpus {
     }
 }
 
-/// A directory no walk enters: dot directories, build output (`target`,
-/// `target-*`, `target.*`: what `.gitignore` keeps out) and `node_modules`.
+/// A directory no walk enters: `.git`, build output (`target`, `target-*`,
+/// `target.*`: what `.gitignore` keeps out by pattern) and `node_modules`.
+/// Other dot directories are walked: a key file is as public in `.cargo/` as
+/// anywhere.
 fn skipped_dir(name: &str) -> bool {
-    name.starts_with('.')
+    name == ".git"
         || name == "target"
         || name.starts_with("target-")
         || name.starts_with("target.")
         || name == "node_modules"
 }
 
-/// Every file under `root/rel` ([`skipped_dir`]s aside) as a root-relative,
-/// `/`-separated path. A missing `rel` adds nothing.
-pub(crate) fn walk(root: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), String> {
+/// Is `rel` under a dot directory (`.cargo/…`, `crates/x/.scratch/…`)? Its
+/// files are paths to the walk, never scripts: tool state, not the tree's code.
+fn in_dot_dir(rel: &str) -> bool {
+    rel.rsplit_once('/')
+        .is_some_and(|(dirs, _)| dirs.split('/').any(|d| d.starts_with('.')))
+}
+
+/// The directories the root `.gitignore` keeps out by a plain directory row
+/// (`name/` at any depth, `/path/` or `a/b/` from the root; no glob, no
+/// negation): tool state and caches (`.claude/`, `/.trust-cache/`), whose
+/// files no commit takes without `-f`, so no walk needs them. An absent or
+/// unreadable `.gitignore` keeps nothing out, which walks more, never less.
+#[derive(Default)]
+pub(crate) struct Ignored {
+    /// Rows without a `/` but their last: a directory of that name anywhere.
+    anywhere: Vec<String>,
+    /// Rows anchored at the root: that root-relative directory.
+    rooted: Vec<String>,
+}
+
+impl Ignored {
+    pub(crate) fn read(root: &Path) -> Self {
+        Self::parse(&std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default())
+    }
+
+    fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for row in text.lines().map(str::trim) {
+            let Some(dir) = row.strip_suffix('/') else {
+                continue;
+            };
+            if dir.is_empty() || row.starts_with(['#', '!']) || dir.contains(['*', '?', '[', '\\'])
+            {
+                continue;
+            }
+            match dir.strip_prefix('/') {
+                Some(path) => out.rooted.push(path.to_string()),
+                None if dir.contains('/') => out.rooted.push(dir.to_string()),
+                None => out.anywhere.push(dir.to_string()),
+            }
+        }
+        out
+    }
+
+    /// Does a row keep out the directory `name` at root-relative `rel`?
+    fn skips(&self, rel: &str, name: &str) -> bool {
+        self.anywhere.iter().any(|n| n == name) || self.rooted.iter().any(|p| p == rel)
+    }
+}
+
+/// Every file under `root/rel` ([`skipped_dir`]s and `ignored` directories
+/// aside) as a root-relative, `/`-separated path. A missing `rel` adds nothing.
+pub(crate) fn walk(
+    root: &Path,
+    rel: &str,
+    ignored: &Ignored,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
     let dir = root.join(rel);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -400,8 +474,8 @@ pub(crate) fn walk(root: &Path, rel: &str, out: &mut Vec<String>) -> Result<(), 
         };
         let kind = entry.file_type().map_err(|e| format!("{child}: {e}"))?;
         if kind.is_dir() {
-            if !skipped_dir(&name) {
-                walk(root, &child, out)?;
+            if !skipped_dir(&name) && !ignored.skips(&child, &name) {
+                walk(root, &child, ignored, out)?;
             }
         } else {
             out.push(child);
@@ -688,6 +762,56 @@ pub(crate) mod tests {
         let found = run(&rule, &[]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].rule, "boom");
+    }
+
+    /// The walk enters dot directories for paths (never `.git`, nor one
+    /// `.gitignore` keeps out by directory), and reads scripts only outside
+    /// them.
+    #[test]
+    fn the_walk_lists_dot_directories_but_reads_no_script_there() {
+        use crate::scan_set::test_fixtures::synth_tree;
+        let files: Vec<(String, String)> = [
+            (
+                ".gitignore",
+                "debug\n.claude/\n/.trust-cache/\n/publish/.out/\n**/mutants.out*/\n\
+                 !vendor/**/debug/\n",
+            ),
+            ("tools/install.sh", "#!/bin/sh\n"),
+            (".cargo/config.toml", ""),
+            (".cargo/machine.key", ""),
+            (".config/hooks/stop.sh", "#!/bin/sh\n"),
+            (".claude/worktrees/w/.cargo/machine.key", ""),
+            (".trust-cache/f.json", ""),
+            ("crates/a/.trust-cache/f.json", ""),
+            ("publish/.out/x.sh", "#!/bin/sh\n"),
+            (".git/hooks/pre-commit.sh", "#!/bin/sh\n"),
+            ("target/debug/x.sh", "#!/bin/sh\n"),
+            (
+                "crates/a/src/lib.rs",
+                "// SPDX-License-Identifier: Apache-2.0\n",
+            ),
+        ]
+        .iter()
+        .map(|(p, c)| ((*p).to_string(), (*c).to_string()))
+        .collect();
+        let root = synth_tree("aterm-census-guards", "walk-dot-dirs", &files);
+        let corpus = Corpus::read(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let corpus = corpus.expect("the synth tree reads");
+        assert_eq!(
+            corpus.paths,
+            [
+                ".cargo/config.toml",
+                ".cargo/machine.key",
+                ".config/hooks/stop.sh",
+                ".gitignore",
+                "crates/a/.trust-cache/f.json",
+                "crates/a/src/lib.rs",
+                "tools/install.sh",
+            ]
+        );
+        let scripts: Vec<&str> = corpus.scripts.iter().map(|s| s.rel.as_str()).collect();
+        assert_eq!(scripts, ["tools/install.sh"]);
     }
 
     #[test]

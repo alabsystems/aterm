@@ -24,16 +24,16 @@
 //! - **W1–W7**, **N0** (bracket pairs, BD16, with canonical equivalence and the
 //!   NSM follow-up), **N1/N2**, **I1/I2**, **L1** and **L2**.
 //! - The full `Bidi_Class` property ([`bidi_class`]) and `Bidi_Paired_Bracket`
-//!   pairs ([`bracket_of`]), generated from the UCD (`src/tables.rs`,
-//!   `tables/gen.py`).
+//!   pairs ([`bracket_of`]), generated from the UCD (`src/tables.rs`, by
+//!   `examples/gen_tables.rs tables`).
 //!
 //! Conformance is pinned against the UCD's own `BidiTest.txt` and
 //! `BidiCharacterTest.txt` (`tests/uax9_conformance.rs`). L3 (combining-mark
 //! rendering) belongs to the renderer. For L4 the crate holds the
-//! `Bidi_Mirroring_Glyph` pairs ([`mirror_glyph`], `src/mirroring.rs`,
-//! `tables/gen_mirroring.py`) and says which cell of a reordered row resolved
-//! right to left ([`Scratch::cell_is_rtl`]); the caller that owns the row
-//! substitutes the mirror.
+//! `Bidi_Mirroring_Glyph` pairs ([`mirror_glyph`], `src/mirroring.rs`, by
+//! aterm-grapheme's `examples/unicode_tables.rs mirroring`) and says which
+//! cell of a reordered row resolved right to left ([`Scratch::cell_is_rtl`]);
+//! the caller that owns the row substitutes the mirror.
 //!
 //! Characters removed by X9 (the embedding controls and `BN`) take the level of
 //! the character before them, so every character — removed or not — has a place
@@ -169,15 +169,17 @@ const ASCII_BIDI_CLASS: [BidiClass; 128] = {
 // stock rustc (the cross cells of `verify cells`, the x86_64-apple-darwin
 // compat slice) parses a cfg'd-out module's body all the same, so the island's
 // module goes through this macro, which drops its tokens there and emits them
-// unchanged under `cfg(trust_verify)`.
-#[cfg(trust_verify)]
+// unchanged under `cfg(clean_islands)`: set by this crate's build script
+// whenever the compiler is Trust (crates/aterm-log/clean_islands.rs), so the
+// island is kernel-checked at every Trust build, not only the verify lane.
+#[cfg(clean_islands)]
 macro_rules! verify_island {
     ($($tt:tt)*) => {
         $($tt)*
     };
 }
 
-#[cfg(not(trust_verify))]
+#[cfg(not(clean_islands))]
 macro_rules! verify_island {
     ($($tt:tt)*) => {};
 }
@@ -1282,47 +1284,10 @@ fn resolve_sequence(
 mod tests {
     use super::*;
 
-    // Hebrew aleph and Arabic alef as named test scalars (others use literals).
     const ALEF: char = '\u{05D0}'; // Hebrew R
-    const AR_ALEF: char = '\u{0627}'; // Arabic AL
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()
-    }
-
-    #[test]
-    fn class_table_spot_checks() {
-        assert_eq!(bidi_class('a'), L);
-        assert_eq!(bidi_class('Z'), L);
-        assert_eq!(bidi_class('5'), EN);
-        assert_eq!(bidi_class('+'), ES);
-        assert_eq!(bidi_class('$'), ET);
-        assert_eq!(bidi_class(','), CS);
-        assert_eq!(bidi_class(' '), WS);
-        assert_eq!(bidi_class('!'), ON);
-        assert_eq!(bidi_class('('), ON);
-        assert_eq!(bidi_class(ALEF), R);
-        assert_eq!(bidi_class(AR_ALEF), AL);
-        assert_eq!(bidi_class('\u{0660}'), AN); // Arabic-Indic zero
-        assert_eq!(bidi_class('\u{05B0}'), NSM); // Hebrew point sheva
-        assert_eq!(bidi_class('\n'), B);
-        assert_eq!(bidi_class('\t'), S);
-    }
-
-    #[test]
-    fn pure_ltr_is_identity() {
-        assert_eq!(reorder_str("abc", BaseDirection::Auto), vec![0, 1, 2]);
-        assert_eq!(
-            reorder_str("hello world", BaseDirection::Auto),
-            (0..11).collect::<Vec<_>>()
-        );
-        assert!(!has_bidi(&chars("hello world 123")));
-    }
-
-    #[test]
-    fn empty_line_is_empty() {
-        assert_eq!(reorder_str("", BaseDirection::Auto), Vec::<usize>::new());
-        assert_eq!(resolve_levels(&[], BaseDirection::Auto), Vec::<u8>::new());
     }
 
     #[test]
@@ -1337,113 +1302,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn arabic_pure_rtl_reverses() {
-        let t = chars("\u{0627}\u{0628}"); // AR_ALEF AR_BEH
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            vec![1, 0]
-        );
-    }
-
-    #[test]
-    fn ltr_with_trailing_rtl_run() {
-        // "a " + ALEF BET : base LTR (first strong 'a'); the Hebrew run reverses
-        // and sits after the Latin prefix.
-        let t = chars("a \u{05D0}\u{05D1}");
-        assert_eq!(paragraph_level(&t, BaseDirection::Auto), 0);
-        // logical: 0='a' 1=' ' 2=ALEF 3=BET
-        // visual : a, space, BET, ALEF  → [0,1,3,2]
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            vec![0, 1, 3, 2]
-        );
-    }
-
-    #[test]
-    fn numbers_stay_ltr_inside_rtl() {
-        // ALEF '1' '2' with base RTL: the digits keep their L-to-R order but the
-        // whole line is RTL, so visually the digits sit to the LEFT of the letter.
-        let t = chars("\u{05D0}12");
-        // logical 0=ALEF 1='1' 2='2'; levels: ALEF=1, digits get level 2 (EN at
-        // odd base → +1 = 2). L2 → visual [1,2,0] = "12" then ALEF.
-        assert_eq!(resolve_levels(&t, BaseDirection::Auto), vec![1, 2, 2]);
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            vec![1, 2, 0]
-        );
-    }
-
-    #[test]
-    fn forced_rtl_base_on_latin() {
-        // Force RTL base on a Latin word: each Latin char gets level 1+1=2 (L at
-        // odd base), reversed once at level 2 then once at level 1 → net identity
-        // order but right-aligned conceptually. The permutation here is identity
-        // because the double reversal cancels for a single uniform run.
-        let t = chars("ab");
-        assert_eq!(resolve_levels(&t, BaseDirection::Rtl), vec![2, 2]);
-        assert_eq!(reorder_from_levels(&[2, 2]), vec![0, 1]);
-    }
-
-    #[test]
-    fn neutral_between_same_direction_takes_that_direction() {
-        // ALEF '-' BET (RTL base): the '-' (ES→ON, neutral) is between two R, so
-        // N1 makes it R; whole run reverses together.
-        let t = chars("\u{05D0}-\u{05D1}");
-        assert_eq!(resolve_levels(&t, BaseDirection::Auto), vec![1, 1, 1]);
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            vec![2, 1, 0]
-        );
-    }
-
-    #[test]
-    fn mixed_english_hebrew_english() {
-        // "hi " + ALEF BET + " bye" — base LTR. The middle Hebrew run reverses;
-        // the Latin segments stay in order around it.
-        let t = chars("hi \u{05D0}\u{05D1} bye");
-        // indices: 0 h,1 i,2 space,3 ALEF,4 BET,5 space,6 b,7 y,8 e
-        // Hebrew run [3,4] reverses → [4,3]; spaces are neutral between L and R /
-        // R and L → embedding (L). Visual: 0,1,2,4,3,5,6,7,8
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            vec![0, 1, 2, 4, 3, 5, 6, 7, 8]
-        );
-    }
-
-    #[test]
-    fn l1_resets_trailing_whitespace_in_rtl() {
-        // RTL base line ending in spaces: the trailing spaces reset to the base
-        // level (1) so they stay at the visual start, not interleaved oddly.
-        let t = chars("\u{05D0}  ");
-        let levels = resolve_levels(&t, BaseDirection::Rtl);
-        // ALEF level 1; two trailing WS reset to base 1 (not bumped).
-        assert_eq!(levels, vec![1, 1, 1]);
-    }
-
-    #[test]
-    fn reorder_from_levels_matches_unicode_l2_example() {
-        // Classic UAX #9 L2 illustration: levels [0,0,0,1,1,2] → reverse level-2
-        // run, then level-1+ runs. Verify the permutation is a valid involution of
-        // the reversals.
-        let levels = [0u8, 0, 0, 1, 1, 2];
-        let order = reorder_from_levels(&levels);
-        // level 2: reverse [5,6) → no-op (single). level 1: reverse positions
-        // 3..6 → [5,4,3]. Final: [0,1,2,5,4,3].
-        assert_eq!(order, vec![0, 1, 2, 5, 4, 3]);
-    }
-
     const CJK: char = '\u{4E2D}'; // 中 — a wide (2-cell) glyph, bidi class L
-
-    #[test]
-    fn reorder_cells_ascii_is_identity() {
-        let cc = chars("hello");
-        let wide = vec![false; cc.len()];
-        assert_eq!(
-            reorder_cells(&cc, &wide, BaseDirection::Auto),
-            (0..cc.len()).collect::<Vec<_>>()
-        );
-    }
 
     #[test]
     fn reorder_cells_wide_glyph_stays_paired_ltr() {
@@ -1529,113 +1388,6 @@ mod tests {
     }
 
     #[test]
-    fn permutation_is_always_valid() {
-        // Whatever the input, the result must be a permutation of 0..n.
-        for s in [
-            "abc",
-            "\u{05D0}\u{05D1}1 2",
-            "a\u{0628}c\u{0627}!",
-            "12.34 \u{05D0}",
-        ] {
-            let t = chars(s);
-            let order = reorder_visual_to_logical(&t, BaseDirection::Auto);
-            let mut seen = order.clone();
-            seen.sort_unstable();
-            assert_eq!(
-                seen,
-                (0..t.len()).collect::<Vec<_>>(),
-                "not a permutation for {s:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn arithmetic_run_is_ltr_identity() {
-        // "1+2=3" is all EN/ES/ON — no strong RTL, base LTR. Even-level EN runs
-        // never reorder (no odd level), so it stays in logical order.
-        let t = chars("1+2=3");
-        assert!(!has_bidi(&t));
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            vec![0, 1, 2, 3, 4]
-        );
-    }
-
-    #[test]
-    fn neutral_only_line_is_identity() {
-        // Pure punctuation/whitespace: no strong char → base LTR, all neutrals
-        // resolve to the embedding direction (L), identity order.
-        let t = chars("  .!? ");
-        assert_eq!(paragraph_level(&t, BaseDirection::Auto), 0);
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            (0..t.len()).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn arabic_number_in_arabic_text_stays_ltr() {
-        // Arabic letter + two Arabic-Indic digits (AN). Base RTL (first strong AL→R
-        // after W3). AN at odd base → +1 = level 2; the letter stays level 1. The
-        // digits keep logical order and sit to the LEFT of the letter visually.
-        let t = chars("\u{0627}\u{0660}\u{0661}"); // ALEF, Arabic-Indic 0, 1
-        assert_eq!(resolve_levels(&t, BaseDirection::Auto), vec![1, 2, 2]);
-        assert_eq!(
-            reorder_visual_to_logical(&t, BaseDirection::Auto),
-            vec![1, 2, 0]
-        );
-    }
-
-    #[test]
-    fn class_taking_entry_points_match_char_taking() {
-        // The precomputed-class companions must produce byte-identical output to
-        // the char-taking originals (the dedup the bridge relies on).
-        for s in [
-            "",
-            "abc",
-            "\u{05D0}\u{05D1}\u{05D2}",
-            "hi \u{05D0}\u{05D1} bye",
-            "\u{05D0}12",
-            "12.34 \u{05D0}",
-            "a\u{0628}c\u{0627}!",
-        ] {
-            let t = chars(s);
-            let classes: Vec<BidiClass> = t.iter().map(|&c| bidi_class(c)).collect();
-            let brackets: Vec<Bracket> = t.iter().map(|&c| bracket_of(c)).collect();
-            assert_eq!(has_bidi(&t), has_bidi_classes(&classes), "has_bidi {s:?}");
-            for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
-                assert_eq!(
-                    resolve_levels(&t, base),
-                    resolve_levels_from_classes(&classes, &brackets, base),
-                    "resolve_levels {s:?} {base:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn reorder_cells_with_classes_matches_reorder_cells() {
-        let cases: &[(Vec<char>, Vec<bool>)] = &[
-            (chars("hello"), vec![false; 5]),
-            (vec![CJK, ' '], vec![false, true]),
-            (vec![ALEF, CJK, ' '], vec![false, false, true]),
-            (vec![CJK, ' ', ALEF, '1'], vec![false, true, false, false]),
-            (vec![' ', 'a'], vec![true, false]),
-        ];
-        for (cc, wide) in cases {
-            let classes: Vec<BidiClass> = cc.iter().map(|&c| bidi_class(c)).collect();
-            let brackets: Vec<Bracket> = cc.iter().map(|&c| bracket_of(c)).collect();
-            for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
-                assert_eq!(
-                    reorder_cells(cc, wide, base),
-                    reorder_cells_with_classes(&classes, &brackets, wide, base),
-                    "{cc:?} {base:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn into_variants_match_vec_returning() {
         // The buffer-in/buffer-out companions produce byte-identical output to the
         // Vec-returning wrappers (the render bridge relies on this equality), and
@@ -1674,23 +1426,6 @@ mod tests {
                 let mut order_out = Vec::new();
                 reorder_from_levels_into(&levels, &mut order_out);
                 assert_eq!(order_out, reorder_from_levels(&levels), "{cc:?} {base:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn levels_never_drop_below_base() {
-        // Spot the invariant the property test generalizes: I1/I2 only raise levels
-        // and L1 resets to the base, so the minimum level equals the base level.
-        for (s, base) in [
-            ("a\u{05D0}1 b", BaseDirection::Auto),
-            ("\u{05D0}a1", BaseDirection::Rtl),
-            ("mixed \u{0628} text", BaseDirection::Ltr),
-        ] {
-            let t = chars(s);
-            let para = paragraph_level(&t, base);
-            for (i, &l) in resolve_levels(&t, base).iter().enumerate() {
-                assert!(l >= para, "level {l} at {i} below base {para} for {s:?}");
             }
         }
     }

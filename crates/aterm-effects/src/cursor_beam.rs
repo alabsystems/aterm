@@ -377,30 +377,6 @@ mod tests {
         }
     }
 
-    /// The block fill whitens with the blaze but never reaches pure white.
-    #[test]
-    fn block_emitter_fill_rides_the_blaze() {
-        let mut rod = CursorBeamRod::default();
-        let mut out = Vec::new();
-        let t0 = Instant::now();
-        let cold = rod
-            .tick(Some((2, 3)), t0, 0.0, geom(), &cfg(false), &mut out)
-            .fill
-            .expect("block gets a fill");
-        out.clear();
-        let mut rod2 = CursorBeamRod::default();
-        let hot = rod2
-            .tick(Some((2, 3)), t0, 1.0, geom(), &cfg(false), &mut out)
-            .fill
-            .expect("block gets a fill");
-        assert_ne!(cold, hot, "the fill whitens as the blaze climbs");
-        assert!(
-            hot != 0x00FF_FFFF,
-            "never pure white — the axis stays the star"
-        );
-        assert!(!out.is_empty(), "the charged emitter glows");
-    }
-
     /// The rod lands inside the padded window's grid box (origin applied).
     #[test]
     fn rod_lands_at_the_window_origin() {

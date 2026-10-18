@@ -202,8 +202,7 @@ impl From<u64> for WindowId {
 //     zero; a SIBLING subclass's own first ivar lands at 513 and its honest
 //     `true` is read as ours, so `get` hands out a `&T` over another class's
 //     bytes; an `NSObject`-sized survivor reads 497 bytes PAST its allocation.
-//     Measured in `winit_seam.rs::a_substituting_initializer_defeats_the_
-//     initialized_flag`, mechanism on `IvarSlot::get`. Zero cost HERE (`Ivars`
+//     Mechanism on `IvarSlot::get`. Zero cost HERE (`Ivars`
 //     = `()`); a class carrying STATE must prove its init does not substitute.
 aterm_objc::declare_class! {
     /// The `NSWindow` subclass every winit window on macOS is an instance of.

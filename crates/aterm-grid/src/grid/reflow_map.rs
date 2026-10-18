@@ -360,245 +360,48 @@ mod tests {
         assert_ne!(old.get(coord).unwrap().bg_rgb(), copied.bg_rgb());
     }
 
+    /// A chunk boundary that would split a wide glyph backs off to its lead
+    /// (but always advances at least one glyph); any other boundary stays.
     #[test]
-    fn adjust_chunk_boundary_no_wide_chars() {
-        let cells = [
-            Cell::new('A'),
-            Cell::new('B'),
-            Cell::new('C'),
-            Cell::new('D'),
+    fn adjust_chunk_boundary_never_splits_a_wide_glyph() {
+        let [head, tail] = wide('W');
+        let (a, b) = (Cell::new('A'), Cell::new('B'));
+        let cases: &[(&str, &[Cell], usize, usize, usize)] = &[
+            ("ascii", &[a, b, a, b], 0, 2, 2),
+            ("ascii to the end", &[a, b, a, b], 2, 4, 4),
+            ("lead at the boundary", &[a, head, tail, b], 0, 2, 1),
+            ("continuation at the boundary", &[head, tail, a], 0, 3, 3),
+            ("forward progress", &[head, tail], 0, 1, 2),
+            ("single cell", &[a], 0, 1, 1),
+            ("empty", &[], 0, 0, 0),
         ];
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 2), 2);
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 4), 4);
-        assert_eq!(adjust_chunk_boundary(&cells, 2, 4), 4);
+        for &(name, cells, offset, end, want) in cases {
+            assert_eq!(adjust_chunk_boundary(cells, offset, end), want, "{name}");
+        }
     }
 
+    /// A cursor offset lands in the chunk that holds it, at `offset - start`;
+    /// only the last chunk owns its end (and any clamped offset past it).
     #[test]
-    fn adjust_chunk_boundary_wide_char_at_boundary() {
-        // cells[1] is WIDE: the boundary backs up to 1 rather than split it.
-        let cells = [
-            Cell::new('A'),
-            Cell::with_style(
-                'W',
-                crate::PackedColor::default(),
-                crate::PackedColor::default(),
-                CellFlags::WIDE,
-            ),
-            Cell::with_style(
-                ' ',
-                crate::PackedColor::default(),
-                crate::PackedColor::default(),
-                CellFlags::WIDE_CONTINUATION,
-            ),
-            Cell::new('B'),
+    fn cursor_in_chunk_owns_only_its_span() {
+        // (offset, cells_len, chunk start, chunk end, dest row, want)
+        let cases = [
+            (3, 10, 2, 5, 1, Some((1, 1))),
+            (0, 10, 0, 5, 0, Some((0, 0))),
+            (5, 10, 0, 5, 0, None),
+            (10, 10, 5, 10, 2, Some((2, 5))),
+            (1, 10, 5, 10, 1, None),
+            (7, 10, 0, 5, 0, None),
+            (100, 10, 5, 10, 3, Some((3, 5))),
+            (0, 0, 0, 0, 0, Some((0, 0))),
         ];
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 2), 1);
-    }
-
-    #[test]
-    fn adjust_chunk_boundary_wide_char_not_at_boundary() {
-        // cells[2] is WIDE_CONTINUATION, not WIDE: the boundary stays at 3.
-        let cells = [
-            Cell::with_style(
-                'W',
-                crate::PackedColor::default(),
-                crate::PackedColor::default(),
-                CellFlags::WIDE,
-            ),
-            Cell::with_style(
-                ' ',
-                crate::PackedColor::default(),
-                crate::PackedColor::default(),
-                CellFlags::WIDE_CONTINUATION,
-            ),
-            Cell::new('A'),
-        ];
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 3), 3);
-    }
-
-    #[test]
-    fn adjust_chunk_boundary_forward_progress_single_cell() {
-        // A wide char at 0 with chunk_end=1 backs up to cell_offset, so the
-        // chunk is forced forward to min(2, len).
-        let cells = [
-            Cell::with_style(
-                'W',
-                crate::PackedColor::default(),
-                crate::PackedColor::default(),
-                CellFlags::WIDE,
-            ),
-            Cell::with_style(
-                ' ',
-                crate::PackedColor::default(),
-                crate::PackedColor::default(),
-                CellFlags::WIDE_CONTINUATION,
-            ),
-        ];
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 1), 2);
-    }
-
-    #[test]
-    fn adjust_chunk_boundary_at_end_of_cells() {
-        // chunk_end == cells.len(): no cell at boundary to check.
-        let cells = [Cell::new('A'), Cell::new('B')];
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 2), 2);
-    }
-
-    #[test]
-    fn adjust_chunk_boundary_single_ascii_cell() {
-        let cells = [Cell::new('X')];
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 1), 1);
-    }
-
-    #[test]
-    fn adjust_chunk_boundary_empty_cells() {
-        let cells: [Cell; 0] = [];
-        assert_eq!(adjust_chunk_boundary(&cells, 0, 0), 0);
-    }
-
-    #[test]
-    fn cursor_in_chunk_within_range() {
-        // cursor at offset 3, chunk [2..5), dest_row=1
-        let result = cursor_in_chunk(3, 10, 2, 5, 1);
-        assert_eq!(result, Some((1, 1))); // col = 3 - 2 = 1
-    }
-
-    #[test]
-    fn cursor_in_chunk_at_start() {
-        let result = cursor_in_chunk(0, 10, 0, 5, 0);
-        assert_eq!(result, Some((0, 0)));
-    }
-
-    #[test]
-    fn cursor_in_chunk_at_end_non_last() {
-        // Offset 5 in chunk [0..5), not the last of 10 cells: out of range.
-        let result = cursor_in_chunk(5, 10, 0, 5, 0);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn cursor_in_chunk_at_end_last_chunk() {
-        // Offset 10 in the last chunk [5..10) of 10 cells: in range (`<=`).
-        let result = cursor_in_chunk(10, 10, 5, 10, 2);
-        assert_eq!(result, Some((2, 5))); // col = 10 - 5 = 5
-    }
-
-    #[test]
-    fn cursor_in_chunk_before_range() {
-        let result = cursor_in_chunk(1, 10, 5, 10, 1);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn cursor_in_chunk_after_range() {
-        let result = cursor_in_chunk(7, 10, 0, 5, 0);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn cursor_in_chunk_clamped_to_cells_len() {
-        // cursor_logical_offset clamps to cells_len (10); the last chunk
-        // [5..10) includes 10.
-        let result = cursor_in_chunk(100, 10, 5, 10, 3);
-        assert_eq!(result, Some((3, 5)));
-    }
-
-    #[test]
-    fn cursor_in_chunk_zero_length_cells() {
-        // cells_len=0, chunk [0..0), cursor 0: the last chunk includes it.
-        let result = cursor_in_chunk(0, 0, 0, 0, 0);
-        assert_eq!(result, Some((0, 0)));
-    }
-
-    #[test]
-    fn source_coords_for_row_basic() {
-        let coords = source_coords_for_row(5, 3);
-        assert_eq!(coords.len(), 3);
-        assert_eq!(coords[0], CellCoord::new(5, 0));
-        assert_eq!(coords[1], CellCoord::new(5, 1));
-        assert_eq!(coords[2], CellCoord::new(5, 2));
-    }
-
-    #[test]
-    fn source_coords_for_row_single_cell() {
-        let coords = source_coords_for_row(0, 1);
-        assert_eq!(coords.len(), 1);
-        assert_eq!(coords[0], CellCoord::new(0, 0));
-    }
-
-    #[test]
-    fn source_coords_for_row_empty() {
-        let coords = source_coords_for_row(10, 0);
-        assert!(coords.is_empty());
-    }
-
-    #[test]
-    fn source_coords_for_row_wide_row() {
-        let coords = source_coords_for_row(3, 80);
-        assert_eq!(coords.len(), 80);
-        assert_eq!(coords[0], CellCoord::new(3, 0));
-        assert_eq!(coords[79], CellCoord::new(3, 79));
-    }
-
-    #[test]
-    fn copy_cells_to_row_basic_ascii() {
-        let mut pages = PageStore::new();
-        let mut new_row = unsafe { Row::new(5, &mut pages) };
-        let cells = [Cell::new('A'), Cell::new('B'), Cell::new('C')];
-        let mut new_extras = CellExtras::new();
-        let mut extras_ctx = ExtrasCopyCtx {
-            source: ExtrasSource::None,
-            old_extras: None,
-            new_extras: &mut new_extras,
-        };
-
-        copy_cells_to_row(
-            &mut new_row,
-            &cells,
-            0,
-            3,
-            cells.len(),
-            5,
-            0,
-            &mut extras_ctx,
-        );
-
-        assert_eq!(new_row.get(0).unwrap().char_data(), 'A' as u16);
-        assert_eq!(new_row.get(1).unwrap().char_data(), 'B' as u16);
-        assert_eq!(new_row.get(2).unwrap().char_data(), 'C' as u16);
-    }
-
-    #[test]
-    fn copy_cells_to_row_with_offset() {
-        let mut pages = PageStore::new();
-        let mut new_row = unsafe { Row::new(5, &mut pages) };
-        let cells = [
-            Cell::new('A'),
-            Cell::new('B'),
-            Cell::new('C'),
-            Cell::new('D'),
-        ];
-        let mut new_extras = CellExtras::new();
-        let mut extras_ctx = ExtrasCopyCtx {
-            source: ExtrasSource::None,
-            old_extras: None,
-            new_extras: &mut new_extras,
-        };
-
-        // Copy cells[2..4] = ['C', 'D']
-        copy_cells_to_row(
-            &mut new_row,
-            &cells,
-            2,
-            4,
-            cells.len(),
-            5,
-            0,
-            &mut extras_ctx,
-        );
-
-        assert_eq!(new_row.get(0).unwrap().char_data(), 'C' as u16);
-        assert_eq!(new_row.get(1).unwrap().char_data(), 'D' as u16);
+        for (offset, len, start, end, row, want) in cases {
+            assert_eq!(
+                cursor_in_chunk(offset, len, start, end, row),
+                want,
+                "offset {offset} of {len} in [{start}, {end})"
+            );
+        }
     }
 
     #[test]
@@ -640,31 +443,6 @@ mod tests {
         let cell = new_row.get(0).unwrap();
         assert_eq!(cell.char_data(), ' ' as u16);
         assert!(!cell.flags().contains(CellFlags::WIDE));
-    }
-
-    #[test]
-    fn copy_cells_to_row_empty_range() {
-        let mut pages = PageStore::new();
-        let mut new_row = unsafe { Row::new(5, &mut pages) };
-        let cells = [Cell::new('A')];
-        let mut new_extras = CellExtras::new();
-        let mut extras_ctx = ExtrasCopyCtx {
-            source: ExtrasSource::None,
-            old_extras: None,
-            new_extras: &mut new_extras,
-        };
-
-        copy_cells_to_row(
-            &mut new_row,
-            &cells,
-            0,
-            0,
-            cells.len(),
-            5,
-            0,
-            &mut extras_ctx,
-        );
-        assert!(new_row.is_empty());
     }
 
     /// The pages (first, so a caller's binding drops them after the rows),
@@ -716,17 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_cells_to_rows_single_chunk() {
-        let cells = [Cell::new('A'), Cell::new('B'), Cell::new('C')];
-        let (_pages, new_rows, _) = chunk(&cells, 5, [None, None]);
-        assert_eq!(new_rows.len(), 1);
-        assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
-        assert_eq!(new_rows[0].get(1).unwrap().char_data(), 'B' as u16);
-        assert_eq!(new_rows[0].get(2).unwrap().char_data(), 'C' as u16);
-        assert!(!new_rows[0].is_wrapped());
-    }
-
-    #[test]
     fn chunk_cells_to_rows_multi_chunk() {
         let cells = [
             Cell::new('A'),
@@ -759,17 +526,6 @@ mod tests {
         let (_pages, new_rows, at) = chunk(&cells, 3, [Some(4), Some(1)]);
         assert_eq!(new_rows.len(), 2);
         assert_eq!(at, [Some((1, 1)), Some((0, 1))]);
-    }
-
-    #[test]
-    fn chunk_cells_to_rows_single_column() {
-        let cells = [Cell::new('A'), Cell::new('B')];
-        let (_pages, new_rows, _) = chunk(&cells, 1, [None, None]);
-        assert_eq!(new_rows.len(), 2);
-        assert_eq!(new_rows[0].get(0).unwrap().char_data(), 'A' as u16);
-        assert_eq!(new_rows[1].get(0).unwrap().char_data(), 'B' as u16);
-        assert!(!new_rows[0].is_wrapped());
-        assert!(new_rows[1].is_wrapped());
     }
 
     #[test]

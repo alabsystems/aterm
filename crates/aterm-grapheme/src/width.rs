@@ -9,8 +9,6 @@ use crate::grapheme_iter::GraphemeClusters;
 use crate::tables::width as unicode_tables;
 use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
 
-#[cfg(test)]
-use crate::types::GraphemeType;
 use crate::types::{Grapheme, GraphemeInfo};
 
 /// Calculate grapheme information for a string.
@@ -228,20 +226,6 @@ pub fn is_emoji_char(c: char) -> bool {
     )
 }
 
-/// Zero Width Joiner (ZWJ) character.
-#[cfg(test)]
-pub const ZWJ: char = '\u{200D}';
-
-/// Check if a grapheme contains a ZWJ sequence.
-///
-/// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
-/// ENSURES: returns `true` iff `grapheme` contains U+200D.
-#[cfg(test)]
-#[inline]
-pub fn has_zwj(grapheme: &str) -> bool {
-    grapheme.contains(ZWJ)
-}
-
 /// Check if a character is a skin tone modifier.
 ///
 /// Skin tone modifiers (Fitzpatrick scale) are U+1F3FB through U+1F3FF.
@@ -304,76 +288,10 @@ pub fn is_emoji_modifier_base(c: char) -> bool {
     )
 }
 
-/// Check if a grapheme has a skin tone modifier.
-///
-/// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
-/// ENSURES: returns `true` iff at least one codepoint is in `U+1F3FB..=U+1F3FF`.
-#[cfg(test)]
-pub fn has_skin_tone(grapheme: &str) -> bool {
-    grapheme.chars().any(is_skin_tone_modifier)
-}
-
 /// Check if a character is a regional indicator.
 ///
 /// Regional indicators (A-Z) are used in pairs to create flag emoji.
 #[inline]
 pub fn is_regional_indicator(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
-}
-
-/// Check if a grapheme is a flag emoji (two regional indicators).
-///
-/// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
-/// ENSURES: returns `true` iff `grapheme` has exactly two regional-indicator codepoints.
-#[cfg(test)]
-pub fn is_flag_emoji(grapheme: &str) -> bool {
-    let chars: Vec<char> = grapheme.chars().collect();
-    chars.len() == 2 && chars.iter().all(|&c| is_regional_indicator(c))
-}
-
-/// Classify a grapheme into its type.
-///
-/// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
-/// ENSURES: returns `GraphemeType::Control` for empty input; otherwise returns one deterministic classification.
-#[cfg(test)]
-pub fn classify_grapheme(grapheme: &str) -> GraphemeType {
-    if grapheme.is_empty() {
-        return GraphemeType::Control;
-    }
-
-    let first = grapheme
-        .chars()
-        .next()
-        .expect("invariant: checked !is_empty()");
-    let codepoint_count = grapheme.chars().count();
-
-    if grapheme.len() == 1 && first.is_ascii() {
-        return if first.is_control() {
-            GraphemeType::Control
-        } else {
-            GraphemeType::Ascii
-        };
-    }
-
-    if has_zwj(grapheme) {
-        return GraphemeType::ZwjSequence;
-    }
-
-    if is_flag_emoji(grapheme) {
-        return GraphemeType::Flag;
-    }
-
-    if codepoint_count > 1 && grapheme_display_width(grapheme) <= 1 {
-        return GraphemeType::Combining;
-    }
-
-    if is_emoji_char(first) {
-        return GraphemeType::Emoji;
-    }
-
-    if grapheme_display_width(grapheme) == 2 {
-        return GraphemeType::Wide;
-    }
-
-    GraphemeType::Other
 }

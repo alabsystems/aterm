@@ -10,7 +10,8 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use aterm_agent::harness::upgrade_models::{MODEL_WARM_MAX_S, model_moves_now};
-use aterm_spec::derive::{Model, harness_model_ladder_model};
+use aterm_models_harness::harness_model_ladder_model;
+use aterm_spec::derive::Model;
 
 use super::{Vars, assert_forged_rejected, assert_transition};
 

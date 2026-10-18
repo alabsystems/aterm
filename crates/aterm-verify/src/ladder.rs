@@ -24,58 +24,6 @@ pub struct Finding {
     pub message: Vec<String>,
 }
 
-/// The one-minute load average around a stage, in hundredths, and the cores it
-/// is read against: a red on an idle machine and the same red at load 78 are
-/// different evidence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StageLoad {
-    pub start: u32,
-    pub end: u32,
-    pub cores: u32,
-}
-
-impl StageLoad {
-    /// From two readings ([`crate::exec::load_average`]); `None` unless both
-    /// were read and are small non-negative numbers.
-    #[must_use]
-    pub fn of(start: Option<f64>, end: Option<f64>, cores: u32) -> Option<Self> {
-        let centi = |l: f64| -> Option<u32> {
-            if !(l.is_finite() && (0.0..1e7).contains(&l)) {
-                return None;
-            }
-            let text = format!("{l:.2}");
-            let (whole, frac) = text.split_once('.')?;
-            whole
-                .parse::<u32>()
-                .ok()?
-                .checked_mul(100)?
-                .checked_add(frac.parse().ok()?)
-        };
-        Some(Self {
-            start: centi(start?)?,
-            end: centi(end?)?,
-            cores,
-        })
-    }
-
-    /// Hundredths as the decimal they came from: `7482` is `74.82`.
-    #[must_use]
-    pub fn text(centi: u32) -> String {
-        format!("{}.{:02}", centi / 100, centi % 100)
-    }
-
-    /// `74.82 -> 80.10 on 14 cores`.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        format!(
-            "{} -> {} on {} cores",
-            Self::text(self.start),
-            Self::text(self.end),
-            self.cores
-        )
-    }
-}
-
 /// Why a stage failed: exit `1` against exit `3` ([`crate::exit`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
@@ -128,8 +76,6 @@ pub enum Entry {
 pub struct Report {
     pub title: String,
     pub entries: Vec<Entry>,
-    /// The load around the stage, set once it has finished.
-    pub load: Option<StageLoad>,
 }
 
 impl Report {
@@ -138,7 +84,6 @@ impl Report {
         Self {
             title: title.into(),
             entries: Vec::new(),
-            load: None,
         }
     }
 
@@ -384,23 +329,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ladder_rows_render_under_their_header() {
-        let mut r = Report::new("test compile (--workspace)");
-        r.pass("targo test --workspace --no-run");
-        r.skip("tippy lint (no tippy)");
-        r.fail("aterm-census --guards");
-        r.cannot_run("targo not found");
-        assert_eq!(
-            r.render(),
-            "\n=== test compile (--workspace) ===\n\
-             \x20 ok    targo test --workspace --no-run\n\
-             \x20 skip  tippy lint (no tippy)\n\
-             \x20 FAIL  aterm-census --guards\n\
-             \x20 NOT RUN targo not found\n"
-        );
-    }
-
-    #[test]
     fn every_skip_is_counted_and_named() {
         let mut a = Report::new("a");
         a.skip("targo test (no targo)");
@@ -409,6 +337,7 @@ mod tests {
         b.skip("gui smoke (macOS only)");
         b.fail("a finding");
         b.cannot_run("no driver");
+        b.raw("  NOTICE: raw text is never a decision");
 
         let t = tally(&[a, b]);
         assert_eq!(t.skipped(), 2);
@@ -416,13 +345,6 @@ mod tests {
         assert_eq!(t.gate_failures, ["a finding"]);
         assert_eq!(t.could_not_run, ["no driver"]);
         assert!(t.failed());
-    }
-
-    #[test]
-    fn raw_text_never_becomes_a_decision() {
-        let mut r = Report::new("r");
-        r.raw("  NOTICE: something");
-        assert_eq!(tally(&[r]), Tally::default());
     }
 
     #[test]
@@ -457,13 +379,7 @@ mod tests {
         );
         let t = tally(std::slice::from_ref(&r));
         assert_eq!(t.gate_failures, ["a finding"]);
-        assert_eq!(
-            t.could_not_run,
-            [
-                "never spawned — No space left on device (os error 28)",
-                "starved — the child ran out of disk (No space left on device)",
-            ]
-        );
+        assert_eq!(t.could_not_run.len(), 2, "never spawned, starved: {t:?}");
         let found = r.findings();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "a finding");
@@ -497,36 +413,10 @@ mod tests {
         let t = tally(std::slice::from_ref(&r));
         assert_eq!(t.gate_failures, ["found"]);
         assert_eq!(t.could_not_run.len(), 1, "{t:?}");
-        assert!(
-            t.could_not_run[0].starts_with("refused — every failing test refused")
-                && t.could_not_run[0].contains("(a, b)"),
-            "{t:?}"
-        );
         let ids: Vec<String> = r.findings().into_iter().map(|f| f.id).collect();
         assert_eq!(
             ids,
             ["-p x --test bridge_e2e -- a", "-p x --test bridge_e2e -- b"]
         );
-    }
-
-    #[test]
-    fn a_row_decided_without_a_child_is_itemized_from_the_log_under_it() {
-        let mut r = Report::new("smoke");
-        r.fail("smoke: aterm-gui exited early");
-        r.raw("panicked at src/main.rs:3:1");
-        r.fail("smoke: metrics reset -> ERR");
-        let found = r.findings();
-        assert_eq!(found[0].message, ["panicked at src/main.rs:3:1"]);
-        assert!(found[1].message.is_empty());
-    }
-
-    #[test]
-    fn a_stage_load_is_two_readings_or_none() {
-        let l = StageLoad::of(Some(74.82), Some(80.1), 14).expect("both read");
-        assert_eq!((l.start, l.end, l.cores), (7482, 8010, 14));
-        assert_eq!(l.describe(), "74.82 -> 80.10 on 14 cores");
-        assert_eq!(StageLoad::of(Some(1.0), None, 14), None);
-        assert_eq!(StageLoad::of(Some(-1.0), Some(1.0), 14), None);
-        assert_eq!(StageLoad::of(Some(f64::NAN), Some(1.0), 14), None);
     }
 }

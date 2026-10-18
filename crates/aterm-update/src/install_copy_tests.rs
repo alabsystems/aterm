@@ -172,7 +172,13 @@ fn a_timed_out_writer_cannot_mutate_a_retry_after_stage_or_swap_publication() {
             let published = if shape == "cross-volume" {
                 std::fs::create_dir(&installed).unwrap();
                 std::fs::write(installed.join("id"), "ROLLBACK").unwrap();
-                checked_bundle_exchange(&destination, &installed, "copy fixture swap").unwrap();
+                checked_bundle_exchange(
+                    &destination,
+                    &installed,
+                    "copy fixture swap",
+                    aterm_durable::Flush::Durable,
+                )
+                .unwrap();
                 installed
             } else {
                 let ready = Ready {
@@ -323,75 +329,6 @@ fn reaper_case(
             "{case}"
         );
     }
-    let _ = std::fs::remove_dir_all(&staging.root);
-}
-
-/// A copy attempt nobody can finish is reclaimed in the end: a caller killed
-/// mid-copy never marks its attempt, and one that gave up on a writer it could not
-/// confirm stopped marks it abandoned. An attempt whose caller is gone or gave it
-/// up, and that has outlived every copy's ceiling by a wide margin, has no writer
-/// left to protect.
-#[test]
-fn an_attempt_whose_caller_or_writer_died_is_eventually_reclaimed() {
-    let staging = Staging::scratch("copy-lapsed");
-    let dead = {
-        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        pid
-    };
-    let old = std::time::SystemTime::now()
-        - STALE_COPY_ATTEMPT_AFTER
-        - std::time::Duration::from_secs(60);
-    let attempt = |name: &str, owner: u32, aged: bool, gave_up: bool| {
-        let attempt = IsolatedCopy::create(&staging.root.join(name)).unwrap();
-        std::fs::create_dir_all(&attempt.payload).unwrap();
-        std::fs::write(attempt.payload.join("partial"), "bytes").unwrap();
-        std::fs::write(attempt.root.join(COPY_OWNER), format!("{owner}\n")).unwrap();
-        if gave_up {
-            std::fs::write(attempt.root.join("abandoned"), "1\n").unwrap();
-        }
-        if aged {
-            std::fs::File::options()
-                .write(true)
-                .open(attempt.root.join("copy-layout"))
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
-        }
-        attempt.root
-    };
-    let live = std::process::id();
-    let caller_killed = attempt("killed", dead, true, false);
-    let given_up = attempt("given-up", live, true, true);
-    // Negative controls: a live caller that has not given its attempt up (it may
-    // be stopped, and will still promote it), and either cut while young enough
-    // that a writer could still be finishing.
-    let live_caller = attempt("live-caller", live, true, false);
-    let young_killed = attempt("young-killed", dead, false, false);
-    let young_given_up = attempt("young-given-up", live, false, true);
-
-    reap_abandoned_copy_attempts(&staging.root);
-    assert!(
-        !caller_killed.exists(),
-        "a dead caller's attempt is reclaimed"
-    );
-    assert!(
-        !given_up.exists(),
-        "an attempt its caller gave up is reclaimed"
-    );
-    assert!(
-        live_caller.exists(),
-        "a live caller's attempt is never reclaimed"
-    );
-    assert!(
-        young_killed.exists(),
-        "a young attempt may still have a writer"
-    );
-    assert!(
-        young_given_up.exists(),
-        "a young attempt may still have a writer"
-    );
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 

@@ -3,6 +3,10 @@
 
 # aterm-types: spec recovery from its 398 unit tests
 
+> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 173 tests
+> it deleted and 2 specs whose functions it deleted are gone. Counts elsewhere in this file were
+> taken before.
+
 > Status 2026-10-15: this is the crate's migration worklist. The 125 specs below are each to be
 > proved through Trust/Clean about the compiled Rust function, and then the tests each one subsumes are
 > deleted. The 18 tests in §4 sample no spec and can be deleted now. Nothing has been proved yet.
@@ -122,14 +126,12 @@ cs-graph-entry-lines	contract	control_socket::{graph_entry_sock,graph_entry_pid}
 cs-token-name-injective	contract	control_socket::{token_name_for_sock,sock_name_pid}	∀ s: token_name_for_sock(s) = instance_token_name(p) if s ends .sock and instance_pid(s) = Some(p); else (s ends .sock ? "" : "aterm-sock-")++s++".token". (1) Injective up to the pid normal form: two non-instance names, or instance names with different pids, never share a token name; (2) the result is never "aterm.token"; (3) instance_pid(token_name_for_sock(s)) = None unless s is an instance .sock name.	4	String concatenation, ends_with, injectivity quantified over strings	1,3,5
 cs-token-candidates	contract	control_socket::token_names_for_sock	∀ s: token_names_for_sock(s) = [token_name_for_sock(s)] if s is an instance .sock name with a u32 pid, else [token_name_for_sock(s), "aterm.token"].	1	Vec<String> construction	1,4
 cs-stale-instance-files	contract	control_socket::stale_instance_files	∀ names, pid_alive: result = [n | n ∈ names in order, instance_pid(n) = Some(p) ∧ ¬pid_alive(p)] as owned Strings.	1	&dyn Fn callback (higher-order), iterator filter/map/collect, Vec<String>	1,7,13
-cs-stale-socket-files	contract	control_socket::stale_socket_files	∀ files, min_age, aliased, pid_alive, listening: result = [f.name | f ∈ files in order, f.name ends .sock, f.name ≠ "aterm.sock", Some(f.name) ≠ aliased, f.len = 0, f.age_secs ≥ min_age, and (instance_pid(f.name) = Some(p) ∧ ¬pid_alive(p), or else ¬listening(f.name))]. Call protocol: pid_alive is called only for files passing the first five conjuncts; listening exactly once each, in order, for those with no dead-pid verdict. A file with a live listener and no dead pid in its name is never returned.	6	two &dyn Fn callbacks observed as a call trace (short-circuit order), iterator filter, struct slice	1,5,7,13
-cs-symlink-targets-pid	contract	control_socket::symlink_targets_pid	∀ target, pid: holds iff Path::new(target).file_name() = Some("aterm-"++Dec(pid)++".sock").	1	std::path::Path::file_name (needs a path model), OsStr comparison	1,3,8
 cv-host-gone-roundtrip	round-trip	control_verbs::{host_gone_line,host_gone}	∀ pid: u32, sock ≠ "" not ending in CR/LF: host_gone(host_gone_line(pid,sock)) = Some((pid,sock)). ∀ l: host_gone(l) = Some((p,s)) iff l minus trailing CR/LF = "ERR gone pid="++d++" sock="++s split at the first " sock=", with Digits(d), value(d) = p ≤ u32::MAX and s ≠ "".	1	format! with runtime args, split_once, str::parse	1,3,5,7
 cv-rows-fence-wire	round-trip	RowsFence::{parse,hash_rows}, <RowsFence as Display>::fmt	∀ f with f.first ≤ f.last: to_string(f) = Dec(first)++"-"++Dec(last)++":"++16 lowercase hex digits of hash, and parse(to_string(f)) = Some(f). parse(v) = Some(f) iff v = a++"-"++b++":"++h with Digits(a), Digits(b), values fitting usize, a ≤ b, |h| = 16 all hex; else None. ∀ rows r1..rn: hash_rows(r) = fnv1a_64(r1++"\n"++…++rn++"\n").	1	Display via Formatter::write_str, a [u8;16] digit loop, generic IntoIterator<Item=&str>, cross-crate aterm_hash	1,3,7,11,12
 cv-screen-gen-wire	round-trip	ScreenGen::parse, <ScreenGen as Display>::fmt	∀ g: ScreenGen, to_string(g) = Dec(epoch)++"."++Dec(seq) and parse(to_string(g)) = Some(g). parse(v) = Some(ScreenGen{e,s}) iff v = a++"."++b split at the first '.', with Digits(a), Digits(b) and both values ≤ u64::MAX; else None.	1	split_once, closure, u64 parse, Display	1,3,5,13
 cv-framing-of	contract	control_verbs::{framing_of,spec}	∀ verb, request: r = the text after the first space if request starts with '@', else request; sub = the 2nd whitespace token of r; F = some token of r ∈ {--json, json}; B = some token ∈ {--bytes, bytes}. framing_of, rules in this order: image with sub = read or B ⇒ Lines; cast with sub ∈ {frames, drift} ⇒ Lines; inbox get ⇒ Bytes; inbox seen, outbox sent, identities forget, topic add|drop ⇒ Status; video frames ⇒ Lines; temporal status ⇒ Status; verb ∈ JSON_CAPABLE_VERBS with F ⇒ Lines; otherwise spec(verb).framing, or Status for an unknown verb.	4	split_whitespace iterators, linear search over a 200+-row static table, &str matching (trust::skip today)	1,3,5,7
-cv-verb-table-wellformed	table-property	control_verbs::VERBS, VerbSpec::help_line, catalog_lines, catalog_lines_full, JSON_CAPABLE_VERBS	Over the const table VERBS: names pairwise distinct; ∀ v ∈ JSON_CAPABLE_VERBS, spec(v) = Some(s) with s.op = Read; every summary nonempty, ≤ 96 chars; no summary or detail has a double space or leading/trailing whitespace; help_line(s) = summary if detail = "", else summary++" "++detail; |catalog_lines| = |catalog_lines_full| = |VERBS|; Σ(|catalog_row(name,summary)|+1) ≤ 11449. Decidable by evaluation.	3	a 200+-row static &[VerbSpec] of &'static str, char counting, format! padding	1,3,7
-cv-access-classification	table-property	control_verbs::{VERBS,is_owner_only,is_any_scope_meta,is_bridge_only,spec}	Security policy over VERBS, in table order: OwnerOnly = [appnotice, notice, story, topic, rekey, hold, operator, operator-propose-bin, fabric, sessions, who, exits, identities, whoami, grant, revoke, connect, disconnect, flows, raise, dial, dial-list, dial-token]; AnyScopeMeta = [version, update, help, verbs, privacy]; BridgeOnly = [deliver, link, outbox, outbox sent]. is_X(v) iff spec(v) = Some(s) with s.access = X, so the sets are pairwise disjoint and unknown verbs are in none. Designed (op, framing, target, access) rows: inbox, inbox get, inbox seen, post, topic, deliver, link, hold, outbox, outbox sent; copy = ClipboardWrite; settings = ConfigWrite; scroll/select = Read; identities target = Meta; privacy = (Read, Lines, Meta, AnyScopeMeta).	5	static table evaluation, enum equality, find over a slice	1,3,7
+cv-verb-table-wellformed	table-property	control_verbs::VERBS, VerbSpec::help_line, catalog_lines, catalog_lines_full, JSON_CAPABLE_VERBS	Over the const table VERBS: names pairwise distinct; ∀ v ∈ JSON_CAPABLE_VERBS, spec(v) = Some(s) with s.op = Read; every summary nonempty, ≤ 96 chars; no summary or detail has a double space or leading/trailing whitespace; help_line(s) = summary if detail = "", else summary++" "++detail; |catalog_lines| = |catalog_lines_full| = |VERBS|; Σ(bytes of catalog_row(name,summary) + 1) ≤ SHORT_CATALOG_MAX_BYTES (12696), which the const assertion beside VERBS also checks at compile time. Decidable by evaluation.	3	a 200+-row static &[VerbSpec] of &'static str, char counting, format! padding	1,3,7
+cv-access-classification	table-property	control_verbs::{VERBS,is_owner_only,is_any_scope_meta,is_bridge_only,spec}	Security policy over VERBS, in table order: OwnerOnly = [appnotice, notice, story, devtools, askpass, topic, rekey, hold, fabric, sessions, who, exits, identities, whoami, grant, revoke, connect, disconnect, flows, raise]; AnyScopeMeta = [version, update, help, verbs, privacy]; BridgeOnly = [deliver, link, hello, outbox, outbox sent, log-take, log-landed]. is_X(v) iff spec(v) = Some(s) with s.access = X, so the sets are pairwise disjoint and unknown verbs are in none. Designed (op, framing, target, access) rows: inbox, inbox get, inbox seen, post, topic, deliver, link, hello, hold, outbox, outbox sent, log-take = (Read, Bytes, Meta, BridgeOnly), log-landed = (Write, Status, Meta, BridgeOnly); copy = ClipboardWrite; settings = ConfigWrite; scroll/select = Read; identities target = Meta; privacy = (Read, Lines, Meta, AnyScopeMeta).	5	static table evaluation, enum equality, find over a slice	1,3,7
 cv-artifact-ack	contract	control_verbs::{artifact_reply_requires_ack,valid_artifact_ack_nonce}	With r, sub, B as in cv-framing-of: artifact_reply_requires_ack(verb,request) = (verb = image ∧ sub ≠ read ∧ ¬B) ∨ verb = window ∨ (verb = video ∧ sub ∉ {status, stop}); false for every other verb. valid_artifact_ack_nonce(n) iff |n| = 32 and every byte is ASCII hex.	1	split_whitespace/nth/any, matches! on Option<&str>	1,3,5,7
 cv-entry-lines-wrap	contract	VerbSpec::entry_lines, catalog_row	∀ VerbSpec s whose help_line h has no double space, W = 71 (100−29): entry_lines(s) = [catalog_row(name, c0)] ++ [29 spaces ++ ci | i ≥ 1], where c0..ck is the greedy word-wrap of h.split(' ') at width W chars (a chunk closes only when the next word would pass W). Hence join(ci, " ") = h; each ci nonempty and trimmed; |ci| ≤ W unless ci is a single word; deterministic.	1	loop with a String accumulator, mem::take, chars().count, Vec<String>, format! width padding (trust::skip today)	1,3,5,7
 dev-seam-reads-env	contract	dev_seam! macro	In a build with cfg(debug_assertions) or the calling crate's dev-seams feature, dev_seam!(n) = std::env::var_os(n) ∀ n; in every other build it is None, whatever the environment holds.	1	cfg-dependent macro expansion, a process-environment read (platform effect)	8
@@ -172,11 +174,12 @@ rl-trust-spelling	contract	rust_lane::{trust_spelling,cargo_spelling,cargo_verb,
 rl-render-spellings	contract	rust_lane::render_spellings	∀ spellings, indent: one line per spelling: indent++command padded to the widest command plus 3 spaces, then label padded to the widest label and " \u{2014} "++note when there is a label; just indent++command when no spelling has a label. Each line ends in \n.	1	String formatting with computed widths, char counting	1,3,7
 rl-channel-in	contract	rust_lane::channel_in	∀ text: channel_in(text) = Some(v) iff some line outside comments is channel = <quoted v> (single or double quotes, any spacing), as rustup reads rust-toolchain(.toml), or the file is a legacy bare channel name; v is the first such value. None otherwise.	1	lines/trim/strip_prefix parsing	1,3,5,7
 rl-file-beside	contract	rust_lane::file_beside	∀ dir, name, cwd, home: holds iff resolve(dir)/name is a regular file. resolve: absolute dir as is; relative dir under cwd (None if cwd is None); ~/, $HOME/, ${HOME}/ under home (None if home is None). Any other $, `, *, ? or ~user makes it false. A ~ inside a path is literal.	1	filesystem metadata (is_file), Path join	1,8
-scheme-builtin-registry	table-property	scheme::{builtin,builtin_names,builtin_themes,builtin_description,BUILTINS}, Builtin::to_scheme	builtin_names() = ["Default"] ++ [b.name | b ∈ BUILTINS]. builtin_themes() = [(n, builtin_description(n)) | n ∈ builtin_names()]. Every description is nonempty and differs from the fallback. No BUILTINS name equals "default" ignoring case. builtin(n) = Some(default()) for n equal to "default" ignoring case; builtin(b.name) = Some(b.to_scheme()) ∀ b ∈ BUILTINS, and to_scheme keeps the name; builtin(x) = None otherwise.	3	static table, eq_ignore_ascii_case, Vec collect, String	1,3,7
+scheme-builtin-registry	table-property	scheme::{builtin,builtin_names,builtin_themes,builtin_theme_list,BUILTINS}, Builtin::to_scheme	builtin_names() = ["Default"] ++ [b.name | b ∈ BUILTINS]. builtin_themes() = [(t.name, t.description) | t ∈ builtin_theme_list()], and the names of builtin_theme_list() are builtin_names() in order. Every description is nonempty. No BUILTINS name equals "default" ignoring case. builtin(n) = Some(default()) for n equal to "default" ignoring case; builtin(b.name) = Some(b.to_scheme()) ∀ b ∈ BUILTINS, and to_scheme keeps the name; builtin(x) = None otherwise.	3	static table, eq_ignore_ascii_case, Vec collect, String	1,3,7
 scheme-theme-name-grammar	contract	scheme::validate_user_theme_name	∀ name: Ok(()) iff name is nonempty, name = trim(name), name ∉ {., ..}, no control char, no / or \\, no comma, and the trimmed lowercase text before the first ':' (if any) ∉ {dark, light}. The Err reason names the first failing clause in that order.	1	chars().any, split_once, to_ascii_lowercase (String)	1,3,5,7
-scheme-projections	contract	ColorScheme::{default,to_color_palette,to_theme_parts}	∀ s: to_color_palette(s).get(i) = s.ansi[i] for i < 16 and default_color(i) for i ≥ 16. to_theme_parts(s) = {fg: pack(fg), bg: pack(bg), cursor: pack(cursor or else fg), selection: pack(selection_band(s))} with pack(c) = r<<16 | g<<8 | b, selection_band(s) = selection or else derived_selection(fg, bg), and derived_selection(f, b) = per channel round((78·b + 22·f) / 100). default().ansi[i] = default_color(i), so default().to_color_palette() equals ColorPalette::new() pointwise.	2	loop over [Rgb;16], composition with palette-mutators, u32 shifts	1,3,4,7
+selector-draw	contract	ThemeSelector::draw_builtin, SelectorDraw::unset, scheme::UNSET_THEME	∀ selector s, appearance a: draw_builtin(s,a) = Unset(builtin(UNSET_THEME)) iff name_for(s,a) = None; Builtin(builtin(n)) iff name_for(s,a) = Some(n) and n names a built-in (case-insensitive; the scheme is canonically named); Other(n) otherwise. UNSET_THEME = Default on every appearance: following the OS is a written pair, never the unset value. aterm-gui's theme resolution and aterm-wasm's theme_api both draw through it.	1	enum with owned payloads, Option combinators	3,12
+scheme-projections	contract	ColorScheme::{default,to_color_palette,to_theme_parts}	∀ s: to_color_palette(s).get(i) = s.ansi[i] for i < 16; for i ≥ 16 it is default_color(i) when !s.palette_generate, else generated_extended_palette(s.ansi, s.foreground, s.background)[i-16]. to_theme_parts(s) = {fg: pack(fg), bg: pack(bg), cursor: pack(cursor or else fg), selection: pack(selection_band(s))} with pack(c) = r<<16 | g<<8 | b, selection_band(s) = selection or else derived_selection(fg, bg), and derived_selection(f, b) = per channel round((78·b + 22·f) / 100). default().ansi[i] = default_color(i), so default().to_color_palette() equals ColorPalette::new() pointwise.	2	loop over [Rgb;16], composition with palette-mutators, u32 shifts	1,3,4,7
 scheme-builtin-legibility	table-property	BUILTINS, Rgb::contrast	∀ built-in scheme s: s.appearance = Light ⇒ luma(s.background) > luma(s.foreground), luma = 0.299r + 0.587g + 0.114b; contrast(s.foreground, selection_band(s)) ≥ 3.0. ∀ built-in s, Default included: contrast(fg, bg) ≥ 4.5, contrast(selection_band(s), bg) ≥ 1.5, contrast(cursor or else fg, bg) ≥ 3.0, and no ansi[i] = bg. At least 4 built-ins are Light.	1	f64 arithmetic (WCAG luminance with powf), evaluation over a const table; builds on luminance-denotation	1,3,6,7
-scheme-parse	contract	scheme::{parse_theme_str,parse_theme_located,parse_scheme_str,parse_hex,lookup_theme_key,strip_inline_comment,THEME_KEYS}	∀ text: a leading U+FEFF is dropped (line numbers unchanged); then, over 1-based lines: skip blank lines and lines starting # or ;. Every other line must be key = value: split at the first '=', value = trim(strip_inline_comment(rest)), nonempty. The key is read by lookup_theme_key over THEME_KEYS (trimmed, ASCII-lowercased; a row's name or any alias, and for the indexed row a stem color|palette|ansi followed by decimal digits N ∈ 0..16): name, description, author (text: at most MAX_THEME_TEXT_CHARS chars, no control char); appearance ∈ dark|light (case-insensitive); foreground|fg, background|bg, cursor|cursor_color, selection|selection_color, selection_foreground and colorN (ansi[N]) take parse_hex: #RRGGBB, bare RRGGBB, or #RGB (the 3-digit form needs the #; d ↦ 17·d). Any other key is an error. A key set twice under any of its spellings (fg then foreground, color1 then palette1) is an error at the second line. Every failure is Err(Parse{line, …}) at the first offending line. After the loop a missing foreground or background is Err(Parse{line: 0}). Unset ansi slots = default_color(i); unset cursor/selection/selection_foreground = None; appearance_declared iff appearance was set. strip_inline_comment cuts at the first whitespace-preceded # or ; that is not the leading token. parse_scheme_str(t) = parse_theme_str(t).map(scheme).	4	lines().enumerate loop, String, closures, usize parse, [bool;16] seen-set (trust::skip today)	1,3,5,7,13
+scheme-parse	contract	scheme::{parse_theme_str,parse_theme_located,parse_scheme_str,parse_hex,lookup_theme_key,strip_inline_comment,THEME_KEYS}	∀ text: a leading U+FEFF is dropped (line numbers unchanged); then, over 1-based lines: skip blank lines and lines starting # or ;. Every other line must be key = value: split at the first '=', value = trim(strip_inline_comment(rest)), nonempty. The key is read by lookup_theme_key over THEME_KEYS (trimmed, ASCII-lowercased; a row's name or any alias, and for the indexed row a stem color|palette|ansi followed by decimal digits N ∈ 0..16): name, description, author (text: at most MAX_THEME_TEXT_CHARS chars, no control char); appearance ∈ dark|light (case-insensitive); palette_generate ∈ true|false (case-insensitive; omitted ⇒ false), any other value an error at its line; foreground|fg, background|bg, cursor|cursor_color, selection|selection_color, selection_foreground and colorN (ansi[N]) take parse_hex: #RRGGBB, bare RRGGBB, or #RGB (the 3-digit form needs the #; d ↦ 17·d). Any other key is an error. A key set twice under any of its spellings (fg then foreground, color1 then palette1) is an error at the second line. Every failure is Err(Parse{line, …}) at the first offending line. After the loop a missing foreground or background is Err(Parse{line: 0}). Unset ansi slots = default_color(i); unset cursor/selection/selection_foreground = None; appearance_declared iff appearance was set. strip_inline_comment cuts at the first whitespace-preceded # or ; that is not the leading token. parse_scheme_str(t) = parse_theme_str(t).map(scheme).	4	lines().enumerate loop, String, closures, usize parse, [bool;16] seen-set (trust::skip today)	1,3,5,7,13
 sel-linear	contract	selection::selection_contains_linear	requires (r1,c1) ≤Lex (r2,c2). ∀ row, col: selection_contains_linear(row,col,r1,c1,r2,c2) iff (r1,c1) ≤Lex (row,col) ≤Lex (r2,c2). On one row (r1 = r2 = row) this is c1 ≤ col ≤ c2.	3	scalar i32/usize comparisons, an if/else-if chain with an early return (the chunk listed gap 5; the ensures needs no quantifier)	3
 sel-block	contract	selection::selection_contains_block	∀ inputs: selection_contains_block(row,col,r1,c1,r2,c2) iff min(r1,r2) ≤ row ≤ max(r1,r2) ∧ min(c1,c2) ≤ col ≤ max(c1,c2). Symmetric in the two anchors.	4	i32/usize min/max (std calls)	3
 sel-glyph-span	contract	selection::glyph_cell_span	∀ col, lead, cont: glyph_cell_span = (sat_sub(col,1), col) if cont; (col, sat_add(col,1)) if lead ∧ ¬cont; (col,col) otherwise. Hence for a wide pair at (c, c+1), 0 ≤ c < u16::MAX: span(c,true,false) = span(c+1,false,true) = (c, c+1). The span never wraps.	3	const fn, saturating u16, tuple return	1,3
@@ -201,7 +204,7 @@ kb-termmode-projection	contract	TermMode::{from_keyboard_state,to_keyboard_mode}
 kb-wire-values	contract	Modifiers::{kitty_encoded,xterm_encoded}, KeyEventType::kitty_value	∀ m: Modifiers, kitty_encoded(m) = 1 + m.bits(), lock bits included (CAPS_LOCK = 64, NUM_LOCK = 128). xterm_encoded(m) = 1 + (m.bits() & chord bits), locks excluded. kitty_value: Press = 1, Repeat = 2, Release = 3.	2	u8 arithmetic on bitflags	3
 kb-kitty-code-table	table-property	NamedKey::kitty_code	∀ NamedKey k, kitty_code(k) = the kitty protocol functional-key code: Escape 27, Enter 13, Tab 9, Backspace 127, Space 32; Insert 57348, Delete 57349, Left 57350, Right 57351, Up 57352, Down 57353, PageUp 57354, PageDown 57355, Home 57356, End 57357, CapsLock 57358, ScrollLock 57359, …; F1..F35 = 57364..57398; KP_0..KP_9 = 57399..57408, …; media keys 57428 and up; ShiftLeft 57441 … MetaRight 57452. kitty_code is injective on NamedKey.	6	a ~120-arm enum → u32 match	1,3
 kb-dom-map	contract	keyboard::{map_dom_key,map_dom_named_key}	∀ key: &str: exactly one char c ⇒ Some(Named(Space)) for c = ' ', else Some(Character(c)). Multi-char ⇒ Some(Named(n)) iff key is in the UI Events name table (navigation, editing, Escape, ContextMenu/Pause/PrintScreen, the locks, F1..F35, media/audio keys, and the modifiers mapped Left-canonical: Shift→ShiftLeft, Control→ControlLeft, Alt→AltLeft, Meta→SuperLeft); else None: empty, multi-codepoint text, Dead, Process, Compose, Unidentified, AltGraph, Fn, F0, F36+.	8	chars iterator, a large &str match	1,3
-kb-dom-encode	contract	keyboard::encode_dom_key	∀ key, mods, ev, base, mode: None if map_dom_key(key) = None or ev > 2. Otherwise b = encode_key_with_layout(map(key), Modifiers::from_bits_truncate(mods), mode, [Press,Repeat,Release][ev], base); result = None if b is empty, else Some(b).	3	composition with the encoder specs, Option<Vec<u8>>	1,4
+kb-dom-encode	contract	keyboard::encode_dom_key	∀ key, mods, ev, base, mode: None if map_dom_key(key) = None or ev > 2. Otherwise b = encode_key_with_layout(map(key), Modifiers::from_bits_truncate(mods), mode, [Press,Repeat,Release][ev], base); result = None if b is empty, else Some(b). mods are the chord's modifiers: a host clears CTRL and ALT on a press AltGraph chose (Windows reports AltGr as both, the glyph already in key), so a Ctrl+Alt that reaches the encoder is a chord (AltGr+Q's '@' with them left on is ESC NUL, AltGr+E's '€' ESC ^E, by kb-layout-text's Ctrl twin on base).	3	composition with the encoder specs, Option<Vec<u8>>	1,4
 kb-shift-map	refinement	keyboard::{shifted_character,encode_key}	∀ ASCII c with an ANSI US-QWERTY shifted glyph S(c) (a-z→A-Z, the digit row → !@#$%^&*(), and the 11 punctuation pairs): shifted_character(c, SHIFT) = Some(S(c)). Corollary: encode_key(Character(c), SHIFT, ∅) ≠ encode_key(Character(c), ∅, ∅) for every such c.	2	char matches, the encoder (trust::skip today), Vec<u8>	1,3,4,5
 kb-write-u32	contract	keyboard::encode::{write_u32,write_u8}	∀ buf, v: u32, write_u32(buf,v) appends Dec(v) and terminates, u32::MAX included. write_u8 likewise appends Dec(v).	1	a digit loop into a fixed scratch array, &mut Vec push	1,2,3,7
 kb-shift-enter-distinct	contract	keyboard::encode_key	∀ mode ∈ Modes(16): encode_key(Named(Enter), SHIFT, mode) ≠ encode_key(Named(Enter), ∅, mode), both nonempty. Witnesses: legacy CR vs LF; DISAMBIGUATE CR vs CSI 13;2u; LEVEL2 CR vs CSI 27;2;13~; WIN32 CR vs the VK_RETURN record pair.	2	∀ over 2^16 modes (exhaustive or symbolic), the whole encoder	1,3,4,5,7
@@ -210,13 +213,13 @@ kb-kitty-text-preserving	equivalence	keyboard::encode_key_with_event	∀ mode wi
 kb-kitty-csi-u-denotation	contract	encode_kitty, encode_kitty_legacy_functional, kitty_key_codes, kitty_modifiers_for_event, append_mod_event, letter_final, tilde_final	∀ k, m, ev, mode with DISAMBIGUATE ∈ mode, WIN32 ∉ mode, the event not covered by kb-kitty-text-preserving or kb-release-gating. Keys with a legacy functional form (arrows, Home/End, F1-F4 as letter finals; Insert/Delete/PgUp/PgDn/F5-F12 as tilde numbers): CSI [1;]mod[:ev] X or CSI n[;mod[:ev]] ~. Every other key: CSI code[:alts] [;mod[:ev]] [;text] u, code = the lowercase/unshifted codepoint or kitty_code, mod = kitty_encoded(m) (omitted when 1 and no :ev), :ev = :kitty_value(ev) present iff REPORT_EVENT_TYPES ∈ mode ∧ ev ≠ Press. Escape and Alt/Ctrl/Ctrl+Alt/Shift+Alt chords are always CSI u.	3	Vec<u8> building, decimal writes, nested matches over Key/NamedKey	1,2,3,4,7
 kb-kitty-progressive	contract	encode_kitty, associated_text_codepoints, named_key_text, should_encode_kitty_event	Extends kb-kitty-csi-u-denotation. REPORT_ALL_KEYS_AS_ESC: every key, text and modifier keys included, is a CSI u report, except the legacy functional keys keep their CSI letter/tilde forms. REPORT_ALTERNATE_KEYS: code gets :shifted when Shift changes the glyph and ::base / :shifted:base from the base-layout key. REPORT_ASSOCIATED_TEXT under report-all: a third field of the codepoints the press typed (the glyph, a keypad key's main-block glyph, Space's U+0020); omitted for named keys whose text is a control code (Enter, Tab, Backspace, Escape) and for keys with no text.	7	char → codepoint, Vec<u32>, encoder branches	1,3,4,7
 kb-keypad-fold	contract	Key::main_block_twin, encode_key_with_event	main_block_twin maps each keypad key to its main-block twin: Numpad0-9 → digits; Decimal, Separator, Divide, Multiply, Subtract, Add, Equal → . , / * - + =; NumpadEnter → Enter; numpad arrows, Home, End, PgUp/Dn, Insert, Delete → the named keys; None for NumpadBegin and every main-block key. Encoding: under a kitty mode without DISAMBIGUATE and APP_KEYPAD ∉ mode, a keypad key encodes as its twin's text press/repeat. APP_KEYPAD outranks the fold (SS3 form); DISAMBIGUATE keeps the dedicated keypad code; associated text carries the twin's glyph. A modified keypad key never composes the main row's shifted or control glyph (Shift+KP_5 is 5, never %).	5	enum matches, &self	1,2,3,4
-kb-xterm-mok	contract	encode_xterm_other_keys, xterm_modify_other_keys_level1_applies, xterm_level1_character_applies, xterm_modify_other_keys_level2_applies	∀ k, m, mode with mode ∩ KITTY = ∅, WIN32 ∉ mode, Lv = xterm_modify_other_keys_level(mode) > 0. If Lv = 1 and k is a Character whose Ctrl/Ctrl+Shift chord has no traditional C0 byte (Ctrl+Shift+c, Ctrl+1), or Lv = 2 and k is a modified Character whose result is not plain shifted text (Shift alone on a char whose shifted glyph is outside @..~ and [ \\ ] ^ _ stays text), or k = Backspace with Shift at Lv = 2: encode_key = CSI 27;xterm_encoded(m);code ~, or CSI code;mod u under FORMAT_OTHER_KEYS, code = the layout's shifted keysym when known. Otherwise the legacy encoding (Alt+Backspace = ESC DEL, Ctrl+Backspace = BS, keypad untouched, arrows legacy). Any kitty flag disables modifyOtherKeys.	8	char predicates, Vec<u8>	1,3,4,7
+kb-xterm-mok	contract	encode_xterm_other_keys, xterm_modify_other_keys_level1_applies, xterm_level1_character_applies, xterm_modify_other_keys_level2_applies	∀ k, m, mode with mode ∩ KITTY = ∅, WIN32 ∉ mode, Lv = xterm_modify_other_keys_level(mode) > 0. If Lv = 1 and k is a Character whose Ctrl/Ctrl+Shift chord has no traditional C0 byte (Ctrl+Shift+c, Ctrl+1), or Lv = 2 and k is a modified Character whose result is not plain shifted text (Shift alone on a char whose shifted glyph is outside @..~ and [ \\ ] ^ _ stays text), or k = Backspace with Shift at Lv = 2: encode_key = CSI 27;xterm_encoded(m);code ~, or CSI code;mod u under FORMAT_OTHER_KEYS, code = the shifted keysym, as xterm reports it: the layout's when known, else the US Shift table (Shift+2 = 64, Ctrl+Shift+c = 67). Otherwise the legacy encoding (Alt+Backspace = ESC DEL, Ctrl+Backspace = BS, keypad untouched, arrows legacy). Any kitty flag disables modifyOtherKeys.	8	char predicates, Vec<u8>	1,3,4,7
 kb-legacy-character	contract	encode_legacy, typed_character, shifted_character	∀ Character(c), m, with mode ∩ (KITTY ∪ XTERM ∪ WIN32) = ∅. Ctrl: the C0 byte of the chord's glyph (a-z and @[\\]^_ → 0x00-0x1F, ? → 0x7F, Ctrl+Shift+- → US 0x1F, Ctrl+~ → RS 0x1E, Ctrl+Space → NUL). Shift: UTF-8 of shifted_character. Alt: ESC prefix of the unmodified result unless ALT_NO_ESC; with Ctrl, ESC prefix of the Ctrl byte (C-M-SPC = ESC NUL, M-C-h = ESC BS). Otherwise UTF-8 of typed_character(c,m). The emacs/readline bindings (Alt+b/f/d, Ctrl+a/e/k…) are instances.	8	char matches, UTF-8 encoding of char, Vec<u8>	1,3,4,7
 kb-legacy-named	contract	encode_legacy, encode_{control,navigation,function,numpad}_named_legacy, encode_arrow, encode_home_end, encode_tilde_key, encode_f1_f4, encode_numpad	∀ named k, m, legacy mode (no kitty, xterm or win32 bits), chord = m minus the lock bits (CAPS/NUM never change a navigation or function form). Arrows: CSI A-D, SS3 under APP_CURSOR, CSI 1;xterm(chord) X when chord ≠ ∅. Home/End: CSI H/F likewise. Ins/Del/PgUp/PgDn/F5-F12: CSI n~ / CSI n;mod~, Shift+F10 = CSI 21;2~ (kf22). F1-F4: SS3 P-S, or CSI 1;mod P-S. Enter: CR, Shift+Enter LF, Ctrl CR, Alt ESC CR. Tab: HT, Shift+Tab CSI Z. Backspace: DEL, BS under BACKARROW_SENDS_BS, Ctrl inverts it. Escape: ESC. Numpad without APP_KEYPAD: the main-block twin's bytes (KP_Enter = main Enter); with APP_KEYPAD: SS3 p-y/M/k/m/j/o/X…, not cancelled by NumLock. KP_Begin: CSI E or SS3 E, never a digit.	10	large NamedKey matches, Vec<u8> building, bitflags	1,3,4,7
 kb-legacy-mode-switches	contract	encode_legacy, alt_prefixed	∀ k, m, legacy mode: ALT_NO_ESC ∈ mode ⇒ Alt+x encodes without the ESC prefix (the Alt-free encoding). META_SENDS_ESC ⇒ a META-modified key is the ESC-prefixed Meta-free encoding. NO_SPECIAL_MODIFIERS ⇒ the encoding equals that of m minus NUM_LOCK. Without the flags: Alt prefixes ESC, Meta is ignored, NumLock is a special modifier.	3	bitflags, Vec prefixing	1,3,4
 kb-vt52	contract	encode_legacy, encode_arrow, encode_f1_f4, encode_home_end, encode_numpad	∀ m, under VT52_MODE (no kitty or win32 bits): arrows ESC A-D whatever APP_CURSOR and m; F1-F4 ESC P-S (PF1-PF4); Home/End ESC H / ESC F, modifiers ignored; F5+ keep the ANSI form. Numpad with APP_KEYPAD: ESC ? p..y and the VT52 application forms; without it, the plain digits and glyphs.	6	encoder branches	1,3,4
-kb-layout-text	contract	keyboard::encode_key_with_text, text_press_glyph, ctrl_layout_twin, typed_character	∀ c, m, mode, ev, base, text. typed_character(c,m) = shifted_character(c,m) when SHIFT ∈ m, else (CAPS_LOCK ∈ m ? uppercase(c) : c); Shift and Caps both held gives the shifted glyph. On a text press (TextKey(k,m), no Ctrl/Alt/Super chord) the layout's text t, when Some, replaces the US-derived glyph in every mode where text stays text. Kitty reports keep code = the unshifted layout key with alternates/text = t. A Ctrl/Alt chord ignores t. Ctrl on a non-Latin layout key uses the base (US) letter's control byte (Russian Ctrl+С = ^C).	7	Option<char> params, char case mapping (Unicode for non-ASCII), encoder composition	1,3,4,7
-kb-win32-records	contract	win32_key_record, win32_enter_chord, win32_escape_record, conhost_holds_once_switched, us_physical_key, encode_win32_record_pair	∀ k, m, mode with WIN32_INPUT ∈ mode. (1) conhost_holds_once_switched(b) iff b is a lone ESC or an ESC-led sequence conhost leaves dangling (ESC, ESC [, ESC O, ESC ESC…; the measured set). (2) For a key whose legacy bytes satisfy (1), or Enter with a nonempty chord (Shift, Ctrl, Alt, combinations; NumpadEnter as an enhanced key): Press and Repeat give the record pair Win32Rec(vk,sc,uc,1,cs) ++ Win32Rec(vk,sc,uc,0,cs) from us_physical_key and the Windows control-key state; Release gives []. Escape, Ctrl+[, Ctrl+3, Alt+[ and Alt+O are records of their own physical key. (3) Every other key keeps exactly its non-win32 encoding (plain Enter CR, plain text text). (4) On the keys of (2) WIN32 outranks kitty flags and modifyOtherKeys; elsewhere kitty flags still apply. Across the printable-ASCII keyboard WIN32 changes exactly the held forms.	12	struct record building, decimal writes, &[u8] predicate, encoder composition	1,3,4,5,7
+kb-layout-text	contract	keyboard::encode_key_with_text, layout_glyph, chord_ctrl_byte, ctrl_layout_twin, encode_character_legacy, typed_character	∀ c, m, mode, ev, base, text. typed_character(c,m) = shifted_character(c,m) when SHIFT ∈ m, else (CAPS_LOCK ∈ m ? uppercase(c) : c); Shift and Caps both held gives the shifted glyph. t = layout_glyph(k, text): text, the layout's character at the press's Shift and lock level with Ctrl and Alt aside, when k is a Character and text is not a control character; a named key takes none. On a text press (no Ctrl/Alt/Meta/Hyper/Super) t, when Some, replaces the US-derived glyph in every mode where text stays text. Kitty reports keep code = the unshifted layout key; the shifted key under REPORT_ALTERNATE_KEYS is t while Shift is held, chord or not, and the associated text is t. In the legacy, xterm and win32 paths a Ctrl chord's byte is chord_ctrl_byte(c,m,t) = ctrl(c), else ctrl(t when Some, else shifted_character(c,m)) (German Ctrl+Shift+ß types '?': DEL; Ctrl+Shift+/ stays 0x1F). When that is None on a non-ASCII c and the physical key's US character base has a control byte, the press is encoded as Character(base) and without t (ctrl_layout_twin): Russian Ctrl+С = 0x03, Russian Ctrl+х on the [ key = ESC, AZERTY Ctrl+é on the 2 key = NUL, and modifyOtherKeys level 2 reports base's keysym (Russian Ctrl+Shift+х = CSI 27;6;123~). An Alt chord (Meta under META_SENDS_ESC) with no control byte is ESC + (t when Some, else Shift ? shifted_character(c,m) : lowercase(c)): German Alt+Shift+2 = ESC ", US Alt+Shift+2 = ESC @. A chord with neither a control nor an ESC form (no control byte for c, t, shifted_character or base; or Alt under ALT_NO_ESC) writes the character the layout types at that level, t, else the US Shift table's: German Ctrl+ö on the ; key = ö.	8	Option<char> params, char case mapping (Unicode for non-ASCII), encoder composition	1,3,4,7
+kb-win32-records	contract	win32_key_record, win32_enter_chord, win32_escape_record, win32_ctrl_character_record, conhost_holds_once_switched, us_physical_key, encode_win32_record_pair	∀ k, m, mode with WIN32_INPUT ∈ mode. (1) conhost_holds_once_switched(b) iff b is a lone ESC or an ESC-led sequence conhost leaves dangling (ESC, ESC [, ESC O, ESC ESC…; the measured set). (2) For a key whose legacy bytes satisfy (1), or Enter with a nonempty chord (Shift, Ctrl, Alt, combinations; NumpadEnter as an enhanced key), or a Ctrl letter chord whose legacy bytes are a lone BS (Ctrl+H, Ctrl+Shift+H, Ctrl+H under Caps Lock, a non-Latin layout's Ctrl+H key through its US twin; conhost reads a bare BS as Ctrl+Backspace; a BS character, no letter, keeps its byte): Press and Repeat give the record pair Win32Rec(vk,sc,uc,1,cs) ++ Win32Rec(vk,sc,uc,0,cs) from us_physical_key and the Windows control-key state; Release gives []. Escape, Ctrl+[, Ctrl+3, Alt+[ and Alt+O are records of their own physical key. Ctrl+H is VK_H with the physical key's scan (0x23 on US), uc BS, cs LEFT_CTRL alone whether Shift is held or the char is H (BS carries no Shift; PSReadLine 2.4.5/2.0.0 insert a literal BS on a SHIFT_PRESSED Ctrl+H record, measured 2026-10-16). (3) Every other key keeps exactly its non-win32 encoding (plain Enter CR, plain text text, Ctrl+Backspace BS, Ctrl+C ETX, Alt+Ctrl+H ESC BS); the one change outside the held forms and the Enter chords is the Ctrl+H record of (2) (win32_ctrl_h_is_a_record_of_the_h_key, win32_ctrl_h_record_outranks_kitty_and_modify_other_keys). (4) On the keys of (2) WIN32 outranks kitty flags and modifyOtherKeys; elsewhere kitty flags still apply. Across the printable-ASCII keyboard WIN32 changes exactly the held forms and Ctrl(+Shift)+h/H (win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard).	12	struct record building, decimal writes, &[u8] predicate, encoder composition	1,3,4,5,7
 contrast-symmetric-bounded	contract	Rgb::contrast, Rgb::luminance (opaque)	la = clamp(L_F(a),0,1), lb = clamp(L_F(b),0,1). ∀ a, b: Rgb, contrast(a,b) = fl((max(la,lb)+0.05)/(min(la,lb)+0.05)). Corollaries: (i) contrast(a,b) = contrast(b,a) bit for bit; (ii) contrast(a,a) = 1.0 exactly (x/x = 1 for finite x ≥ 0.05); (iii) 1.0 ≤ contrast(a,b) ≤ fl(1.05/0.05). Holds for ANY luminance with range [0,1], so luminance is treated as opaque: only the clamp postcondition is needed, not powf.	3	f64 add/div/compare, f64::clamp, a call used only through its range postcondition, Copy struct of three u8; contrast is #[trust::skip] today (float-interval lane)	3,4,6
 luminance-denotation	contract	Rgb::luminance, Rgb::luminance::linearize, Rgb::contrast	∀ rgb: |L_F(rgb) − L_R(rgb)| ≤ eps. Exact endpoints: lin_F(0) = 0.0, lin_F(255) = 1.0 (powf(1.0,2.4) = 1); hence L_F(0,0,0) = 0 and L_F(255,255,255) = fl(0.2126+0.7152+0.0722), within 1 ulp of 1. L_F is additive over channels within eps. With contrast-symmetric-bounded, contrast(white,black) = 21 within eps. The pinned point values (lin(128) ≈ 0.2158605; the pure primaries 0.2126, 0.7152, 0.0722) are instances.	8	f64 arithmetic, f64::from(u8), a piecewise branch, f64::powf (inexact, refused by Trust by design; needs a pow error model or a 256-entry real-valued table of lin), nested private fn, real-vs-float error reasoning	3,6,14
 luminance-monotone	contract	Rgb::luminance::linearize, Rgb::luminance	lin_F is strictly increasing on u8: ∀ c < d, lin_F(c) < lin_F(d), including 10 → 11 across the 0.04045 seam. Hence L_F is strictly increasing in each channel with the others fixed, and along the gray ramp v ↦ (v,v,v). Decidable by evaluating the 256 lin_F values once a pow model exists (lin_F(10) < 0.005 is one).	2	the float and powf obligations of luminance-denotation, plus a 256-case check or per-branch monotonicity with the seam	3,5,6
@@ -228,12 +231,14 @@ kitty-push-pop-stack-model	refinement	KittyKeyboardState::{push_flags_for_buffer
 kitty-switch-screen	contract	KittyKeyboardState::switch_screen	∀ s: switch_screen(s,true) gives main_saved' = Some(s.flags), flags' = s.alt_saved.unwrap_or(none), alt_saved' = None. switch_screen(s,false) gives alt_saved' = Some(s.flags), flags' = s.main_saved.unwrap_or(none), main_saved' = None. Both stacks unchanged; KInv preserved. Corollary: switch(true); switch(false) restores flags, alternation keeps each screen's flags separately, and a repeated switch(true) overwrites main_saved with the current flags.	5	&mut self, Option::take/unwrap_or on Option<newtype>, a bool branch, a two-state postcondition over several fields	1,2,4
 screen-buffer-from-bool	contract	<ScreenBuffer as From<bool>>::from	∀ b: bool, ScreenBuffer::from(b) = (b ? Alternate : Main).	1	a fieldless #[non_exhaustive] enum result, if on bool, a trait impl method	1,11
 kitty-snapshot-roundtrip	round-trip	KittyKeyboardState::{snapshot,restore_snapshot}	Normal(snap): main_sp, alt_sp ≤ 7, every flags value has bits ≤ KMASK, and main_stack[i] = none for i ≥ main_sp (alt likewise). (a) ∀ s, ∀ snap with Normal(snap): snapshot(restore_snapshot(s,snap)) = snap. (b) ∀ snap: restore clamps both sp to min(sp,7), keeps the first sp entries and zeroes the rest, so snapshot(restore(s,snap)) = normalize(snap) whatever s was. (c) ∀ s ∈ KReach, ∀ t: KAbs(restore_snapshot(t, snapshot(s))) = KAbs(s), so later pushes and pops behave as on s.	1	iter_mut().zip() / take(n).zip() loops over [_;8], usize::min, usize → u8 cast, usize::from(u8), derived PartialEq, &mut self	1,2,4,7
+scheme-generated-palette	table-property	scheme_palette256::{generated_extended_palette,palette_anchors,oklab_to_linear}	∀ ansi, fg, bg, with (D, W) = palette_anchors(ansi, fg, bg) — D = ansi[15] if L(ansi[15]) < L(ansi[0]) else ansi[0]; W = the first of ansi[0], ansi[7], ansi[15], fg, bg of greatest OkLab L — g = generated_extended_palette(ansi, fg, bg): cube slot 16+36r+6g+b (r,g,b ∈ 0..6) is, when every level is 0 or 5, its corner byte for byte (16 = D, 196 = ansi[9], 46 = ansi[10], 226 = ansi[11], 21 = ansi[12], 201 = ansi[13], 51 = ansi[14], 231 = W), else the OkLab trilinear blend of the eight corners at t = XTERM_CUBE_LEVELS[v]/255 per axis; grey slot 232+i is the OkLab blend of D and W at t = (8+10i)/255. A blend outside sRGB keeps L and hue and takes the largest chroma a 20-step bisection finds in gamut; encoding rounds half up. Pure and deterministic; the ramp's OkLab L rises from 232 to 255 whenever L(D) < L(W), whatever the order of ansi[0] and ansi[15].	3	f64 OkLab transforms (trust::skip), fixed [Rgb;8] corners, [Rgb;240] output, bisection loop	1,3
+scheme-palette-generate-key	contract	scheme::{THEME_KEYS,parse_theme_str,ThemeKey::PaletteGenerate}, scheme_import::to_native_conf_package, scheme_import (Ghostty palette-generate)	∀ text: the theme key palette_generate (row 11 of THEME_KEYS, type Flag) sets ColorScheme::palette_generate; omitted ⇒ false; a value other than true|false (any case) or a second setting is Err(Parse{line}) at that line. The native writer emits `palette_generate = true` iff the flag is set, so write∘parse is the identity on it. A Ghostty file's `palette-generate = true|false` carries to the flag; any other value is listed in the import's dropped keys.	2	THEME_KEYS row order const assert, Flag reader, Draft field	1,3,5,7
 ```
 
-## 2. Test → spec map (TSV; all 398)
+## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists the other specs the same test samples. A
-test in §4 has `primary` = `-` and `also` = its action.
+`primary` is the spec that retires the test. `also` lists the other specs the same test samples. The
+tests of §4 have no row.
 
 Deleted since (rows kept for the record): `summaries_fit_the_short_catalog_budget` (the summary and
 short-catalog caps are a `const` assertion over `VERBS`, a build error) and
@@ -248,46 +253,8 @@ src/app_inspection.rs	action_targets_view_and_semantic_key_not_focus	app-act-gra
 src/app_inspection.rs	open_request_is_parsed_but_not_canonicalized_or_authorized	app-open-grammar	
 src/app_inspection.rs	opaque_tokens_and_payloads_are_bounded_and_line_safe	app-inspect-grammar	app-act-grammar, app-open-grammar
 src/bitflags.rs	operations_produce_expected_bits	bitflags-boolean-algebra	
-src/bitflags.rs	test_contains	bitflags-boolean-algebra	
-src/bitflags.rs	test_intersects	bitflags-boolean-algebra	
-src/bitflags.rs	test_insert_remove_toggle	bitflags-boolean-algebra	
-src/bitflags.rs	test_set	bitflags-boolean-algebra	
-src/color_palette.rs	default_color_ansi_range	palette-default-table	
-src/color_palette.rs	default_color_bright_range	palette-default-table	
-src/color_palette.rs	default_color_cube_boundaries	palette-default-table	
-src/color_palette.rs	default_color_grayscale_boundaries	palette-default-table	
-src/color_palette.rs	palette_new_has_no_overrides	palette-mutators	
-src/color_palette.rs	palette_get_returns_default_without_override	palette-mutators	
-src/color_palette.rs	palette_set_and_get	palette-mutators	
-src/color_palette.rs	palette_set_to_default_removes_override	palette-mutators	
-src/color_palette.rs	palette_set_update_existing_override	palette-mutators	
-src/color_palette.rs	palette_reset_color	palette-mutators	
-src/color_palette.rs	palette_reset_color_noop_when_no_override	palette-mutators	
-src/color_palette.rs	palette_reset_clears_all	palette-mutators	
-src/color_palette.rs	parse_rgb_colon_format	color-spec-hex	
-src/color_palette.rs	parse_rgb_colon_single_digit	color-spec-hex	
-src/color_palette.rs	parse_hash_3_digits	color-spec-hex	
-src/color_palette.rs	parse_hash_6_digits	color-spec-hex	
-src/color_palette.rs	parse_hash_9_digits	color-spec-hex	
-src/color_palette.rs	parse_hash_12_digits	color-spec-hex	
-src/color_palette.rs	parse_rgbi_basic	color-spec-rgbi	
-src/color_palette.rs	parse_rgbi_black_and_white	color-spec-rgbi	
-src/color_palette.rs	parse_rgbi_clamps_out_of_range	color-spec-rgbi	
-src/color_palette.rs	parse_rgbi_fractional_precision	color-spec-rgbi	
-src/color_palette.rs	parse_rgbi_integer_values	color-spec-rgbi	
-src/color_palette.rs	parse_rgbi_invalid_formats	color-spec-rgbi	
-src/color_palette.rs	parse_invalid_formats	color-spec-hex	color-spec-named-fallthrough
-src/color_palette.rs	parse_color_spec_rejects_multibyte_utf8	color-spec-hex	
-src/color_palette.rs	parse_named_color_extended	color-spec-named-fallthrough	
-src/color_palette.rs	parse_named_color_css_basic	color-spec-named-fallthrough	
-src/color_palette.rs	format_color_spec_black	color-spec-format-roundtrip	
-src/color_palette.rs	format_color_spec_white	color-spec-format-roundtrip	
-src/color_palette.rs	format_color_spec_roundtrip	color-spec-format-roundtrip	
 src/color_palette.rs	palette_cache_agrees_with_overrides_after_mutations	palette-model-invariant	
 src/control_socket.rs	socket_key_collapses_the_verbatim_drive_spelling_and_nothing_else	cs-socket-key	
-src/control_socket.rs	directive_disables_on_off_values	cs-socket-directive	
-src/control_socket.rs	directive_defaults_to_per_instance	cs-socket-directive	
-src/control_socket.rs	directive_passes_explicit_path_through	cs-socket-directive	
 src/control_socket.rs	instance_names_roundtrip_through_pid_parse	cs-instance-name-pid	
 src/control_socket.rs	instance_pid_rejects_fixed_and_malformed_names	cs-instance-name-pid	
 src/control_socket.rs	graph_entry_sock_parses_the_shared_on_disk_format	cs-graph-entry-lines	
@@ -298,76 +265,31 @@ src/control_socket.rs	odd_socket_names_never_land_on_a_reserved_token_name	cs-to
 src/control_socket.rs	the_token_name_rule_is_injective_over_socket_names	cs-token-name-injective	
 src/control_socket.rs	read_candidates_put_the_per_socket_token_first	cs-token-candidates	
 src/control_socket.rs	stale_sweep_removes_only_dead_instances	cs-stale-instance-files	
-src/control_socket.rs	aged_empty_sock_of_a_dead_pid_is_stale_without_a_probe	cs-stale-socket-files	
-src/control_socket.rs	aged_empty_sock_nobody_listens_on_is_stale_even_when_its_pid_is_alive	cs-stale-socket-files	
-src/control_socket.rs	a_live_listener_is_never_stale	cs-stale-socket-files	
-src/control_socket.rs	young_socks_are_left_alone_and_not_probed	cs-stale-socket-files	
-src/control_socket.rs	only_zero_length_sock_files_other_than_the_latest_alias_are_candidates	cs-stale-socket-files	
-src/control_socket.rs	the_socket_the_alias_names_is_kept_until_the_alias_moves_on	cs-stale-socket-files	
-src/control_socket.rs	the_stale_margin_is_one_day	-	not a spec sample: delete (§4)
-src/control_socket.rs	symlink_ownership_matches_pid_in_target	cs-symlink-targets-pid	
 src/control_verbs.rs	the_host_gone_line_round_trips_and_nothing_else_reads_as_it	cv-host-gone-roundtrip	
 src/control_verbs.rs	a_rows_fence_round_trips_refuses_bad_shapes_and_hashes_the_rows_joined	cv-rows-fence-wire	
 src/control_verbs.rs	screen_gen_parses_exactly_the_wire_spelling	cv-screen-gen-wire	
-src/control_verbs.rs	json_capable_verbs_are_real_read_verbs	cv-verb-table-wellformed	
 src/control_verbs.rs	json_flag_switches_every_json_capable_verb_to_lines	cv-framing-of	
-src/control_verbs.rs	table_has_no_duplicate_verbs	cv-verb-table-wellformed	
 src/control_verbs.rs	framing_base_and_sub_forms	cv-framing-of	cv-access-classification
 src/control_verbs.rs	artifact_ack_classification_covers_every_guarded_subform	cv-artifact-ack	
 src/control_verbs.rs	summaries_fit_the_short_catalog_budget	cv-verb-table-wellformed	
 src/control_verbs.rs	entry_lines_wrap_every_verb_deterministically_and_losslessly	cv-entry-lines-wrap	
-src/control_verbs.rs	the_person_fence_help_keeps_its_residual	-	not a spec sample: delete (§4)
 src/control_verbs.rs	access_exceptions_are_exactly_the_declared_sets	cv-access-classification	
 src/control_verbs.rs	fabric_verbs_carry_their_designed_classes	cv-framing-of	cv-access-classification
 src/control_verbs.rs	copy_and_settings_have_their_own_op_class	cv-access-classification	
 src/control_verbs.rs	privacy_is_a_headless_answerable_meta_read	cv-framing-of	cv-access-classification
-src/dev_seam.rs	a_test_build_reads_the_seam	dev-seam-reads-env	
 src/dirs.rs	an_empty_or_relative_home_is_no_home	dirs-home-from-env	
 src/dirs.rs	aterm_config_path_follows_the_one_rule_the_window_loads_by	dirs-config-path	
 src/dirs.rs	state_dir_honours_an_absolute_override_and_refuses_a_relative_one	dirs-state-dir	
 src/dirs.rs	logs_dir_follows_each_platforms_convention	dirs-logs-dir	
 src/dirs.rs	aterm_data_dir_follows_the_state_home_seam_and_else_the_os_data_dir	dirs-data-dir	
-src/dirs.rs	a_private_state_root_is_the_state_home_seam_set	-	not a spec sample: delete (§4)
-src/dirs.rs	identities_dir_is_one_segment_below_the_state_root	-	not a spec sample: delete (§4)
-src/dirs.rs	test_passwd_parsing_finds_uid	dirs-home-from-passwd	
-src/dirs.rs	test_passwd_parsing_empty_home_returns_none	dirs-home-from-passwd	
-src/dirs.rs	test_passwd_parsing_malformed_lines_skipped	dirs-home-from-passwd	
 src/env_sanitize.rs	a_non_utf8_key_is_classified_by_its_lossy_spelling	env-key-lossy	
-src/env_sanitize.rs	test_is_ai_env_var_matches_deny_prefixes	env-deny-classifier	
-src/env_sanitize.rs	test_is_ai_env_var_preserves_shell_integration_vars	env-deny-classifier	env-deny-policy
-src/env_sanitize.rs	test_aterm_shell_nonce_survives_sanitization	env-deny-classifier	env-deny-policy
-src/env_sanitize.rs	test_reroute_seam_vars_survive_sanitization	env-deny-classifier	env-deny-policy
-src/env_sanitize.rs	test_recursion_provisioning_vars_are_denied_by_name	env-deny-classifier	env-deny-policy
-src/env_sanitize.rs	test_update_contract_vars_are_denied_by_name	env-deny-classifier	env-deny-policy
-src/env_sanitize.rs	test_is_ai_env_var_preserves_standard_vars	env-deny-classifier	env-deny-policy
 src/fabric_grammar.rs	a_principal_is_bounded_and_class_prefixed	fab-principal	
 src/fabric_grammar.rs	a_topic_is_one_bounded_lowercase_segment	fab-topic	
 src/fabric_grammar.rs	a_via_chain_is_bounded_in_hops_and_bytes	fab-via	
-src/fs_restricted.rs	private_write_accepts_owned_unwritable_by_others	fs-dir-safe-predicate	
-src/fs_restricted.rs	private_write_rejects_foreign_owner	fs-dir-safe-predicate	
 src/fs_restricted.rs	ensure_private_dir_creates_0700_tightens_and_is_idempotent	fs-ensure-private-dir	
-src/fs_restricted.rs	private_write_rejects_group_or_other_writable	fs-dir-safe-predicate	
 src/fs_restricted.rs	an_already_private_dir_keeps_its_ctime_and_a_drifted_one_is_hardened	fs-ensure-private-dir	
-src/identity.rs	the_origin_line_is_assembled_from_the_parts	identity-origin-line	
 src/input.rs	bit_layout_matches_keyboard_modifiers	input-modifier-bridge	
-src/input.rs	from_conversion_roundtrip	input-modifier-bridge	
-src/input.rs	key_bridge_space_roundtrip	input-key-bridge	
-src/input.rs	key_bridge_named_space_to_char	input-key-bridge	
-src/input.rs	key_bridge_enter_roundtrip	input-key-bridge	
-src/input.rs	key_bridge_arrow_up_roundtrip	input-key-bridge	
-src/input.rs	key_bridge_delete_roundtrip	input-key-bridge	
-src/input.rs	key_bridge_f0_out_of_range	input-key-bridge	
-src/input.rs	key_bridge_f25_out_of_range	input-key-bridge	
-src/input.rs	key_bridge_numpad5_protocol_only	input-key-bridge	
-src/input.rs	key_bridge_numpad_enter_protocol_only	input-key-bridge	
-src/lib.rs	cursor_style_default_is_blinking_block	-	not a spec sample: delete (§4)
-src/lib.rs	cursor_style_from_param_valid	cursor-style-from-param	
-src/lib.rs	cursor_style_from_param_invalid	cursor-style-from-param	
-src/lib.rs	bidi_mode_default_is_implicit	-	not a spec sample: delete (§4)
-src/lib.rs	bidi_mode_discriminants_match_wire_format	-	not a spec sample: delete (§4)
-src/mutex_ext.rs	test_lock_or_recover_normal_access	mutex-lock-or-recover	
 src/mutex_ext.rs	test_lock_or_recover_after_poison	mutex-lock-or-recover	
-src/paragraph_direction.rs	paragraph_direction_discriminants_match_wire_format	-	not a spec sample: delete (§4)
 src/rfc3339.rs	format_rfc3339_matches_known_instants	rfc3339-format-denotation	
 src/rfc3339.rs	parse_utc_inverts_format_and_refuses_looser_shapes	rfc3339-parse-strict	rfc3339-parse-fractional
 src/rfc3339.rs	parse_utc_fractional_truncates_a_fraction_and_nothing_else	rfc3339-parse-fractional	
@@ -379,71 +301,44 @@ src/rust_lane_tests.rs	the_other_places_a_shell_runs_a_command_are_read	rl-comma
 src/rust_lane_tests.rs	asking_about_a_tool_and_naming_it_as_data_are_not_running_it	rl-command-position-verdict	
 src/rust_lane_tests.rs	the_escape_hatch_clears_exactly_one_simple_command	rl-escape-hatch	
 src/rust_lane_tests.rs	an_escape_is_reported_with_its_reason_and_never_hides_a_second_command	rl-escape-hatch	
-src/rust_lane_tests.rs	the_refusal_names_the_trust_spelling_the_pin_and_the_escape	rl-refusal-shape	
 src/rust_lane_tests.rs	the_refusal_is_bounded_and_one_line_per_command	rl-refusal-shape	
 src/rust_lane_tests.rs	a_hit_names_what_was_used_and_the_trust_command_with_its_arguments	rl-hit-fields	
 src/rust_lane_tests.rs	every_cargo_verb_gets_the_lane_targo_accepts_for_it	rl-trust-spelling	
-src/rust_lane_tests.rs	spellings_render_as_one_padded_column	rl-render-spellings	
 src/rust_lane_tests.rs	a_pin_is_read_the_way_rustup_reads_it	rl-channel-in	
 src/rust_lane_tests.rs	nesting_past_the_cap_is_refused_and_malformed_input_is_bounded	rl-depth-cap-total	
 src/rust_lane_tests.rs	a_trust_channels_own_rustc_and_rustdoc_are_not_stock	rl-command-position-verdict	
 src/rust_lane_tests.rs	the_reviewers_thirteen_missed_shapes_are_read_and_the_allow_probes_still_pass	rl-command-position-verdict	
 src/rust_lane_tests.rs	a_parameter_expansion_a_case_pattern_and_a_dashed_heredoc_delimiter_are_read_as_the_shell_reads_them	rl-command-position-verdict	
-src/scheme.rs	builtin_themes_cover_every_name_default_first_and_resolve	scheme-builtin-registry	
 src/scheme.rs	user_theme_name_grammar_rejects_paths_splits_and_normalization_traps	scheme-theme-name-grammar	
+src/scheme.rs	draw_builtin_follows_name_for	selector-draw	
 src/scheme.rs	default_scheme_matches_palette_defaults	scheme-projections	
-src/scheme.rs	default_theme_parts_are_historical	scheme-projections	
 src/scheme.rs	builtin_lookup	scheme-builtin-registry	
-src/scheme.rs	builtins_well_formed	scheme-builtin-registry	
-src/scheme.rs	builtin_palette_values_are_canonical	-	not a spec sample: delete (§4)
 src/scheme.rs	light_builtins_are_light_and_selection_legible	scheme-builtin-legibility	
 src/scheme.rs	parse_scheme_str_full_theme	scheme-parse	
 src/scheme.rs	parse_scheme_str_minimal_defaults_unset_slots	scheme-parse	
 src/scheme.rs	parse_scheme_str_rejects_malformed	scheme-parse	
-src/scheme.rs	parse_scheme_str_inline_comments	scheme-parse	
-src/selection.rs	selection_type_default_is_simple	-	not a spec sample: delete (§4)
-src/selection.rs	selection_side_default_is_left	-	not a spec sample: delete (§4)
-src/selection.rs	a_single_width_cell_is_its_own_whole_glyph	sel-glyph-span	
+src/scheme.rs	palette_generate_key_parses	scheme-palette-generate-key	scheme-parse
+src/scheme_import.rs	ghostty_import_carries_palette_generate	scheme-palette-generate-key	
+src/scheme_palette256.rs	generated_corners_are_the_theme_anchors	scheme-generated-palette	scheme-projections
+src/scheme_palette256.rs	grey_ramp_follows_black_to_white	scheme-generated-palette	
+src/scheme_palette256.rs	generated_palette_is_deterministic	scheme-generated-palette	scheme-projections
 src/selection.rs	both_halves_of_a_wide_glyph_name_the_same_pair_of_columns	sel-glyph-span	
-src/selection.rs	a_glyph_span_never_wraps_past_the_ends_of_the_column_axis	sel-glyph-span	
-src/selection.rs	selection_side_ordering	sel-side-total-order	
-src/selection.rs	linear_contains_single_line	sel-linear	
-src/selection.rs	linear_contains_multi_line	sel-linear	
-src/selection.rs	block_contains	sel-block	
-src/selection.rs	block_contains_reversed_columns	sel-block	
-src/selection.rs	block_contains_reversed_rows_and_columns	sel-block	
 src/selection.rs	containment_matches_the_normalized_shapes	sel-linear	sel-block
 src/shell_blocks_tests.rs	block_is_complete_requires_complete_state	shell-block-predicates	
-src/shell_blocks_tests.rs	block_succeeded_requires_exit_code_zero	shell-block-predicates	
-src/shell_blocks_tests.rs	block_failed_requires_nonzero_exit_code	shell-block-predicates	
-src/shell_blocks_tests.rs	command_rows_saturate_at_u64_max	shell-block-row-ranges	
-src/shell_blocks_tests.rs	output_rows_saturate_at_u64_max	shell-block-row-ranges	
-src/shell_types_tests.rs	command_mark_is_complete_requires_exit_code	shell-block-predicates	
-src/shell_types_tests.rs	command_mark_succeeded_only_on_zero	shell-block-predicates	
-src/shell_types_tests.rs	current_time_ms_returns_some	-	not a spec sample: delete (§4)
 src/terminal_core.rs	kitty_graphics_advertised_after_kitty_core	caps-feature-list	
 src/terminal_core.rs	soft_fonts_not_advertised	caps-feature-list	
-src/text_shaping.rs	text_shaping_config_default	-	not a spec sample: delete (§4)
-src/text_shaping.rs	parse_font_features_plus_minus	font-feature-token	
-src/text_shaping.rs	parse_font_features_bare_tag_enables	font-feature-token	
-src/text_shaping.rs	parse_font_features_explicit_value	font-feature-token	
 src/text_shaping.rs	parse_font_features_short_tag_padded	font-feature-token	
 src/text_shaping.rs	parse_font_features_skips_malformed	font-feature-token	font-features-list
-src/text_shaping.rs	parse_font_features_empty	font-features-list	
 src/text_shaping.rs	parse_never_panics_and_is_well_formed	font-feature-token	font-features-list
 src/text_shaping.rs	affixes_and_explicit_values	font-feature-token	
 src/time.rs	duration_to_nanos_cases	duration-to-nanos	
-src/trust_fmt.rs	debug_string_matches_format	debug-string	
 src/trust_fmt.rs	push_hex4_matches_format	push-hex4	
 src/version.rs	install_first_wins	build-stamp-first-install-wins	
 src/vt_level.rs	decscl_param_roundtrip	vt-decscl-roundtrip	
 src/x11_colors.rs	table_is_sorted	x11-table-wellformed	
-src/x11_colors.rs	lookup_basic_colors	x11-lookup	
 src/x11_colors.rs	lookup_case_insensitive	x11-lookup	
 src/x11_colors.rs	lookup_grey_variants	x11-table-wellformed	x11-lookup
 src/x11_colors.rs	lookup_unknown_returns_none	x11-lookup	
-src/x11_colors.rs	lookup_non_ascii_returns_none	x11-lookup	
-src/xterm_keyboard.rs	test_default_state	xtk-state-machine	
 src/xterm_keyboard.rs	test_set_modify_other_keys	xtk-state-machine	
 src/xterm_keyboard.rs	test_reset_modify_other_keys	xtk-state-machine	
 src/xterm_keyboard.rs	test_disable_modify_other_keys	xtk-state-machine	
@@ -451,44 +346,16 @@ src/xterm_keyboard.rs	test_format_other_keys	xtk-state-machine
 src/xterm_keyboard.rs	test_query_responses	xtk-query-responses	
 src/xterm_keyboard.rs	test_reset_all	xtk-state-machine	
 src/mouse/encode.rs	a_thumb_buttons_legacy_release_is_button_three	mouse-dispatch	
-src/mouse/encode.rs	x10_basic	mouse-x10	
-src/mouse/encode.rs	x10_clamps_large_coordinates	mouse-x10	
-src/mouse/encode.rs	utf8_small_coordinates	mouse-utf8	
-src/mouse/encode.rs	utf8_large_coordinates	mouse-utf8	
 src/mouse/encode.rs	utf8_large_button_code	mouse-utf8	
-src/mouse/encode.rs	sgr_press	mouse-decimal-forms	
-src/mouse/encode.rs	sgr_release	mouse-decimal-forms	
-src/mouse/encode.rs	urxvt_basic	mouse-decimal-forms	
-src/mouse/encode.rs	encode_mouse_dispatches_x10	mouse-dispatch	
-src/mouse/encode.rs	encode_mouse_x10_in_range_is_the_six_byte_frame	mouse-dispatch	
-src/mouse/encode.rs	encode_mouse_x10_past_222_clamps_and_keeps_x10_framing	mouse-dispatch	
-src/mouse/encode.rs	encode_mouse_dispatches_sgr	mouse-dispatch	
-src/mouse/encode.rs	encode_mouse_dispatches_sgr_release	mouse-dispatch	
-src/mouse/encode.rs	encode_mouse_dispatches_urxvt	mouse-dispatch	
 src/mouse/encode.rs	encode_mouse_dispatches_sgr_pixel	mouse-dispatch	
-src/mouse/encode.rs	sgr_u16_max_coordinates_no_overflow	mouse-decimal-forms	
-src/mouse/encode.rs	urxvt_u16_max_coordinates_no_overflow	mouse-decimal-forms	
-src/mouse/encode.rs	x10_u16_max_coordinates_clamps	mouse-x10	
-src/mouse/types.rs	mouse_mode_discriminants_match_wire_format	-	not a spec sample: delete (§4)
-src/mouse/types.rs	mouse_encoding_discriminants_match_wire_format	-	not a spec sample: delete (§4)
-src/mouse/types.rs	thumb_buttons_encode_xterm_128_and_129	mouse-button-codes	
 src/mouse/types.rs	button_slots_are_dense_and_distinct	mouse-button-slot-injective	
-src/mouse/types.rs	wheel_directions_map_to_xterm_64_through_67	mouse-button-codes	
 src/mouse/types.rs	only_vertical_wheel_directions_carry_a_viewport_sense	wheel-vertical-sense	
-src/keyboard/dom_map.rs	maps_single_char_keys_to_character	kb-dom-map	
-src/keyboard/dom_map.rs	space_maps_to_the_named_form_legacy_expects	kb-dom-map	
-src/keyboard/dom_map.rs	maps_named_navigation_and_editing_keys	kb-dom-map	
-src/keyboard/dom_map.rs	maps_system_and_lock_keys	kb-dom-map	
-src/keyboard/dom_map.rs	maps_function_keys_through_f24_and_beyond	kb-dom-map	
-src/keyboard/dom_map.rs	maps_media_keys	kb-dom-map	
-src/keyboard/dom_map.rs	modifier_keys_map_left_canonical	kb-dom-map	
 src/keyboard/dom_map.rs	modifier_keys_encode_only_under_report_all	kb-dom-encode	
-src/keyboard/dom_map.rs	ime_and_unidentified_keys_are_none	kb-dom-map	
 src/keyboard/dom_map.rs	encode_dom_key_honours_the_explicit_mode	kb-dom-encode	
 src/keyboard/dom_map.rs	encode_dom_key_text_release_requires_report_all	kb-dom-encode	kb-release-gating
+src/keyboard/dom_map.rs	a_dom_ctrl_chord_without_a_control_byte_takes_the_physical_keys	kb-dom-encode	kb-layout-text
 src/keyboard/encode_tests.rs	shifted_character_refines_independent_spec	kb-shift-map	
 src/keyboard/encode_tests.rs	legacy_shift_changes_every_shiftable_key	kb-shift-map	kb-legacy-character
-src/keyboard/encode_tests.rs	uppercase_only_shift_is_caught_by_the_spec	-	not a spec sample: delete with the oracle (§4)
 src/keyboard/encode_tests.rs	write_u32_renders_every_magnitude	kb-write-u32	
 src/keyboard/encode_tests.rs	shift_enter_distinct_from_enter_in_every_mode	kb-shift-enter-distinct	
 src/keyboard/encode_tests.rs	release_encodes_to_nothing_without_report_event_types	kb-release-gating	
@@ -521,9 +388,8 @@ src/keyboard/encode_tests.rs	win32_alt_chords_that_open_a_sequence_are_records	k
 src/keyboard/encode_tests.rs	win32_escape_records_outrank_kitty_and_modify_other_keys	kb-win32-records	
 src/keyboard/encode_tests.rs	win32_changes_only_the_held_forms_across_the_whole_ascii_keyboard	kb-win32-records	
 src/keyboard/encode_tests.rs	win32_numpad_enter_chord_is_an_enhanced_key_record	kb-win32-records	
-src/keyboard/kitty_progressive_tests.rs	mode_new_kitty_flags_default_off	kb-mode-bit-layout	
-src/keyboard/kitty_progressive_tests.rs	mode_new_kitty_flags_independent	kb-mode-bit-layout	
-src/keyboard/kitty_progressive_tests.rs	mode_all_kitty_flags_combinable	kb-mode-bit-layout	
+src/keyboard/encode_tests.rs	win32_ctrl_h_is_a_record_of_the_h_key	kb-win32-records	
+src/keyboard/encode_tests.rs	win32_ctrl_h_record_outranks_kitty_and_modify_other_keys	kb-win32-records	
 src/keyboard/kitty_progressive_tests.rs	report_all_keys_encodings	kb-kitty-progressive	
 src/keyboard/kitty_progressive_tests.rs	kitty_report_all_keys_keeps_legacy_functional_forms	kb-kitty-progressive	
 src/keyboard/kitty_progressive_tests.rs	report_alternate_keys_encodings	kb-kitty-progressive	
@@ -535,18 +401,15 @@ src/keyboard/layout_text_tests.rs	typed_character_is_the_us_derivation	kb-layout
 src/keyboard/layout_text_tests.rs	a_text_press_writes_the_layouts_character	kb-layout-text	
 src/keyboard/layout_text_tests.rs	kitty_reports_the_layouts_character_beside_the_unshifted_key_code	kb-layout-text	
 src/keyboard/layout_text_tests.rs	xterm_modify_other_keys_reads_the_layouts_shifted_keysym	kb-xterm-mok	kb-layout-text
-src/keyboard/layout_text_tests.rs	the_layouts_character_never_replaces_a_chord	kb-layout-text	
+src/keyboard/layout_text_tests.rs	a_chord_writes_its_control_or_escape_form	kb-layout-text	
 src/keyboard/layout_text_tests.rs	ctrl_on_a_non_latin_layout_sends_the_us_letters_control_byte	kb-layout-text	
+src/keyboard/layout_text_tests.rs	a_chord_on_a_non_us_layout_takes_the_layouts_character	kb-layout-text	kb-xterm-mok
 src/keyboard/tests.rs	keyboard_mode_xterm_accessors	kb-mode-accessors	
-src/keyboard/tests.rs	term_mode_from_keyboard_state_empty	kb-termmode-projection	
 src/keyboard/tests.rs	term_mode_from_keyboard_state_all_kitty	kb-termmode-projection	
 src/keyboard/tests.rs	term_mode_from_keyboard_state_xterm_levels	kb-termmode-projection	
-src/keyboard/tests.rs	term_mode_from_keyboard_state_xterm_format	kb-termmode-projection	
 src/keyboard/tests.rs	term_mode_to_keyboard_mode_roundtrip_mixed	kb-termmode-projection	
 src/keyboard/tests.rs	term_mode_to_keyboard_mode_ignores_non_keyboard_flags	kb-termmode-projection	
 src/keyboard/tests.rs	modifier_wire_values	kb-wire-values	
-src/keyboard/tests.rs	key_event_type_default_is_press	-	not a spec sample: delete (§4)
-src/keyboard/tests.rs	key_event_type_kitty_values	kb-wire-values	
 src/keyboard/tests.rs	kitty_disambiguate_encodings	kb-kitty-csi-u-denotation	
 src/keyboard/tests.rs	kitty_event_type_encodings	kb-kitty-csi-u-denotation	
 src/keyboard/tests.rs	xterm_modify_other_keys_encodings	kb-xterm-mok	
@@ -555,13 +418,6 @@ src/keyboard/tests.rs	xterm_modify_other_keys_level1_reports_only_ambiguous_ctrl
 src/keyboard/tests.rs	xterm_modify_other_keys_level2_preserves_unambiguous_shifted_text	kb-xterm-mok	
 src/keyboard/tests.rs	xterm_modify_other_keys_level2_ctrl_backspace_uses_legacy_toggle	kb-xterm-mok	
 src/keyboard/tests.rs	xterm_modify_other_keys_does_not_capture_keypad_keys	kb-xterm-mok	
-src/keyboard/tests.rs	named_key_kitty_codes_control_keys	kb-kitty-code-table	
-src/keyboard/tests.rs	named_key_kitty_codes_navigation	kb-kitty-code-table	
-src/keyboard/tests.rs	named_key_kitty_codes_editing	kb-kitty-code-table	
-src/keyboard/tests.rs	named_key_kitty_codes_function_keys	kb-kitty-code-table	
-src/keyboard/tests.rs	named_key_kitty_codes_system_media_and_modifiers	kb-kitty-code-table	
-src/keyboard/tests.rs	named_key_kitty_codes_numpad	kb-kitty-code-table	
-src/keyboard/tests.rs	encode_key_equals_encode_key_with_event_press	-	not a spec sample: delete (§4)
 src/keyboard/tests.rs	disambiguate_plain_keys_are_not_over_escaped	kb-kitty-text-preserving	
 src/keyboard/tests.rs	legacy_lock_bits_do_not_corrupt_navigation_keys	kb-legacy-named	
 src/keyboard/tests_legacy.rs	legacy_character_encodings	kb-legacy-character	
@@ -589,42 +445,17 @@ src/keyboard/tests_legacy.rs	legacy_meta_sends_escape_on_prefixes_esc	kb-legacy-
 src/keyboard/tests_legacy.rs	legacy_special_modifiers_off_strips_numlock	kb-legacy-mode-switches	
 src/keyboard/tests_legacy.rs	legacy_numpad_begin_is_the_xterm_letter_form_never_a_digit	kb-legacy-named	
 src/keyboard/tests_legacy.rs	legacy_numpad_digit_under_app_keypad_ignores_num_lock	kb-legacy-named	
-tests/color_space.rs	contrast_white_on_black_is_21	luminance-denotation	
-tests/color_space.rs	contrast_same_color_is_one	contrast-symmetric-bounded	
-tests/color_space.rs	contrast_is_symmetric	contrast-symmetric-bounded	
-tests/color_space.rs	contrast_always_at_least_one	contrast-symmetric-bounded	
 tests/color_space.rs	contrast_wcag_aa_boundary	gray-aa-threshold	
-tests/color_space.rs	luminance_black_is_zero	luminance-denotation	
-tests/color_space.rs	luminance_white_is_one	luminance-denotation	
-tests/color_space.rs	luminance_mid_gray	luminance-denotation	
-tests/color_space.rs	luminance_pure_red	luminance-denotation	
-tests/color_space.rs	luminance_pure_green	luminance-denotation	
-tests/color_space.rs	luminance_pure_blue	luminance-denotation	
 tests/color_space.rs	luminance_monotonic_for_grays	luminance-monotone	
-tests/color_space.rs	luminance_near_srgb_threshold	luminance-monotone	
-tests/color_space.rs	rec709_coefficients_sum_to_one	luminance-denotation	
-tests/input_key_bridge_tests.rs	test_key_bridge_unicode_char_roundtrip	input-key-bridge	
-tests/input_key_bridge_tests.rs	test_key_bridge_supported_named_keys_roundtrip	input-key-bridge	
-tests/input_key_bridge_tests.rs	test_key_bridge_function_keys_roundtrip	input-key-bridge	
-tests/kitty_keyboard_tests.rs	test_flags_none_is_zero	kitty-flags-mask-accessors	
 tests/kitty_keyboard_tests.rs	test_flags_from_bits_masks_invalid	kitty-flags-mask-accessors	
-tests/kitty_keyboard_tests.rs	test_flags_individual_bits	kitty-flags-mask-accessors	
 tests/kitty_keyboard_tests.rs	test_flags_individual_bits_no_cross_contamination	kitty-flags-mask-accessors	
-tests/kitty_keyboard_tests.rs	test_flags_apply_mode_1_set	kitty-flags-apply	
-tests/kitty_keyboard_tests.rs	test_flags_apply_mode_2_or	kitty-flags-apply	
-tests/kitty_keyboard_tests.rs	test_flags_apply_mode_3_and_not	kitty-flags-apply	
-tests/kitty_keyboard_tests.rs	test_flags_apply_explicit_unknown_mode_is_noop	kitty-flags-apply	
-tests/kitty_keyboard_tests.rs	test_flags_apply_masks_input_bits	kitty-flags-apply	
-tests/kitty_keyboard_tests.rs	test_state_new_has_no_flags	kitty-state-new-reset	
 tests/kitty_keyboard_tests.rs	test_push_set_flags_pop_restores_pre_push_state	kitty-push-pop-stack-model	
-tests/kitty_keyboard_tests.rs	test_push_pop_basic_lifo	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_push_pop_three_levels	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_pop_multi_count	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_pop_explicit_count_zero_pops_nothing	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_pop_count_exceeds_stack_resets_to_zero	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_pop_from_empty_stack_resets_to_zero	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_stack_overflow_evicts_oldest	kitty-push-pop-stack-model	
-tests/kitty_keyboard_tests.rs	test_screen_buffer_isolation	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_screen_buffer_stacks_independent	kitty-push-pop-stack-model	
 tests/kitty_keyboard_tests.rs	test_set_flags_direct	kitty-flags-apply	
 tests/kitty_keyboard_tests.rs	test_reset_clears_everything	kitty-state-new-reset	
@@ -633,13 +464,8 @@ tests/kitty_keyboard_tests.rs	test_switch_screen_preserves_alt_flags_across_roun
 tests/kitty_keyboard_tests.rs	test_switch_screen_double_enter_overwrites_saved_main	kitty-switch-screen	
 tests/kitty_keyboard_tests.rs	test_switch_screen_after_reset_no_stale_flags	kitty-switch-screen	
 tests/kitty_keyboard_tests.rs	test_switch_screen_interleaved_with_push_pop	kitty-switch-screen	
-tests/kitty_keyboard_tests.rs	test_flags_apply_mode_0_defaults_to_set	kitty-flags-apply	
-tests/kitty_keyboard_tests.rs	test_alt_stack_overflow_evicts_oldest	kitty-push-pop-stack-model	
-tests/kitty_keyboard_tests.rs	test_screen_buffer_from_bool	screen-buffer-from-bool	
 tests/kitty_keyboard_tests.rs	test_snapshot_roundtrip_restores_full_state	kitty-snapshot-roundtrip	
-tests/xterm_keyboard_tests.rs	test_default_vs_new_divergence	xtk-state-machine	xtk-query-responses
-tests/xterm_keyboard_tests.rs	test_query_response_when_disabled	xtk-query-responses	
-tests/xterm_keyboard_tests.rs	test_boundary_clamp_values	xtk-state-machine	
+src/xterm_keyboard.rs	test_default_vs_new_divergence	xtk-state-machine	xtk-query-responses
 ```
 
 ## 3. Coverage
@@ -656,29 +482,11 @@ tests/xterm_keyboard_tests.rs	test_boundary_clamp_values	xtk-state-machine
 
 Status 2026-10-15: all 18 rows below except `src/scheme.rs::builtin_palette_values_are_canonical` are deleted (with the now-empty test module in `src/paragraph_direction.rs`); that one remains.
 
-| test | why | action |
-|---|---|---|
-| `src/paragraph_direction.rs::paragraph_direction_discriminants_match_wire_format` | Tautology: #[repr(u8)] with literal discriminants already fixes `as u8`. A const assertion beside the enum would make it a compile error if wanted. | **delete** |
-| `src/lib.rs::cursor_style_default_is_blinking_block` | Tautology: derive(Default) with #[default] on BlinkingBlock. | **delete** |
-| `src/lib.rs::bidi_mode_default_is_implicit` | Tautology: derive(Default) with #[default] on Implicit. | **delete** |
-| `src/lib.rs::bidi_mode_discriminants_match_wire_format` | Tautology: repr(u8) with literal discriminants. | **delete** |
-| `src/mouse/types.rs::mouse_mode_discriminants_match_wire_format` | Tautology: repr(u8) with literal discriminants. | **delete** |
-| `src/mouse/types.rs::mouse_encoding_discriminants_match_wire_format` | Tautology: repr(u8) with literal discriminants. | **delete** |
-| `src/selection.rs::selection_type_default_is_simple` | Tautology: derive(Default) with #[default]. | **delete** |
-| `src/selection.rs::selection_side_default_is_left` | Tautology: derive(Default) with #[default]. | **delete** |
-| `src/text_shaping.rs::text_shaping_config_default` | Tautology: derive(Default) over fields whose types have #[default] variants and Vec::new. | **delete** |
-| `src/keyboard/tests.rs::key_event_type_default_is_press` | Tautology: derive(Default) with #[default] Press. | **delete** |
-| `src/keyboard/tests.rs::encode_key_equals_encode_key_with_event_press` | Definitional: encode_key's whole body is encode_key_with_event(.., Press); the test restates the body at 12 points. | **delete** |
-| `src/keyboard/encode_tests.rs::uppercase_only_shift_is_caught_by_the_spec` | Exercises no production code: a vacuity check on the test-local spec_shifted oracle. It goes with the oracle once kb-shift-map is a Trust clause. | **delete with the oracle** |
-| `src/control_socket.rs::the_stale_margin_is_one_day` | Pins the const STALE_SOCK_MIN_AGE_SECS = 24*60*60 against its own value. | **delete** |
-| `src/control_verbs.rs::the_person_fence_help_keeps_its_residual` | Prose-pinning: asserts that a help string contains an English sentence. | **delete** |
-| `src/dirs.rs::a_private_state_root_is_the_state_home_seam_set` | Vacuous when the seam is unset (its own doc says so); runs_under_private_state_root() is literally dev_seam!(..).is_some(). The real pin lives in atpkg tests/machine_edge.rs. | **delete** |
-| `src/dirs.rs::identities_dir_is_one_segment_below_the_state_root` | Restates the one-line body state_dir().map(|s| s.join("identities")); conditional on the ambient environment and vacuous when state_dir is None. | **delete** |
-| `src/shell_types_tests.rs::current_time_ms_returns_some` | A sanity check on the machine's wall clock (now > 2020); the conversion itself is definitional. | **delete** |
-| `src/scheme.rs::builtin_palette_values_are_canonical` | Duplicate data: re-types constants from BUILTINS and compares them with the table. The table is the spec; the external reference (iTerm2-Color-Schemes) is not machine-checkable here. | **delete** |
-
-Actions: delete: 17, delete with the oracle: 1. No test here is a regression
-of a removed bug with no general property: every regression test found is an instance of a §1 spec.
+Status 2026-10-17: `builtin_palette_values_are_canonical` went on 2026-10-16, so all 18 are deleted,
+and their rows here and in §2 are gone. They were tautologies over `derive(Default)` or `repr(u8)`
+discriminants, restatements of a one-line body or a const's own value, prose-pinning, a wall-clock
+sanity check, and a vacuity check on a test-local oracle. None was a regression of a removed bug with no general property: every regression
+test found is an instance of a §1 spec.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
@@ -693,14 +501,13 @@ of a removed bug with no general property: every regression test found is an ins
 2. **`XtermKeyboardState` has two different defaults.** The derived `Default` gives `(mok: None, fok: 0)`
    (disabled; the query answers `CSI > 4 m`), while `new()` (doc: "Create a new default state") and
    `reset()` give `(Some(0), 0)`. No xterm reset produces `Default::default()`, so any caller using it gets a
-   state the protocol never reaches. `src/xterm_keyboard.rs::test_default_state` exercises only `new()`, and
-   `tests/xterm_keyboard_tests.rs::test_default_vs_new_divergence` pins the split as intended (its last
-   two asserts are implied by the two before). Probably a latent bug; `xtk-state-machine` states the code
+   state the protocol never reaches. `src/xterm_keyboard.rs::test_default_vs_new_divergence` pins the split
+   as intended. Probably a latent bug; `xtk-state-machine` states the code
    as it is.
 3. **serde breaks the type invariants the tests sample.** With the `serde` feature, the derived
    `Deserialize` on `KittyKeyboardFlags` and `KittyKeyboardStateSnapshot` accepts any u8 and skips the
    `KMASK` mask (`tests/kitty_keyboard_tests.rs::test_flags_from_bits_masks_invalid`), and on
-   `XtermKeyboardState` it skips the `min(2)`/`min(1)` clamps (`test_boundary_clamp_values`). A proved type
+   `XtermKeyboardState` it skips the `min(2)`/`min(1)` clamps (`test_set_modify_other_keys`, `test_format_other_keys`). A proved type
    invariant needs a validating `Deserialize` (`try_from`), or the specs must be weakened to values built
    through the constructors.
 4. **The UTC parser has a four-digit-year boundary.** `format_rfc3339` is total on u64 and
@@ -712,26 +519,19 @@ of a removed bug with no general property: every regression test found is an ins
    `sel-linear` states it, and the Rust fn should carry it as a `requires`.
 6. **`OutputBlock::command_rows`/`output_rows` can return an inverted range** when `output_start_row` or
    `end_row` is earlier than the start, and nothing guards that, though the #5715 comment says inverted
-   ranges were the bug. `command_rows_saturate_at_u64_max` and `output_rows_saturate_at_u64_max` pin only
-   saturation. A `start ≤ end` ensures needs a struct invariant on `OutputBlock` that is stated nowhere.
-7. **Prose-pinning inside spec tests.** `src/control_verbs.rs::privacy_is_a_headless_answerable_meta_read`
-   is mixed: its row-shape half is in `cv-access-classification`/`cv-framing-of`, its help-text needle half
-   is prose-pinning and is dropped, not migrated. Likewise
-   `src/rust_lane_tests.rs::the_refusal_names_the_trust_spelling_the_pin_and_the_escape` and
-   `a_trust_toolchains_own_rustc_by_path_is_not_stock_and_its_cargo_names_its_targo` assert whole English
-   sentences; only their structure is `rl-refusal-shape`.
-8. **A test of an internal helper.** `src/keyboard/encode_tests.rs::ungated_release_would_collide_with_a_press_report`
+   ranges were the bug. `command_and_output_rows_saturate_at_u64_max` pins only saturation. A
+   `start ≤ end` ensures needs a struct invariant on `OutputBlock` that is stated nowhere.
+7. **A test of an internal helper.** `src/keyboard/encode_tests.rs::ungated_release_would_collide_with_a_press_report`
    calls the private `encode_kitty` and asserts a *collision*, the reason the release gate exists. It is
    kept as lemma (5) of `kb-release-gating`, but it pins internal behaviour, not the public contract.
-9. **The luminance tests measure through `contrast`.** Every test in `tests/color_space.rs` reads
-    luminance back as `contrast(c, black)·0.05 − 0.05`, which adds its own rounding and leans on contrast's
-    formula. The specs are stated on the private `luminance`/`linearize` directly, with an error bound
-    against the real formula. `luminance_near_srgb_threshold` claims to check "continuity" at the 0.04045
-    seam but asserts one strict increase and one bound; the real continuity property (the two branches
-    agree at c' = 0.04045 within eps) is untested.
-10. **`scheme-builtin-legibility` may be cheaper as a build check.** It relies on `Rgb::contrast` (f64, WCAG
-    luminance with `powf`); a const-evaluated check over `BUILTINS` may beat a float proof.
-11. **Dead state.** `KittyKeyboardStackEntry::VALID_BIT` is "set for consistency but never checked" (its
+8. **The luminance tests measure through `contrast`.** Every luminance test in `tests/color_space.rs` reads
+   luminance back as `contrast(c, black)·0.05 − 0.05`, which adds its own rounding and leans on contrast's
+   formula. The specs are stated on the private `luminance`/`linearize` directly, with an error bound
+   against the real formula. Continuity at the 0.04045 seam (the two branches agree at c' = 0.04045
+   within eps) is untested.
+9. **`scheme-builtin-legibility` may be cheaper as a build check.** It relies on `Rgb::contrast` (f64, WCAG
+   luminance with `powf`); a const-evaluated check over `BUILTINS` may beat a float proof.
+10. **Dead state.** `KittyKeyboardStackEntry::VALID_BIT` is "set for consistency but never checked" (its
     doc). Dropping it would make the stack abstraction exact (entry = flags).
 
 ## 6. Proof order (easiest high-value first)
@@ -744,7 +544,7 @@ body widening the parser pilot also needs, and moves outward one gap at a time.
    pure core the plan wants factored out before the effectful `fs-ensure-private-dir` (gap 8).
 2. **`sel-linear` and `sel-block`** (gap 3). Scalar `i32`/`usize` comparisons, an if/else-if chain and
    `min`/`max`. They retire 6 tests between them (plus the shared `containment_matches_the_normalized_shapes`)
-   and force the missing `requires` on `selection_contains_linear` (§5.6).
+   and force the missing `requires` on `selection_contains_linear` (§5.5).
 3. **`kb-wire-values`, `kb-mode-accessors`, `kb-mode-bit-layout`** (gap 3). u8 arithmetic and `contains`
    on bitflags. They retire 7 tests and are the lemmas every keyboard encoder spec composes (modifier
    parameter, modifyOtherKeys level, the 16-bit mode space of §5.1).

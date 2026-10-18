@@ -5,7 +5,7 @@
 //! LIFECYCLE of a text selection, bound to the code that actually runs.
 //!
 //! `selection_custody_model()` is model-checked in the abstract at Tier-0
-//! (`aterm-spec/tests/derived_ring_ty.rs`), which proves the DESIGN sound: a bare
+//! (`aterm-models/tests/derived_ring_ty.rs`), which proves the DESIGN sound: a bare
 //! modifier destroys nothing, ordinary output destroys nothing, damage that missed
 //! the selected rows spares them, damage that hit them clears them, and losing the
 //! oldest line of a selection clamps the head instead of throwing the whole span
@@ -145,7 +145,7 @@ use std::collections::BTreeMap;
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
-use aterm_spec::derive::selection_custody_model;
+use aterm_models_misc::selection_custody_model;
 use aterm_spec::xref::StepEvidence;
 
 use crate::app_input::{PressKind, apply_press_custody};

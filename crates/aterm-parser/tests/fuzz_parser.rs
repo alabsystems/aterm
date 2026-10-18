@@ -10,8 +10,8 @@
 use aterm_parser::{NullSink, Parser};
 
 /// Deterministic LCG fuzz: 200k pseudo-random chunks driven through the full
-/// state machine (CSI / OSC / DCS / ESC / UTF-8 / C0 / C1) via both `advance`
-/// and `advance_fast`, with periodic resets. State carries across chunks, so
+/// state machine (CSI / OSC / DCS / ESC / UTF-8 / C0 / C1) via `advance_fast`,
+/// with periodic resets. State carries across chunks, so
 /// split/partial sequences are exercised too. Any panic aborts the test.
 #[test]
 fn fuzz_advance_never_panics() {
@@ -24,14 +24,10 @@ fn fuzz_advance_never_panics() {
     };
     let mut parser = Parser::new();
     let mut sink = NullSink;
-    for i in 0..200_000u32 {
+    for _ in 0..200_000u32 {
         let len = (next() % 64) as usize;
         let input: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
-        if i & 1 == 0 {
-            parser.advance(&input, &mut sink);
-        } else {
-            parser.advance_fast(&input, &mut sink);
-        }
+        parser.advance_fast(&input, &mut sink);
         // Occasionally reset to also cover fresh-state entry paths.
         if next() % 101 == 0 {
             parser.reset();
@@ -60,7 +56,7 @@ fn fuzz_escape_shapes_never_panic() {
         let mut input: Vec<u8> = intro.to_vec();
         let body = (next() % 48) as usize;
         input.extend((0..body).map(|_| (next() & 0xFF) as u8));
-        parser.advance(&input, &mut sink);
+        parser.advance_fast(&input, &mut sink);
         if next() % 23 == 0 {
             parser.reset();
         }

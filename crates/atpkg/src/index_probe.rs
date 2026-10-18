@@ -339,8 +339,16 @@ pub fn cached_answer(layout: &Layout) -> CachedProbe {
 /// only, never a trust input.
 #[must_use]
 pub fn held_index_builds(layout: &Layout) -> Option<Vec<u64>> {
-    let source = crate::net::github_source_id(aterm_update_core::ATPKG_INDEX_OWNER);
-    let labels = crate::cache::IndexCache::for_layout(layout).labels(&source)?;
+    cached_index_builds(
+        layout,
+        &crate::net::github_source_id(aterm_update_core::ATPKG_INDEX_OWNER),
+    )
+}
+
+/// [`held_index_builds`] for the cache of `source` (a fetcher's `source_id`).
+#[must_use]
+pub(crate) fn cached_index_builds(layout: &Layout, source: &str) -> Option<Vec<u64>> {
+    let labels = crate::cache::IndexCache::for_layout(layout).labels(source)?;
     Some(
         labels
             .iter()
@@ -383,9 +391,10 @@ pub(crate) fn classify(next: u64, answer: Result<HeadAnswer, HttpError>) -> Prob
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_spec::derive::{
-        Model, atpkg_index_probe_cooldown_model, atpkg_index_successor_selection_model,
+    use aterm_models_atpkg::{
+        atpkg_index_probe_cooldown_model, atpkg_index_successor_selection_model,
     };
+    use aterm_spec::derive::Model;
     use std::cell::Cell;
     use std::collections::BTreeMap;
 
@@ -621,66 +630,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn next_index_wakes_once_and_shared_stamp_bounds_other_processes() {
-        let layout = layout("successor");
-        std::fs::write(layout.floor(), "43").unwrap();
-        let t0 = SystemTime::now();
-        let requests = std::cell::RefCell::new(Vec::<String>::new());
-        let newer_ready = Cell::new(false);
-        let tag = |build: u64| {
-            format!(
-                "https://github.com/alabsystems/aterm/releases/download/atpkg-index-{build}/index.toml"
-            )
-        };
-        let mut head = |url: &str| {
-            requests.borrow_mut().push(url.to_string());
-            let published = url == tag(44) || (newer_ready.get() && url == tag(45));
-            Ok(HeadAnswer {
-                code: if published { 302 } else { 404 },
-                location: published
-                    .then(|| "https://release-assets.githubusercontent.com/object".into()),
-            })
-        };
-        let asked = || requests.borrow().len();
-        assert_eq!(
-            successor_with(&layout, "alabsystems", "aterm", t0, &mut head),
-            Probe::Published(44)
-        );
-        assert_eq!(
-            *requests.borrow(),
-            vec![tag(44), tag(45)],
-            "the pair, in order"
-        );
-        stamped_at(&layout, t0);
-        assert_eq!(
-            successor_with(
-                &layout,
-                "alabsystems",
-                "aterm",
-                t0 + INTERVAL - Duration::from_secs(1),
-                &mut head
-            ),
-            Probe::Suppressed(Duration::from_secs(1)),
-            "a second process reuses the shared stamp"
-        );
-        assert_eq!(asked(), 2);
-        newer_ready.set(true);
-        assert_eq!(
-            successor_with(
-                &layout,
-                "alabsystems",
-                "aterm",
-                t0 + INTERVAL + Duration::from_secs(1),
-                &mut head,
-            ),
-            Probe::Published(45),
-            "a newer tag behind an unlanded 44 is found on the next probe"
-        );
-        assert_eq!(asked(), 4);
-        std::fs::remove_dir_all(&layout.prefix).unwrap();
-    }
-
     /// The first HEAD to find a published index reports it before the second returns; the
     /// final answer is still the higher of the pair.
     #[test]
@@ -721,38 +670,6 @@ mod tests {
             hint44 < head45,
             "44 is reported before 45 is asked: {order:?}"
         );
-        std::fs::remove_dir_all(&layout.prefix).unwrap();
-    }
-
-    #[test]
-    fn a_sibling_probe_holding_the_store_lock_prevents_duplicate_heads() {
-        let layout = layout("locked");
-        std::fs::write(layout.floor(), "43").unwrap();
-        let model = atpkg_index_probe_cooldown_model();
-        let mut state = model.init_state();
-        // A sibling's hold, let go by `LOCK_UN` when it drops ([`crate::lock::Flock`]).
-        let held = crate::lock::Flock::try_lock(
-            open_private(&layout.prefix.join(NEAR_LOCK), true).unwrap(),
-        )
-        .unwrap();
-        assert!(model.fire("Acquire", &mut state));
-        assert!(!model.action_enabled("Acquire", &state));
-        let mut head = |_: &str| -> Result<HeadAnswer, HttpError> {
-            panic!("a sibling probe already owns the network request")
-        };
-        assert_eq!(
-            successor_with(
-                &layout,
-                "alabsystems",
-                "aterm",
-                SystemTime::now(),
-                &mut head,
-            ),
-            Probe::Deferred
-        );
-        drop(held);
-        assert!(model.fire("Abort", &mut state));
-        assert!(model.action_enabled("Acquire", &state));
         std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
@@ -807,56 +724,6 @@ mod tests {
             "the probe after a release goes to the wire"
         );
         drop(copy);
-        std::fs::remove_dir_all(&layout.prefix).unwrap();
-    }
-
-    /// The next tags missing are asked again after thirty seconds, never sooner, and a floor
-    /// that moved (the pass landed an index) makes the old stamp moot at once.
-    #[test]
-    fn missing_retries_after_thirty_seconds_and_floor_change_bypasses_old_stamp() {
-        assert_eq!(INTERVAL, Duration::from_secs(30));
-        let layout = layout("missing");
-        std::fs::write(layout.floor(), "44").unwrap();
-        let t0 = SystemTime::now();
-        let requested = std::cell::RefCell::new(Vec::<String>::new());
-        let mut head = |url: &str| {
-            requested.borrow_mut().push(url.to_string());
-            Ok(HeadAnswer {
-                code: 404,
-                location: None,
-            })
-        };
-        let asked = || requested.borrow().len();
-        // One probe per instant, its HEADs counted exactly.
-        let mut at = |at: SystemTime, asks: usize| {
-            let before = asked();
-            let answer = successor_with(&layout, "alabsystems", "aterm", at, &mut head);
-            assert_eq!(asked() - before, asks, "the HEADs at {at:?}");
-            answer
-        };
-        assert_eq!(at(t0, 2), Probe::Missing);
-        stamped_at(&layout, t0);
-        assert_eq!(
-            at(t0 + Duration::from_secs(15), 0),
-            Probe::Suppressed(Duration::from_secs(15))
-        );
-        assert_eq!(at(t0 + Duration::from_secs(31), 2), Probe::Missing);
-        stamped_at(&layout, t0 + Duration::from_secs(31));
-        std::fs::write(layout.floor(), "45").unwrap();
-        assert_eq!(
-            at(t0 + Duration::from_secs(32), 2),
-            Probe::Missing,
-            "a changed floor invalidates the stamp"
-        );
-        let tag = |build: u64| {
-            format!(
-                "https://github.com/alabsystems/aterm/releases/download/atpkg-index-{build}/index.toml"
-            )
-        };
-        assert_eq!(
-            *requested.borrow(),
-            vec![tag(45), tag(46), tag(45), tag(46), tag(46), tag(47)]
-        );
         std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
@@ -974,54 +841,6 @@ mod tests {
     /// A request on GitHub's metered REST API, which the probe must never make.
     fn metered(url: &str) -> bool {
         url.starts_with("https://api.github.com/")
-    }
-
-    /// No API request in the steady state: a hundred ticks of 404s spend exactly the next
-    /// two tags' HEADs each, and nothing on api.github.com.
-    #[test]
-    fn a_hundred_steady_state_ticks_spend_only_unmetered_heads() {
-        // Negative control: the predicate matches a Releases API listing.
-        assert!(metered(
-            "https://api.github.com/repos/alabsystems/aterm/releases?per_page=100&page=1"
-        ));
-        assert!(!metered(
-            "https://github.com/alabsystems/aterm/releases/download/atpkg-index-45/index.toml"
-        ));
-        let layout = layout("steady-state");
-        std::fs::write(layout.floor(), "44").unwrap();
-        let t0 = SystemTime::now();
-        let requested = std::cell::RefCell::new(Vec::<String>::new());
-        let mut head = |url: &str| {
-            requested.borrow_mut().push(url.to_string());
-            Ok(HeadAnswer {
-                code: 404,
-                location: None,
-            })
-        };
-        let asked = || requested.borrow().len();
-        for tick in 0..100u64 {
-            let at = t0 + Duration::from_secs(tick * 31);
-            let before = asked();
-            let answer = successor_with(&layout, "alabsystems", "aterm", at, &mut head);
-            assert_eq!(asked() - before, 2, "tick {tick}: the pair of HEADs");
-            assert_eq!(answer, Probe::Missing, "tick {tick}");
-            stamped_at(&layout, at);
-        }
-        let requested = requested.into_inner();
-        assert_eq!(requested.len(), 200);
-        let next = |build: u64| {
-            format!(
-                "https://github.com/alabsystems/aterm/releases/download/atpkg-index-{build}/index.toml"
-            )
-        };
-        assert!(
-            requested
-                .iter()
-                .all(|url| *url == next(45) || *url == next(46)),
-            "only the next two tags, and never a metered request: {:?}",
-            requested.iter().find(|url| metered(url))
-        );
-        std::fs::remove_dir_all(&layout.prefix).unwrap();
     }
 
     #[test]

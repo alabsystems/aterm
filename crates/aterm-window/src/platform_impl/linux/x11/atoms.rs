@@ -4,39 +4,31 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/atoms.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE.
+// Modified by the aterm project in 2026; see the repository NOTICE. (The atoms are interned
+// in one round trip through first-party `aterm-x11`, where upstream used x11rb's
+// `atom_manager!`: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 //! Collects every atom used by the platform implementation.
 
 use core::ops::Index;
 
+use aterm_x11::proto::Atom;
+
 macro_rules! atom_manager {
     ($($name:ident $(:$lit:literal)?),*) => {
-        x11rb::atom_manager! {
-            /// The atoms used by `winit`
-            pub Atoms: AtomsCookie {
-                $($name $(:$lit)?,)*
-            }
-        }
-
-        /// Indices into the `Atoms` struct.
+        /// Indices into the `Atoms` table.
         #[derive(Copy, Clone, Debug)]
         #[allow(non_camel_case_types)]
         pub enum AtomName {
             $($name,)*
         }
 
-        impl AtomName {
-            pub(crate) fn atom_from(
-                self,
-                atoms: &Atoms
-            ) -> &x11rb::protocol::xproto::Atom {
-                match self {
-                    $(AtomName::$name => &atoms.$name,)*
-                }
-            }
-        }
+        /// Every atom's name, in `AtomName` order: the literal where one is
+        /// given, else the identifier.
+        const NAMES: &[&[u8]] = &[$(atom_manager!(@name $name $(:$lit)?),)*];
     };
+    (@name $name:ident) => { stringify!($name).as_bytes() };
+    (@name $name:ident : $lit:literal) => { $lit };
 }
 
 atom_manager! {
@@ -64,6 +56,11 @@ atom_manager! {
     _NET_WM_STATE_MAXIMIZED_HORZ,
     _NET_WM_STATE_MAXIMIZED_VERT,
     _NET_WM_WINDOW_TYPE,
+
+    // Startup notification (the launchee's side, `startup_notify.rs`).
+    _NET_STARTUP_INFO_BEGIN,
+    _NET_STARTUP_INFO,
+    _NET_STARTUP_ID,
 
     // WM window types.
     _NET_WM_WINDOW_TYPE_DESKTOP,
@@ -107,14 +104,46 @@ atom_manager! {
     _XSETTINGS_SETTINGS
 }
 
+/// The atoms used by `winit`, interned once per connection.
+#[derive(Debug)]
+pub struct Atoms {
+    atoms: Vec<Atom>,
+}
+
+impl Atoms {
+    /// Intern every atom (`only_if_exists` false, so each exists afterwards),
+    /// all requests first and then the replies.
+    pub fn new(conn: &aterm_x11::Connection) -> Result<Atoms, aterm_x11::Error> {
+        let atoms = conn.intern_atoms(NAMES)?;
+        debug_assert_eq!(atoms.len(), NAMES.len());
+        Ok(Atoms { atoms })
+    }
+}
+
 impl Index<AtomName> for Atoms {
-    type Output = x11rb::protocol::xproto::Atom;
+    type Output = Atom;
 
     fn index(&self, index: AtomName) -> &Self::Output {
-        index.atom_from(self)
+        &self.atoms[index as usize]
     }
 }
 
 pub(crate) use AtomName::*;
 // Make sure `None` is still defined.
 pub(crate) use core::option::Option::None;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The names go to the server as written, the two literal ones included,
+    /// and in the order `AtomName` indexes.
+    #[test]
+    fn every_name_is_interned_in_index_order() {
+        assert_eq!(NAMES.len(), _XSETTINGS_SETTINGS as usize + 1);
+        assert_eq!(NAMES[CARD32 as usize], b"CARD32");
+        assert_eq!(NAMES[TextUriList as usize], b"text/uri-list");
+        assert_eq!(NAMES[AtomName::None as usize], b"None");
+        assert_eq!(NAMES[_XSETTINGS_SETTINGS as usize], b"_XSETTINGS_SETTINGS");
+    }
+}

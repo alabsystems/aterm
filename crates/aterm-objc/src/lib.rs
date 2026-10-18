@@ -3,7 +3,8 @@
 
 //! aterm's first-party Objective-C runtime layer.
 //!
-//! Typed message sends ([`msg`], one exact prototype per selector), ownership
+//! Typed message sends ([`checked_msg`], one exact prototype per selector,
+//! checked against the runtime at every send of a debug build), ownership
 //! ([`Obj`], [`Retained`]), scoped autorelease pools, and:
 //!
 //! 1. **[Runtime class creation](declare)**, driven by [`declare_class!`].
@@ -19,22 +20,29 @@
 //! 6. **[A thread-affinity container](main_thread_bound)** —
 //!    [`MainThreadBound<T>`][MainThreadBound], built from the [`MainThread`]
 //!    witness and [`run_on_main`].
-//! 7. **[The run-loop wake timer](wake_timer)** — the event-loop waker.
-//! 8. **[CoreFoundation](cf) and CoreGraphics (`cg`, feature `cg`)** — the
-//!    flat C the windowing backend calls beside its sends. Each declaration is
-//!    held to the SDK headers by clang (`tests/cf_cg_sdk.rs`).
+//! 7. **[The run-loop wake timer](wake_timer)** — the event-loop waker. Its
+//!    repeat interval is a year because CoreFoundation walks a late repeating
+//!    timer forward one interval at a time with the run-loop lock held.
+//! 8. **[CoreFoundation](cf)** — the flat C the windowing backend calls beside
+//!    its sends: run-loop sources and observers, retain/release. Each
+//!    declaration is held to the SDK headers by clang (`tests/cf_sdk.rs`).
+//!    CoreGraphics (display IDs, bounds and modes) is its own crate,
+//!    `aterm-cg`, so only the windowing backend's binaries load it.
 //! 9. **[A window's content view](view)** — [`HasNsView`], the `NSView` the
 //!    windowing crate hands the Metal presenter and the GUI's chrome.
 //!
-//! No third-party dependencies: std over `libobjc`, `Foundation` and
-//! `CoreFoundation` (and, under `cg`, `CoreGraphics`).
+//! The crate has no third-party dependencies: everything is std over `libobjc`,
+//! `Foundation` and `CoreFoundation`, all loaded in every aterm process.
 //!
 //! # Safety conventions
 //!
 //! * No single `objc_msgSend` prototype is right for every selector, and on
 //!   AAPCS64 a variadic declaration passes arguments elsewhere than the
-//!   non-variadic IMP reads them. Every send casts [`msg`] to the exact
-//!   prototype of the selector; a wrong one corrupts registers silently.
+//!   non-variadic IMP reads them. Every send casts [`checked_msg`] to the
+//!   exact prototype of the selector; a wrong one corrupts registers silently
+//!   in a release build and panics, naming both encodings, in a debug build
+//!   ([`send`]). The unchecked [`msg`] is this crate's tests' alone: the
+//!   workspace `clippy.toml` refuses it everywhere else.
 //! * `new*`/`alloc`/`copy*` results are +1 and land in [`Obj`] or
 //!   [`Retained`], the only places `objc_release` is called.
 //! * A declared method that returns an object and is not named
@@ -126,8 +134,6 @@
 
 pub(crate) mod block;
 pub mod cf;
-#[cfg(feature = "cg")]
-pub mod cg;
 pub(crate) mod class_macro;
 pub(crate) mod declare;
 pub(crate) mod dispatch;
@@ -145,8 +151,8 @@ pub(crate) mod weak;
 
 pub use block::{BlockPtr, RcBlock};
 pub use declare::{
-    ClassBuilder, ClassMeta, IVAR_NAME, IvarSlot, MainThread, abort_on_unwind, begin,
-    send_super_dealloc, super_of,
+    ClassBuilder, ClassMeta, IvarSlot, MainThread, abort_on_unwind, begin, send_super_dealloc,
+    super_of,
 };
 pub use dispatch::{ContainedInRunOnMain, run_on_main};
 pub use encode::{Bool, CGPoint, CGRect, CGSize, Encode, NSRange, strip_method_offsets};
@@ -161,6 +167,7 @@ pub use runtime::{
     superclass_of,
 };
 pub use sel_cache::SelCache;
+pub use send::{CheckedFn, Receiver, checked_msg};
 pub use swizzle::{Imp, MethodFn, Swizzle, SwizzleError, SwizzleSite, owning_class};
 pub use view::HasNsView;
 pub use wake_timer::{WakeArm, WakePlan, WakeTarget, WakeTimer};

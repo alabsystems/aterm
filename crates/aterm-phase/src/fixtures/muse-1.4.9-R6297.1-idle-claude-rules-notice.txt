@@ -1,0 +1,11 @@
+# muse 1.4.9-R6297.1 · MEASURED 2026-10-16, `aterm ctl text --json` of a private headless aterm 120x40 (aterm 0.105.0 80b670745), the atpkg-managed muse (Meta latest) launched through its shim with a scratch HOME, `--base-url` at a local scripted stand-in for Meta's Responses endpoint (`--model fake-1`, a dummy META_API_KEY: no login and no model; the stand-in returns the tool call that raises the box, the box is muse's own), harness off · a fresh session in a scratch HOME holding `~/.claude/CLAUDE.md` and no muse rules file of its own: muse imports Claude Code's personal rules (its context then carries that file as `<rules-file scope="user" path="~/.claude/CLAUDE.md" written-for="Claude Code">`; with `$XDG_CONFIG_HOME/muse/AGENTS.md` present it loads that alone) and says so in a row between the banner and the composer: `  Including your Claude Code personal rules — manage with /settings.` · cursor=7,2 (visible) · scratch path redacted at equal length
+$ muse-fake
+
+  Muse Code 1.4.9
+
+  Including your Claude Code personal rules — manage with /settings.
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  fake-1 · high · /private/tmp/at.XXXXXX/mwork · Auto-review

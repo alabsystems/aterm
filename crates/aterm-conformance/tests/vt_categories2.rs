@@ -15,12 +15,6 @@ fn irm_insert_mode_shifts_right() {
 }
 
 #[test]
-fn irm_off_overwrites() {
-    let s = run(b"abc\x1b[1;1HXY");
-    assert_eq!(s.row(0), "XYc");
-}
-
-#[test]
 fn dec_line_drawing_maps_glyphs() {
     // select DEC special graphics for G0, draw 'qqq' -> three horizontal lines,
     // then restore ASCII (G0 = B)

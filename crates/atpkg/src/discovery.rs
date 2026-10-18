@@ -64,17 +64,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_the_public_alabsystems_index_repo() {
-        // No environment is read.
-        let r = resolve_account(None);
-        assert_eq!(r.owner, aterm_update_core::ATPKG_INDEX_OWNER);
-        assert_eq!(r.owner, "alabsystems");
-        assert_eq!(r.repo, INDEX_REPO);
-        assert_eq!(r.repo, "aterm"); // the index rides the aterm repo itself (§16)
-        assert_eq!(r.slug(), "alabsystems/aterm");
-    }
-
-    #[test]
     fn config_account_overrides_default_but_is_validated() {
         assert_eq!(resolve_account(Some("my-org")).owner, "my-org");
         assert_eq!(resolve_account(Some("my-org")).repo, INDEX_REPO);

@@ -3,7 +3,7 @@
 
 //! Tier-1 conformance for the real roster body/signature redo transaction.
 //!
-//! The derived [`RosterPairRedo`](aterm_spec::derive::roster_pair_redo_model)
+//! The derived [`RosterPairRedo`](aterm_models_release::roster_pair_redo_model)
 //! model is proved exhaustively in `aterm-spec`.  These tests bind its decisions
 //! to the shipping `atpkg-keys` filesystem operations: byte-exact snapshot CAS,
 //! end-to-end pair publication, recovery from every durable crash cut, fail-closed
@@ -19,7 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
-use aterm_spec::derive::{Model, roster_pair_redo_model};
+use aterm_models_release::roster_pair_redo_model;
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify::validate_transition_tiered;
 use atpkg_keys::provision::{

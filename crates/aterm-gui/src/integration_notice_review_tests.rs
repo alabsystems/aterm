@@ -105,7 +105,7 @@ fn every_word(app: &App) -> String {
 /// A harness host over no real session under the default `[harness]` (on,
 /// upgrade and relaunch on), or under `cfg`.
 fn harness(cfg: Option<aterm_agent::supervise::SupervisorConfig>) -> HostHandle {
-    let host = HostHandle::for_restored_test(Arc::new(|_, _, _| "refused:inert".to_string()));
+    let host = HostHandle::for_restored_test(Arc::new(|_, _, _, _| "refused:inert".to_string()));
     if let Some(cfg) = cfg {
         host.set_config(cfg);
     }
@@ -169,7 +169,7 @@ fn two_degraded_tabs_are_one_row_that_counts_them() {
     let rows = live(&app);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].0, *id, "restated in place, never a new row");
-    assert_eq!(rows[0].1, "Tab lost its shell integration");
+    assert!(!rows[0].1.starts_with("2 tabs"), "one tab now: {rows:?}");
     assert!(
         records(&app).iter().all(|r| r.state == LogState::Posted),
         "one tab left: nothing retired yet"
@@ -216,7 +216,11 @@ fn a_remedy_change_is_restated_and_only_the_heal_reads_fixed() {
     assert!(live(&app).is_empty());
     let fixed: Vec<LogRecord> = records(&app).into_iter().filter(resolved_ok).collect();
     assert_eq!(fixed.len(), 1, "{fixed:?}");
-    assert_eq!(fixed[0].title, "Shell integration back", "{fixed:?}");
+    assert_eq!(
+        fixed[0].title,
+        crate::message_reporters::INTEGRATION_BACK,
+        "{fixed:?}"
+    );
     host.shutdown_and_join();
 }
 

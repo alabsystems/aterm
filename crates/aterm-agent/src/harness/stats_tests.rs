@@ -11,7 +11,9 @@ use crate::supervise::policy::approval::{
 };
 use crate::supervise::policy::question::RULE_ANSWER_RECOMMENDED;
 use crate::supervise::policy::turn_end::{
-    RULE_ACCOUNT, RULE_ANSWER, RULE_HOST_TURN, RULE_LOGIN, RULE_MODEL_FALLBACK, RULE_USAGE_PROBE,
+    RULE_ACCOUNT, RULE_ANSWER, RULE_API_BACK, RULE_API_CUTOFF, RULE_API_RETRY, RULE_COMPACT,
+    RULE_CONTINUE, RULE_DONE_CHECK, RULE_HOST_TURN, RULE_LIMIT_RESUME, RULE_LOGIN,
+    RULE_MODEL_FALLBACK, RULE_SUGGESTION, RULE_USAGE_PROBE,
 };
 
 /// One approval ledger row as the loop writes it ([`Row::to_json`]).
@@ -75,7 +77,7 @@ fn by(acc: &HarnessStats, rule: &str) -> u64 {
 
 /// Every counter but the waits, the breakdown and the bookkeeping, in the
 /// struct's order: `(approved, unproven, declined, answered, continued,
-/// landed, resumed, escalated, relaunched, upgraded)`.
+/// land_prompts, resumed, escalated, relaunched, upgraded)`.
 fn counts(acc: &HarnessStats) -> [u64; 10] {
     [
         acc.approved,
@@ -83,7 +85,7 @@ fn counts(acc: &HarnessStats) -> [u64; 10] {
         acc.declined,
         acc.answered,
         acc.continued,
-        acc.landed,
+        acc.land_prompts,
         acc.resumed,
         acc.escalated,
         acc.relaunched,
@@ -154,7 +156,7 @@ fn a_ledger_row_counts_where_the_table_says() {
         said(t, RULE_USAGE_PROBE, Outcome::Waiting, "closed"),
     ];
     let acc = fold_ledger(&lines, 0);
-    // approved, unproven, declined, answered, continued, landed, resumed,
+    // approved, unproven, declined, answered, continued, land prompts, resumed,
     // escalated, relaunched, upgraded.
     assert_eq!(counts(&acc), [3, 1, 1, 4, 4, 2, 5, 0, 0, 0], "{acc:#?}");
     assert_eq!((acc.rows, acc.bad, acc.sessions), (32, 0, 1));
@@ -806,6 +808,8 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
         usage_tap: None,
         instances: Instances::Listed(Vec::new()),
         agents_off: Vec::new(),
+        land: false,
+        timings: crate::harness::Timings::FAST,
     }
 }
 
@@ -891,7 +895,7 @@ fn stats_under_reads_every_sessions_files_and_creates_nothing() {
     let acc = stats_under(&state, &harness, at);
     assert_eq!(listing(&root), before, "the read created nothing");
     assert_eq!(acc.since_ms, at);
-    // approved, unproven, declined, answered, continued, landed, resumed,
+    // approved, unproven, declined, answered, continued, land prompts, resumed,
     // escalated, relaunched, upgraded.
     assert_eq!(counts(&acc), [1, 0, 1, 1, 1, 0, 1, 1, 1, 1], "{acc:#?}");
     assert_eq!((acc.human_wait_ms, acc.limit_wait_ms), (5_000, 9_000));
@@ -979,4 +983,494 @@ fn a_ledger_untouched_since_the_window_is_not_read() {
     // NEGATIVE CONTROL: written now.
     set_mtime(std::time::SystemTime::now());
     assert_eq!(stats_under(&state, &harness, since_ms).continued, 1);
+}
+
+/// A session's ledger as the loop's writer serializes it, with a journal
+/// beside it: a box approved (one full-power press the safe rules could not
+/// prove), a three-key question dialog the loop answered (its tab, its
+/// toggle, its submit: one `CHOSE` in the journal), a prose answer, a
+/// continuation, a full context's `/compact` and the continuation it typed
+/// after it, Land's instruction and its nudge, and a decline.
+/// The rows, each with its rule, outcome, command and reason.
+type Recorded = Vec<(String, &'static str, Outcome, &'static str, &'static str)>;
+
+fn the_recorded_session() -> (Recorded, &'static str) {
+    let t = 1_792_249_200_000;
+    let rows = vec![
+        (RULE_ALLOW_ONCE, Outcome::Approved, "cargo test", ""),
+        (
+            RULE_READ_ONLY,
+            Outcome::Approved,
+            "git log",
+            "unproven: not read-only: touch",
+        ),
+        (RULE_ANSWER_RECOMMENDED, Outcome::Approved, "", "tab"),
+        (RULE_ANSWER_RECOMMENDED, Outcome::Approved, "", "toggle"),
+        (RULE_ANSWER_RECOMMENDED, Outcome::Approved, "", "submit"),
+        (RULE_ANSWER, Outcome::Typed, "Decide for yourself.", ""),
+        (RULE_CONTINUE, Outcome::Typed, "keep going", ""),
+        ("context-compact@v1", Outcome::Typed, "/compact", ""),
+        (
+            "context-compact@v1",
+            Outcome::Typed,
+            "Carry on where you left off.",
+            "",
+        ),
+        (
+            "land@v1",
+            Outcome::Typed,
+            "[aterm harness] Autopilot is set to Land",
+            "",
+        ),
+        (
+            "land-nudge@v1",
+            Outcome::Typed,
+            "[aterm harness] Still landing",
+            "",
+        ),
+        ("decline@v1", Outcome::Declined, "rm -rf /", "no spend"),
+        (RULE_LOGIN, Outcome::Typed, "/login", ""),
+        (RULE_READ_ONLY, Outcome::Skipped, "ls", "moved"),
+        ("-", Outcome::Escalated, "", "no rule answers this box"),
+    ];
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (rule, outcome, command, reason))| {
+            let ts = t + i64::try_from(i).expect("few rows") * 100;
+            (
+                row(ts, "s-1", rule, outcome, command, reason),
+                rule,
+                outcome,
+                command,
+                reason,
+            )
+        })
+        .collect();
+    let journal = "
+        1792249200250 s-1 CHOSE seq=40 rule=answer-recommended@v1 policy=recommended Which colour? → Blue
+        1792249200260 s-1 TYPED seq=44 rule=context-compact@v1 /compact
+    ";
+    (rows, journal)
+}
+
+/// The recorded ledger and journal count a question dialog once by its
+/// journal entry, never by its three keys. The compact continuation counts
+/// once as a resume and the slash command counts only by its rule.
+///
+/// NEGATIVE CONTROL: treating each row's act as its counter overcounts the
+/// dialog and the compact operation.
+#[test]
+fn the_sort_counts_the_recorded_acts_without_counting_dialog_keys() {
+    let (rows, fixture) = the_recorded_session();
+    let recs = journal(fixture);
+    let since = 1_792_249_000_000;
+    let mut after = HarnessStats::new(since);
+    for (line, ..) in &rows {
+        fold_ledger_line(&mut after, line);
+    }
+    fold_journal(&mut after, &recs);
+    // approved, unproven, declined, answered, continued, land prompts, resumed,
+    // escalated, relaunched, upgraded.
+    assert_eq!(counts(&after), [2, 1, 1, 2, 1, 2, 1, 0, 0, 0], "{after:#?}");
+    assert_eq!(after.rows, 17, "15 ledger rows and two journal entries");
+    assert_eq!(after.sessions, 1);
+    let expected = [
+        (RULE_ALLOW_ONCE, 1),
+        (RULE_READ_ONLY, 1),
+        (RULE_ANSWER_RECOMMENDED, 3),
+        (RULE_ANSWER, 1),
+        (RULE_CONTINUE, 1),
+        ("context-compact@v1", 2),
+        ("land@v1", 1),
+        ("land-nudge@v1", 1),
+        ("decline@v1", 1),
+        (RULE_LOGIN, 1),
+    ];
+    assert_eq!(
+        after.by_rule,
+        expected
+            .into_iter()
+            .map(|(rule, n)| (rule.to_string(), n))
+            .collect()
+    );
+    // NEGATIVE CONTROL: each act its own counter.
+    let mut by_act = HarnessStats::new(since);
+    for (_, rule, outcome, command, _) in &rows {
+        let act = crate::harness::acts::sort(rule, *outcome, command).act;
+        // `Act::of(rule, Outcome)`: no command to tell `/compact` by.
+        let act = act.or_else(|| {
+            (*rule == "context-compact@v1").then_some(crate::harness::acts::Act::Resumed)
+        });
+        match act {
+            Some(crate::harness::acts::Act::Answered) => by_act.answered += 1,
+            Some(crate::harness::acts::Act::Resumed) => by_act.resumed += 1,
+            _ => {}
+        }
+    }
+    fold_journal(&mut by_act, &recs);
+    assert_eq!(
+        (by_act.answered, by_act.resumed),
+        (5, 2),
+        "CONTROL: three keys, a CHOSE and a prose answer; /compact and its continuation"
+    );
+    assert_ne!(
+        (by_act.answered, by_act.resumed),
+        (after.answered, after.resumed)
+    );
+}
+
+/// The unix ms now, the clock a file's last write is on: the windows the
+/// one-pass fixtures read are placed against it, so a file "untouched
+/// today" is one whose time is set before today's start.
+fn now_ms() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch");
+    i64::try_from(since.as_millis()).expect("ms")
+}
+
+/// A state tree as the page reads one, placed around today's start
+/// `today` and the week's `week` (unix ms): what the one pass must read as
+/// the two windows' readers do.
+///
+/// * `s-1`: the recorded session's ledger (`the_recorded_session`), its
+///   rows today; a limit's wall written before today's start whose resume
+///   comes after it, and a box approved yesterday; its journal with an
+///   escalation raised yesterday and cleared today, one raised and cleared
+///   today, the recorded `CHOSE`, and a line that is no record.
+/// * `s-2`: a ledger and journal last written yesterday (UNTOUCHED TODAY):
+///   a decline, a continuation, a line that is no row, an escalation.
+/// * `s-3`: a ledger CUT back to its kept rows, every one today.
+/// * `s-4`: a ledger last written 9 days ago: in neither window.
+/// * the upgrade ledger: a relaunch yesterday, an upgrade today and a row
+///   with no tab, and a line that is no row.
+///
+/// Returns the scratch root (the tree lives as long as it), the state and
+/// harness directories, and every file a reading may read.
+fn one_pass_tree(today: i64, week: i64) -> (ScratchDir, PathBuf, PathBuf, Vec<PathBuf>) {
+    let root = ScratchDir::new("stats", "one-pass");
+    let state = root.join("state");
+    let harness = root.join("harness");
+    let drive = state.join("drive");
+    std::fs::create_dir_all(&drive).expect("drive");
+    std::fs::create_dir_all(harness.join("upgrade")).expect("upgrade");
+    let write = |path: &Path, lines: &[String], modified: Option<i64>| {
+        let mut body = lines.join("\n");
+        body.push('\n');
+        std::fs::write(path, body).expect("write");
+        if let Some(ms) = modified {
+            let at = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(u64::try_from(ms).expect("after the epoch"));
+            std::fs::File::open(path)
+                .and_then(|f| f.set_modified(at))
+                .expect("set mtime");
+        }
+    };
+    let hour = 3_600_000;
+    let (rows, recorded_journal) = the_recorded_session();
+    // s-1's ledger: the recorded rows, moved to an hour into today.
+    let recorded_t0 = 1_792_249_200_000;
+    let shift = today + hour - recorded_t0;
+    let mut s1: Vec<String> = vec![
+        said(today - 2 * hour, RULE_READ_ONLY, Outcome::Approved, ""),
+        said(
+            today - 30 * 60_000,
+            RULE_WALL_WAIT,
+            Outcome::Waiting,
+            "(wall: …)",
+        ),
+        typed(today + 20 * 60_000, RULE_LIMIT_RESUME, "keep going"),
+    ];
+    s1.extend(
+        rows.iter()
+            .enumerate()
+            .map(|(i, (_, rule, outcome, command, reason))| {
+                let ts = recorded_t0 + shift + i64::try_from(i).expect("few") * 100;
+                row(ts, "s-1", rule, *outcome, command, reason)
+            }),
+    );
+    let s1_ledger = drive.join("s-1.jsonl");
+    write(&s1_ledger, &s1, None);
+    let mut s1_journal = journal(&format!(
+        "{} s-1 ESCALATED seq=10 attention=OK mail=OK 7 off=91
+         {} s-1 CLEARED seq=14 box attention=OK
+         {} s-1 ESCALATED seq=20 attention=OK mail=OK 8 off=92
+         {} s-1 CLEARED seq=24 box attention=OK",
+        today - hour,
+        today + 10 * 60_000,
+        today + 2 * hour,
+        today + 2 * hour + 120_000,
+    ));
+    s1_journal.extend(journal(recorded_journal).into_iter().map(|mut r| {
+        r.t += shift;
+        r
+    }));
+    let mut lines: Vec<String> = s1_journal.iter().map(JournalRecord::to_json).collect();
+    lines.insert(2, "{\"t\":".to_string());
+    let s1_journal = drive.join("s-1.journal.jsonl");
+    write(&s1_journal, &lines, None);
+    // s-2: last written yesterday.
+    let yesterday = today - 10 * hour;
+    let s2_ledger = drive.join("s-2.jsonl");
+    write(
+        &s2_ledger,
+        &[
+            row(
+                yesterday - 5,
+                "s-2",
+                "decline@v1",
+                Outcome::Declined,
+                "Buy?",
+                "-",
+            ),
+            "not a row".to_string(),
+            row(
+                yesterday - 4,
+                "s-2",
+                RULE_CONTINUE,
+                Outcome::Typed,
+                "go on",
+                "-",
+            ),
+        ],
+        Some(yesterday),
+    );
+    let s2_journal = drive.join("s-2.journal.jsonl");
+    let mut s2_lines: Vec<String> = journal(&format!(
+        "{} s-2 ESCALATED seq=3 attention=OK mail=OK 1 off=1",
+        yesterday - 3
+    ))
+    .iter()
+    .map(JournalRecord::to_json)
+    .collect();
+    // A journal untouched today holds a line that is no record too: the
+    // week's, never today's (the journal arm's `bad`, as the ledger's).
+    s2_lines.push("{\"t\":".to_string());
+    write(&s2_journal, &s2_lines, Some(yesterday));
+    // s-3: cut, every row today.
+    let s3_ledger = drive.join("s-3.jsonl");
+    let s3: Vec<String> = (0..approvals::KEEP_ROWS)
+        .map(|k| {
+            let ts = today + 3 * hour + i64::try_from(k).expect("small");
+            row(ts, "s-3", RULE_CONTINUE, Outcome::Typed, "keep going", "-")
+        })
+        .collect();
+    write(&s3_ledger, &s3, None);
+    // s-4: older than the week.
+    let s4_ledger = drive.join("s-4.jsonl");
+    let old = week - 2 * 86_400_000;
+    write(
+        &s4_ledger,
+        &[row(old, "s-4", RULE_CONTINUE, Outcome::Typed, "go", "-")],
+        Some(old),
+    );
+    // The upgrade ledger, in seconds.
+    let up = |t: i64, tab: &str, from: &str, to: &str, step: &str| {
+        format!(
+            "{{\"t\":{},\"pid\":42,\"tab\":\"{tab}\",\"session\":\"c-1\",\"from\":\"{from}\",\
+             \"to\":\"{to}\",\"step\":\"{step}\",\"detail\":\"-\"}}",
+            t / 1000
+        )
+    };
+    let upgrades = upgrade_ledger(&harness);
+    write(
+        &upgrades,
+        &[
+            up(yesterday, "s-2", "2.1.300", "2.1.300(same)", "relaunched"),
+            "{\"t\":".to_string(),
+            up(
+                today + hour,
+                "s-1",
+                "2.1.299",
+                "2.1.300(managed)",
+                "relaunched",
+            ),
+            up(today + hour, "-", "2.1.300", "2.1.300(same)", "relaunched"),
+        ],
+        None,
+    );
+    let files = vec![
+        s1_ledger, s1_journal, s2_ledger, s2_journal, s3_ledger, s4_ledger, upgrades,
+    ];
+    (root, state, harness, files)
+}
+
+/// `acc` without its per-session shares: what [`stats_under`] builds.
+fn without_shares(acc: &HarnessStats) -> HarnessStats {
+    HarnessStats {
+        by_session: None,
+        ..acc.clone()
+    }
+}
+
+/// ONE PASS EQUALS TWO (design §10.3.3, item 1; §10.8's guard): over a
+/// recorded state tree — ledgers, journals, the upgrade ledger, a ledger and
+/// a journal untouched today (each with a line that is no record), a cut
+/// file, one older than the week, and lines that are no rows —
+/// `stats_windows` builds, for each window, exactly what a
+/// `stats_under` call for that window builds: every counter, wait, rule,
+/// session, row, `bad` line and `cut`, and the folds' open memory. The
+/// fixture is no quiet one: the windows differ in every family it holds.
+/// NEGATIVE CONTROL: today's window folding a file untouched today (its bad
+/// line and its rows before today) is not `stats_under`'s.
+#[test]
+fn one_pass_folds_both_windows_as_two_readings_do() {
+    let now = now_ms();
+    let today = now - 5 * 3_600_000;
+    let week = now - 7 * 86_400_000;
+    let (_root, state, harness, _) = one_pass_tree(today, week);
+    let (one_today, one_week) = stats_windows(&state, &harness, today, week);
+    let two_today = stats_under(&state, &harness, today);
+    let two_week = stats_under(&state, &harness, week);
+    assert_eq!(without_shares(&one_today), two_today);
+    assert_eq!(one_week, two_week, "the week keeps no shares");
+    assert!(one_week.by_session.is_none() && one_today.by_session.is_some());
+    // The windows are not one another's: the fixture tells them apart.
+    // approved, unproven, declined, answered, continued, land prompts,
+    // resumed, escalated, relaunched, upgraded.
+    let continued = approvals::KEEP_ROWS as u64 + 1;
+    assert_eq!(
+        counts(&two_today),
+        [2, 1, 1, 2, continued, 2, 2, 1, 1, 1],
+        "{two_today:#?}"
+    );
+    assert_eq!(
+        counts(&two_week),
+        [3, 1, 2, 2, continued + 1, 2, 2, 3, 2, 1],
+        "{two_week:#?}"
+    );
+    assert_eq!(
+        (two_today.human_wait_ms, two_today.limit_wait_ms),
+        (10 * 60_000 + 120_000, 20 * 60_000)
+    );
+    assert_eq!(
+        (two_week.human_wait_ms, two_week.limit_wait_ms),
+        (70 * 60_000 + 120_000, 50 * 60_000)
+    );
+    assert_eq!(
+        (two_today.bad, two_week.bad),
+        (2, 4),
+        "s-2's bad lines, its ledger's and its journal's, are the week's"
+    );
+    assert!(two_today.cut && two_week.cut, "s-3 began inside both");
+    assert_eq!((two_today.sessions, two_week.sessions), (2, 3));
+    // NEGATIVE CONTROL: today folding s-2's untouched file.
+    let mut forced = HarnessStats::new(today);
+    for line in tail_lines(&state.join("drive").join("s-2.jsonl"), READ_MAX_ROWS).expect("s-2") {
+        fold_ledger_line(&mut forced, &line);
+    }
+    assert_eq!(
+        forced.bad, 1,
+        "CONTROL: an untouched file folded is not left unread"
+    );
+}
+
+/// ONE READ PER FILE PER READING (§10.0's "one reading"): the one pass
+/// reads every file a window can hold a row of exactly once — the counting
+/// seam on its reader — and a file last written before both windows not at
+/// all. NEGATIVE CONTROL: two windows read as two passes (the reading
+/// before §10.3) read every file written today twice.
+#[test]
+fn a_reading_reads_each_file_once() {
+    let now = now_ms();
+    let today = now - 5 * 3_600_000;
+    let week = now - 7 * 86_400_000;
+    let (_root, state, harness, files) = one_pass_tree(today, week);
+    let mut reads: BTreeMap<PathBuf, u32> = BTreeMap::new();
+    let mut counting = |path: &Path| {
+        *reads.entry(path.to_path_buf()).or_insert(0) += 1;
+        tail_lines(path, READ_MAX_ROWS)
+    };
+    let (one_today, one_week) = stats_windows_with(&state, &harness, today, week, &mut counting);
+    let s4 = state.join("drive").join("s-4.jsonl");
+    let expected: BTreeMap<PathBuf, u32> = files
+        .iter()
+        .filter(|path| **path != s4)
+        .map(|path| (path.clone(), 1))
+        .collect();
+    assert_eq!(reads, expected, "each file once; s-4 not at all");
+    assert_eq!(
+        (one_today, one_week),
+        stats_windows(&state, &harness, today, week),
+        "the seam reads what tail_lines reads"
+    );
+    // NEGATIVE CONTROL: a pass per window.
+    let mut twice: BTreeMap<PathBuf, u32> = BTreeMap::new();
+    for since in [today, week] {
+        let mut counting = |path: &Path| {
+            *twice.entry(path.to_path_buf()).or_insert(0) += 1;
+            tail_lines(path, READ_MAX_ROWS)
+        };
+        let _ = stats_windows_with(&state, &harness, since, since, &mut counting);
+    }
+    assert_eq!(twice[&files[0]], 2, "CONTROL: two passes read s-1 twice");
+}
+
+/// A TALLY PER SESSION (§10.3.3, item 2): today's shares sum, over every
+/// session, to today's totals — each counter and both waits — and each
+/// session's share is its own rows': `s-1`'s escalation time is its newest
+/// today's, the upgrade ledger's tab-less row holds its own share, and the
+/// cut file marks only its own session. NEGATIVE CONTROLS: a session with
+/// no counted row today (`s-2`, untouched) has no share; a window built by
+/// `new` keeps none.
+#[test]
+fn todays_shares_sum_to_its_totals_and_a_cut_marks_its_own_session() {
+    let now = now_ms();
+    let today = now - 5 * 3_600_000;
+    let week = now - 7 * 86_400_000;
+    let (_root, state, harness, _) = one_pass_tree(today, week);
+    let (acc, _) = stats_windows(&state, &harness, today, week);
+    let shares = acc.by_session.clone().expect("today keeps shares");
+    let sum = shares.values().fold(Tally::default(), |mut sum, t| {
+        sum.approved += t.approved;
+        sum.unproven += t.unproven;
+        sum.declined += t.declined;
+        sum.answered += t.answered;
+        sum.continued += t.continued;
+        sum.land_prompts += t.land_prompts;
+        sum.resumed += t.resumed;
+        sum.escalated += t.escalated;
+        sum.human_wait_ms += t.human_wait_ms;
+        sum.limit_wait_ms += t.limit_wait_ms;
+        sum.relaunched += t.relaunched;
+        sum.upgraded += t.upgraded;
+        sum
+    });
+    let totals = Tally {
+        approved: acc.approved,
+        unproven: acc.unproven,
+        declined: acc.declined,
+        answered: acc.answered,
+        continued: acc.continued,
+        land_prompts: acc.land_prompts,
+        resumed: acc.resumed,
+        escalated: acc.escalated,
+        human_wait_ms: acc.human_wait_ms,
+        limit_wait_ms: acc.limit_wait_ms,
+        relaunched: acc.relaunched,
+        upgraded: acc.upgraded,
+        last_escalated_ms: None,
+        cut: false,
+    };
+    assert_eq!(sum, totals, "{shares:#?}");
+    let s1 = &shares["s-1"];
+    assert_eq!(
+        (
+            s1.approved,
+            s1.unproven,
+            s1.answered,
+            s1.land_prompts,
+            s1.upgraded
+        ),
+        (2, 1, 2, 2, 1)
+    );
+    assert_eq!(s1.last_escalated_ms, Some(today + 2 * 3_600_000));
+    assert!(!s1.cut, "s-1 is whole");
+    assert!(shares["s-3"].cut, "the cut file's own session");
+    assert_eq!(shares["s-3"].continued, approvals::KEEP_ROWS as u64);
+    assert_eq!(shares["-"].relaunched, 1, "the tab-less upgrade row");
+    // NEGATIVE CONTROLS.
+    assert!(!shares.contains_key("s-2"), "untouched today: no share");
+    assert!(HarnessStats::new(today).by_session.is_none());
 }

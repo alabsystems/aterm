@@ -91,11 +91,11 @@ pub(crate) fn with_socket(argv: &[String], sock: Option<&str>) -> Vec<String> {
 /// Run `plan` on its own thread (gathering can take seconds), then open the file.
 /// `sock` is this instance's control socket. Failures are logged, never raised.
 pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
-    let spawned = std::thread::Builder::new()
-        .name("aterm-ledger-key".to_string())
-        .spawn(move || {
+    let spawned = crate::qos::spawn_lane_thread(
+        "aterm-ledger-key".to_string(),
+        crate::qos::Role::Background,
+        move || {
             // Waits on a CLI child the human is not blocked on.
-            crate::qos::set_self(crate::qos::Role::Background);
             let cli = aterm_cli();
             // `aterm.exe` is the CONSOLE image: started bare by the window (which
             // has no console) every key press opened a VISIBLE console window for
@@ -118,7 +118,8 @@ pub(crate) fn launch(plan: LedgerPlan, sock: Option<String>) {
                 ),
                 Err(e) => aterm_log::warn!("ledger key: cannot run {}: {e}", cli.display()),
             }
-        });
+        },
+    );
     if let Err(e) = spawned {
         aterm_log::warn!("ledger key: cannot spawn its thread: {e}");
     }

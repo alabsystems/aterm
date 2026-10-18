@@ -1,0 +1,32 @@
+# muse 1.4.10-R6427.1 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.105.0) running the real Muse Code, launched by path with a scratch `HOME`, a fake `META_API_KEY` and `--base-url http://127.0.0.1:<port>` (a local stub of Meta's model API, crates/aterm-lab) · the stub's call `muse.bash {command: "env | cut -d= -f1 | sort > envnames.txt"}` (no sandbox_permissions): the shell box asking stage by stage, before any key · the lab's random project dir is spelled /private/tmp/at.lab0 here, the lab's scratch home is spelled under /Users//person/ here
+
+  Muse Code 1.4.10
+
+  Rules loaded this session (in precedence order):
+  user: $CONFIG_DIR/AGENTS.md
+  project: none
+  Claude Code rules at /Users//person/Developer/scratch-lab/runs/m3/scratch/home/.claude/CLAUDE.md — not read; import into Muse Code with /rules
+  import.
+  Codex rules at /Users//person/Developer/scratch-lab/runs/m3/scratch/home/.codex/AGENTS.md — not read; import into Muse Code with /rules import.
+
+❯ hello there
+
+◆ Hi! I am the local lab stub, not a model. (reply 2)
+
+❯ toolstart
+
+◈ Calling tools (16s · esc to interrupt)
+
+── Voice input (⌥ + v to start) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Would you like to run the following command?
+
+  $ env | cut -d= -f1 | sort > envnames.txt
+  Skipped Stage 1/3: matched mode:on_request
+  Stage 3/3
+  Current argv: ["sort"]
+
+⟩ 1. Allow this stage once (y)
+  2. Abort the entire command (esc)
+Change approval defaults in /permissions
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab-stub · high · /private/tmp/at.lab0/proj · Auto-review

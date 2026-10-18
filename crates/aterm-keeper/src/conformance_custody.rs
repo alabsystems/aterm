@@ -26,9 +26,10 @@ use crate::core::{
     Rdev, RecordState, RelaunchBrake, Verdict, classify_death,
 };
 use crate::wire::{Birth, CAP_LINK, CAP_SENDS_BYE, MarkerRef, MasterHeader, PeerClass};
-use aterm_spec::derive::{
-    Model, keeper_death_judgement_model, keeper_relaunch_brake_model, pty_keeper_custody_model,
+use aterm_models_core::{
+    keeper_death_judgement_model, keeper_relaunch_brake_model, pty_keeper_custody_model,
 };
+use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
 
 const A: Rdev = 0x0f00_0010;
@@ -1137,6 +1138,12 @@ fn the_real_brake_conforms_to_the_brake_model() {
 
 /// The classifier over real wait statuses, read by the keeper's own exit
 /// watch, and the real core's judgement of a window that ended so.
+///
+/// Off Darwin the exit watch has no primitive (`ExitWatch::watch` answers
+/// `None`: a Linux pidfd cannot read a non-child's status, and the keeper
+/// serves only macOS), so there the parent's own `wait(2)` status stands in.
+/// It is the same kernel encoding the watch delivers, and the classifier and
+/// the core's judgement are still checked over it.
 #[test]
 fn the_classifier_judges_real_ends() {
     use std::process::{Command, Stdio};
@@ -1171,16 +1178,26 @@ fn the_classifier_judges_real_ends() {
             .stdin(Stdio::piped())
             .spawn()
             .expect("spawn");
+        #[cfg(target_vendor = "apple")]
         let watch = aterm_uds::exitwatch::ExitWatch::watch(child.id()).expect("watch");
         drop(child.stdin.take());
-        let _ = child.wait();
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(s) = watch.exit_status() {
-                return s;
+        let waited = child.wait();
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            waited.expect("wait").into_raw()
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let _ = waited;
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(s) = watch.exit_status() {
+                    return s;
+                }
+                assert!(started.elapsed().as_secs() < 60, "no status for {how}");
+                std::thread::yield_now();
             }
-            assert!(started.elapsed().as_secs() < 60, "no status for {how}");
-            std::thread::yield_now();
         }
     };
     let cases: Vec<(&str, i32)> = vec![

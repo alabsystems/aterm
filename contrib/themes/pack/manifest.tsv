@@ -1,0 +1,49 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# The aterm community theme pack: one row per theme. README.md says what each
+# column means and how to add a theme. aterm-theme-pack's build script reads
+# this file; `<id>.conf` and ATTRIBUTION.md are generated from it (never
+# edit them by hand).
+#
+# @collection <repo> <commit> <licence file>: where upstream/ comes from.
+# A built-in theme's source licence is LICENSES/<spdx>-<repo>.txt, found by
+# that rule from the built-in's own source (no row lists it).
+@collection	mbadolato/iTerm2-Color-Schemes	21f281d0834846eef984f75774638e7d16bac068	LICENSES/MIT-iTerm2-Color-Schemes.txt
+id	upstream	appearance	pair	author	project	project_url	licence	licence_files
+Andromeda	Andromeda	dark	-	Eliver Lara	EliverLara/Andromeda	https://github.com/EliverLara/Andromeda	MIT	LICENSES/MIT-Andromeda.txt
+Ayu	Ayu	dark	-	Konstantin Pschera	ayu-theme/ayu-colors	https://github.com/ayu-theme/ayu-colors	MIT	LICENSES/MIT-ayu-colors.txt
+Ayu Mirage	Ayu Mirage	dark	-	Konstantin Pschera	ayu-theme/ayu-colors	https://github.com/ayu-theme/ayu-colors	MIT	LICENSES/MIT-ayu-colors.txt
+Catppuccin Frappe	Catppuccin Frappe	dark	Catppuccin Latte	Catppuccin	catppuccin/catppuccin	https://github.com/catppuccin/catppuccin	MIT	LICENSES/MIT-catppuccin.txt
+Catppuccin Macchiato	Catppuccin Macchiato	dark	Catppuccin Latte	Catppuccin	catppuccin/catppuccin	https://github.com/catppuccin/catppuccin	MIT	LICENSES/MIT-catppuccin.txt
+Dawnfox	Dawnfox	light	Duskfox	EdenEast	EdenEast/nightfox.nvim	https://github.com/EdenEast/nightfox.nvim	MIT	LICENSES/MIT-nightfox.nvim.txt
+Dayfox	Dayfox	light	Nightfox	EdenEast	EdenEast/nightfox.nvim	https://github.com/EdenEast/nightfox.nvim	MIT	LICENSES/MIT-nightfox.nvim.txt
+Doom One	Doom One	dark	-	Henrik Lissner	doomemacs/themes	https://github.com/doomemacs/themes	MIT	LICENSES/MIT-doomemacs-themes.txt
+Duskfox	Duskfox	dark	Dawnfox	EdenEast	EdenEast/nightfox.nvim	https://github.com/EdenEast/nightfox.nvim	MIT	LICENSES/MIT-nightfox.nvim.txt
+Everforest Dark Med	Everforest Dark Med	dark	-	sainnhe	sainnhe/everforest	https://github.com/sainnhe/everforest	MIT	LICENSES/MIT-everforest.txt;LICENSES/MIT-everforest.iterm2.txt
+Flexoki Light	Flexoki Light	light	-	Steph Ango	kepano/flexoki	https://github.com/kepano/flexoki	MIT	LICENSES/MIT-flexoki.txt
+GitHub Dark Default	GitHub Dark Default	dark	GitHub Light Default	Primer	primer/github-vscode-theme	https://github.com/primer/github-vscode-theme	MIT	LICENSES/MIT-github-vscode-theme.txt
+GitHub Dark Dimmed	GitHub Dark Dimmed	dark	-	Primer	primer/github-vscode-theme	https://github.com/primer/github-vscode-theme	MIT	LICENSES/MIT-github-vscode-theme.txt
+GitHub Dark High Contrast	GitHub Dark High Contrast	dark	GitHub Light High Contrast	Primer	primer/github-vscode-theme	https://github.com/primer/github-vscode-theme	MIT	LICENSES/MIT-github-vscode-theme.txt
+GitHub Light Default	GitHub Light Default	light	GitHub Dark Default	Primer	primer/github-vscode-theme	https://github.com/primer/github-vscode-theme	MIT	LICENSES/MIT-github-vscode-theme.txt
+GitHub Light High Contrast	GitHub Light High Contrast	light	GitHub Dark High Contrast	Primer	primer/github-vscode-theme	https://github.com/primer/github-vscode-theme	MIT	LICENSES/MIT-github-vscode-theme.txt
+Horizon	Horizon	dark	-	Jonathan Olaleye	jolaleye/horizon-theme-vscode	https://github.com/jolaleye/horizon-theme-vscode	MIT	LICENSES/MIT-horizon-theme-vscode.txt
+Iceberg Dark	Iceberg Dark	dark	Iceberg Light	cocopon	cocopon/iceberg.vim	https://github.com/cocopon/iceberg.vim	MIT	LICENSES/MIT-iceberg.vim.txt
+Iceberg Light	Iceberg Light	light	Iceberg Dark	cocopon	cocopon/iceberg.vim	https://github.com/cocopon/iceberg.vim	MIT	LICENSES/MIT-iceberg.vim.txt
+Kanagawa Dragon	Kanagawa Dragon	dark	-	Tommaso Laurenzi	rebelot/kanagawa.nvim	https://github.com/rebelot/kanagawa.nvim	MIT	LICENSES/MIT-kanagawa.nvim.txt
+Kanagawa Lotus	Kanagawa Lotus	light	Kanagawa Wave	Tommaso Laurenzi	rebelot/kanagawa.nvim	https://github.com/rebelot/kanagawa.nvim	MIT	LICENSES/MIT-kanagawa.nvim.txt
+Kanagawa Wave	Kanagawa Wave	dark	Kanagawa Lotus	Tommaso Laurenzi	rebelot/kanagawa.nvim	https://github.com/rebelot/kanagawa.nvim	MIT	LICENSES/MIT-kanagawa.nvim.txt
+Melange Dark	Melange Dark	dark	Melange Light	Sergio Alejandro Vargas	savq/melange-nvim	https://github.com/savq/melange-nvim	MIT	LICENSES/MIT-melange-nvim.txt
+Melange Light	Melange Light	light	Melange Dark	Sergio Alejandro Vargas	savq/melange-nvim	https://github.com/savq/melange-nvim	MIT	LICENSES/MIT-melange-nvim.txt
+Moonfly	Moonfly	dark	-	bluz71	bluz71/vim-moonfly-colors	https://github.com/bluz71/vim-moonfly-colors	MIT	LICENSES/MIT-vim-moonfly-colors.txt
+Nightfox	Nightfox	dark	Dayfox	EdenEast	EdenEast/nightfox.nvim	https://github.com/EdenEast/nightfox.nvim	MIT	LICENSES/MIT-nightfox.nvim.txt
+Nordfox	Nordfox	dark	-	EdenEast	EdenEast/nightfox.nvim	https://github.com/EdenEast/nightfox.nvim	MIT	LICENSES/MIT-nightfox.nvim.txt
+Rose Pine	Rose Pine	dark	-	Rosé Pine	rose-pine/rose-pine-theme	https://github.com/rose-pine/rose-pine-theme	MIT	LICENSES/MIT-rose-pine-theme.txt
+Rose Pine Moon	Rose Pine Moon	dark	-	Rosé Pine	rose-pine/rose-pine-theme	https://github.com/rose-pine/rose-pine-theme	MIT	LICENSES/MIT-rose-pine-theme.txt
+Selenized Black	Selenized Black	dark	-	Jan Warchoł	jan-warchol/selenized	https://github.com/jan-warchol/selenized	MIT	LICENSES/MIT-selenized.txt
+Snazzy	Snazzy	dark	-	Sindre Sorhus	sindresorhus/iterm2-snazzy	https://github.com/sindresorhus/iterm2-snazzy	MIT	LICENSES/MIT-iterm2-snazzy.txt
+Sonokai	Sonokai	dark	-	sainnhe	sainnhe/sonokai	https://github.com/sainnhe/sonokai	MIT	LICENSES/MIT-sonokai.txt
+Terafox	Terafox	dark	-	EdenEast	EdenEast/nightfox.nvim	https://github.com/EdenEast/nightfox.nvim	MIT	LICENSES/MIT-nightfox.nvim.txt
+TokyoNight Day	TokyoNight Day	light	TokyoNight Storm	Folke Lemaitre	folke/tokyonight.nvim	https://github.com/folke/tokyonight.nvim	Apache-2.0	LICENSES/Apache-2.0-tokyonight.nvim.txt
+TokyoNight Moon	TokyoNight Moon	dark	-	Folke Lemaitre	folke/tokyonight.nvim	https://github.com/folke/tokyonight.nvim	Apache-2.0	LICENSES/Apache-2.0-tokyonight.nvim.txt
+TokyoNight Storm	TokyoNight Storm	dark	TokyoNight Day	Folke Lemaitre	folke/tokyonight.nvim	https://github.com/folke/tokyonight.nvim	Apache-2.0	LICENSES/Apache-2.0-tokyonight.nvim.txt

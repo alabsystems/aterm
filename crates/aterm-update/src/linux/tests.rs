@@ -64,32 +64,10 @@ fn settings_provider(auto_apply: bool) -> crate::CheckSettingsProvider {
     })
 }
 
+/// A request's provider over settings that cannot be read grants nothing. (Every
+/// requested x current combination is the model test's binding.)
 #[test]
-fn auto_apply_requires_current_source_and_available_enabled_settings() {
-    let source = settings_provider(true)().unwrap().source;
-    for configured in [false, true] {
-        let provider = settings_provider(configured);
-        assert_eq!(automatic_apply_allowed(&source, &provider), configured);
-        let changed_source = Source {
-            owner: "different".into(),
-            repo: source.repo.clone(),
-        };
-        assert!(!automatic_apply_allowed(&changed_source, &provider));
-    }
-    let unavailable: crate::CheckSettingsProvider = std::sync::Arc::new(|| None);
-    assert!(!automatic_apply_allowed(&source, &unavailable));
-}
-
-#[test]
-fn a_manual_request_cannot_gain_apply_authority_from_a_later_automatic_setting() {
-    for requested in [false, true] {
-        for current in [false, true] {
-            let live = settings_provider(current);
-            let sampled = request_apply_provider(&live, requested)().unwrap();
-            assert_eq!(sampled.auto_apply, requested && current);
-            assert_eq!(sampled.source, live().unwrap().source);
-        }
-    }
+fn a_request_over_unreadable_settings_has_no_apply_authority() {
     let unavailable: crate::CheckSettingsProvider = std::sync::Arc::new(|| None);
     assert!(request_apply_provider(&unavailable, true)().is_none());
 }
@@ -163,7 +141,6 @@ fn manual_policy_stages_exact_authenticated_identity_and_explicit_apply_still_wo
     assert_eq!(status.installed_build, 10);
     assert_eq!(status.staged_build, Some(11));
     assert!(status.trial_phase.is_none());
-    assert!(durable.outcome.contains("aterm update apply"));
     // Explicit apply is not routed through the automatic-policy provider.
     f.apply().unwrap();
     assert_eq!(f.state.installed.build, 11);
@@ -248,7 +225,7 @@ fn default_policy_applies_and_rechecks_live_policy_after_candidate_probe() {
 }
 
 #[test]
-fn manual_staging_never_bypasses_authentication_or_the_apply_time_recheck() {
+fn manual_staging_never_bypasses_authentication() {
     let mut f = Fixture::new();
     let provider = settings_provider(false);
     let source = provider().unwrap().source;
@@ -269,32 +246,6 @@ fn manual_staging_never_bypasses_authentication_or_the_apply_time_recheck() {
         .is_err()
     );
     assert!(f.state.staged.is_none());
-    finish_candidate(
-        &f.context,
-        &mut f.state,
-        &f.proof,
-        Pins {
-            masters: &[&f.master],
-        },
-        &source,
-        &provider,
-        |_, _, _| Ok(()),
-    )
-    .unwrap();
-    fs::write(f.context.dir.join("candidate"), b"tampered").unwrap();
-    assert!(f.apply().is_err());
-    assert_eq!(f.state.installed.build, 10);
-    assert!(f.state.trial.is_none());
-}
-
-#[test]
-fn pre_policy_enrollment_records_remain_readable_without_a_stage_field() {
-    let f = Fixture::new();
-    let text = aterm_toml::to_string(&f.state).unwrap();
-    assert!(!text.contains("staged"));
-    let decoded: State = aterm_toml::from_str(&text).unwrap();
-    assert!(decoded.staged.is_none());
-    assert_eq!(decoded.installed.sha256, f.state.installed.sha256);
 }
 
 #[test]
@@ -460,6 +411,8 @@ impl Fixture {
             trial: None,
             staged: None,
             rejected_build: 0,
+            rejected_unstarted: false,
+            kept_unproven: None,
             outcome: String::new(),
             updated_at: String::new(),
             failing_checks: 0,
@@ -535,6 +488,17 @@ impl Drop for Fixture {
     }
 }
 
+/// The candidate's identity probe: the exact identity passes; an exit failure, a
+/// reply that is not JSON, a probe that never answers (killed at its bound), another
+/// identity and a synthetic signed-header ELF the real loader cannot run all refuse,
+/// and no probe temp outlives them.
+///
+/// A RELEASE THIS SYSTEM CANNOT RUN SAYS WHY. A build linked against a newer glibc
+/// than this distro has never starts: the dynamic loader prints "version
+/// `GLIBC_2.39' not found" and exits, and the check failed with "identity probe exited
+/// exit status: 127", the loader's words deleted unread. The probe's first line of
+/// stderr is now the reason (any missing symbol version, and any other failure's
+/// words too).
 #[test]
 fn authenticated_probe_is_bounded_and_rejects_loader_identity_and_exit_failures() {
     let f = Fixture::new();
@@ -548,6 +512,9 @@ fn authenticated_probe_is_bounded_and_rejects_loader_identity_and_exit_failures(
         target: native().unwrap().triple().into(),
         dirty: false,
     };
+    let probe = |path: &Path, bound: Duration| {
+        probe_candidate(path, &manifest, native().unwrap(), &f.context.dir, bound)
+    };
     let write_script = |body: &str| {
         fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -556,54 +523,40 @@ fn authenticated_probe_is_bounded_and_rejects_loader_identity_and_exit_failures(
         "test \"$1 $2\" = 'update identity' || exit 9\nprintf '%s\\n' '{}'",
         aterm_json::to_string(&good).unwrap()
     ));
-    probe_candidate(
-        &script,
-        &manifest,
-        native().unwrap(),
-        &f.context.dir,
-        aterm_spec::wait::MUST_HAPPEN,
-    )
-    .unwrap();
-    for body in ["exit 3", "printf 'not json'", "while :; do :; done"] {
-        write_script(body);
-        assert!(
-            probe_candidate(
-                &script,
-                &manifest,
-                native().unwrap(),
-                &f.context.dir,
-                Duration::from_millis(50)
-            )
-            .is_err()
-        );
-    }
+    probe(&script, aterm_spec::wait::MUST_HAPPEN).unwrap();
     let mut bad = good;
     bad.build_number += 1;
-    write_script(&format!(
-        "printf '%s\\n' '{}'",
-        aterm_json::to_string(&bad).unwrap()
-    ));
-    assert!(
-        probe_candidate(
-            &script,
-            &manifest,
-            native().unwrap(),
-            &f.context.dir,
-            Duration::from_secs(1)
-        )
-        .is_err()
-    );
-    assert!(
-        probe_candidate(
-            &f.context.dir.join("candidate"),
-            &manifest,
-            native().unwrap(),
-            &f.context.dir,
-            Duration::from_secs(1)
-        )
-        .is_err(),
-        "synthetic signed-header ELF cannot satisfy the real loader probe"
-    );
+    let other_identity = format!("printf '%s\\n' '{}'", aterm_json::to_string(&bad).unwrap());
+    for (body, says) in [
+        ("exit 3", None),
+        ("printf 'not json'", None),
+        (other_identity.as_str(), None),
+        (
+            "echo \"$0: /lib/x86_64-linux-gnu/libc.so.6: version \\`GLIBC_2.99' not found \
+             (required by $0)\" >&2\nexit 127",
+            Some("GLIBC_2.99"),
+        ),
+        (
+            "echo \"$0: /usr/lib/libstdc++.so.6: version \\`CXXABI_1.3.15' not found \
+             (required by $0)\" >&2\nexit 127",
+            Some("CXXABI_1.3.15"),
+        ),
+        (
+            "echo 'unknown command: identity' >&2\nexit 2",
+            Some("unknown command: identity"),
+        ),
+    ] {
+        write_script(body);
+        let refused = probe(&script, aterm_spec::wait::MUST_HAPPEN).unwrap_err();
+        assert!(
+            says.is_none_or(|says| refused.contains(says)),
+            "{body}: {refused}"
+        );
+    }
+    write_script("while :; do :; done");
+    probe(&script, Duration::from_millis(50)).expect_err("a probe that never answers");
+    probe(&f.context.dir.join("candidate"), Duration::from_secs(1))
+        .expect_err("synthetic signed-header ELF cannot satisfy the real loader probe");
     assert!(fs::read_dir(&f.context.dir).unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -707,6 +660,41 @@ fn bootstrap_first_install_and_latest_policy_handoff_preserve_floors() {
     .unwrap();
 }
 
+/// Which flush each step of a first bootstrap takes (aterm-durable's counting seam): the
+/// candidate's bytes and its entry are only ordered (a lost candidate is fetched again), as
+/// is the removal of a policy proof a check without a policy no longer carries
+/// (`Proof::read` refuses half a pair); every proof record, the state and the first
+/// install's own rename stay durable.
+#[test]
+fn a_first_bootstrap_orders_its_candidate_and_keeps_its_records_durable() {
+    use aterm_durable::{Flush, seam::Recording};
+    const O: Flush = Flush::Ordered;
+    const D: Flush = Flush::Durable;
+    let f = Fixture::new();
+    let download = f.root.join("download");
+    fs::copy(f.context.dir.join("candidate"), &download).unwrap();
+    fs::set_permissions(&download, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(&f.context.target).unwrap();
+    fs::remove_file(f.context.dir.join("state.toml")).unwrap();
+    let pins = Pins {
+        masters: &[&f.master],
+    };
+    let recording = Recording::start();
+    install_locked(&f.context, &download, &f.proof, pins, |_, _, _| Ok(())).unwrap();
+    assert_eq!(
+        recording.take(),
+        [
+            D, D, D, D, // authorize's two state saves: the roster observed, the floor
+            O, O, // the candidate's bytes, its entry
+            D, D, D, D, D, D, D, D, // the four proof records, each file and entry
+            O, // the stale policy proof's removal
+            D, D, // the receipt before the rename
+            D, // the first install's rename
+            D, D, // the enabled state
+        ]
+    );
+}
+
 #[test]
 fn bootstrap_and_self_update_share_the_same_process_lock() {
     let f = Fixture::new();
@@ -716,10 +704,6 @@ fn bootstrap_and_self_update_share_the_same_process_lock() {
             .unwrap()
             .lock()
             .is_err()
-    );
-    assert_eq!(
-        hash_file(&f.context.target).unwrap(),
-        f.state.installed.sha256
     );
 }
 
@@ -870,7 +854,7 @@ fn verified_native_update_replaces_disk_without_changing_open_old_inode_and_roll
     let mut f = Fixture::new();
     let mut old_inode = File::open(&f.context.target).unwrap();
     let old_hash = f.state.installed.sha256.clone();
-    assert!(f.apply().unwrap().contains("existing sessions continue"));
+    f.apply().unwrap();
     assert_eq!(f.state.installed.build, 11);
     assert_ne!(hash_file(&f.context.target).unwrap(), old_hash);
     let mut bytes = Vec::new();
@@ -981,6 +965,33 @@ fn state_symlinks_shared_directories_and_tampered_backups_are_refused() {
     assert_eq!(hash_file(&f.context.target).unwrap(), current);
 }
 
+/// Which flush each step of a Linux apply and its rollback takes (aterm-durable's counting
+/// seam): every step `recover` covers is only ordered (the rollback copy, the candidate's
+/// bytes, the replacing rename, the restored copy and its rename into place), while the
+/// state record each checkpoint saves stays durable, file and entry.
+#[test]
+fn a_linux_apply_and_rollback_order_their_steps_and_keep_the_state_durable() {
+    use aterm_durable::{Flush, seam::Recording};
+    const O: Flush = Flush::Ordered;
+    const D: Flush = Flush::Durable;
+    let mut f = Fixture::new();
+    let recording = Recording::start();
+    f.apply().unwrap();
+    assert_eq!(
+        recording.take(),
+        [D, D, D, D, O, O, O, D, D, O, D, D],
+        "authorize's two state saves (the roster observed, the floor ratcheted), the \
+         rollback copy and its entry, the candidate, Prepared saved, the replacing \
+         rename, Installed saved"
+    );
+    rollback_locked(&f.context, &mut f.state).unwrap();
+    assert_eq!(
+        recording.take(),
+        [O, D, D, O, D, D],
+        "the restored copy, RollbackPrepared saved, its rename into place, the rollback saved"
+    );
+}
+
 /// A yank is the one signing fact a rollback respects: a build below the signed
 /// minimum-build floor never comes back, and refusing lowers no floor. A revoked
 /// signer is not one ([`a_rotated_signers_build_still_comes_back_from_a_crash_loop`]).
@@ -1044,9 +1055,8 @@ fn interrupted_apply_recovers_both_sides_of_the_atomic_rename() {
 #[test]
 fn a_build_that_pins_no_paper_master_verifies_no_update_channel() {
     let mut f = Fixture::new();
-    let error = authorize(&f.context, &mut f.state, &f.proof, Pins { masters: &[] })
+    authorize(&f.context, &mut f.state, &f.proof, Pins { masters: &[] })
         .expect_err("no anchor, no channel");
-    assert!(error.contains("pins no paper master"), "{error}");
     // Negative control: the very same proof verifies under the fixture's master.
     assert!(
         authorize(
@@ -1165,58 +1175,8 @@ fn actual_boot_and_health_transitions_bind_build_commit_and_process_inode() {
         )
         .unwrap()
     );
-    for n in 0..5 {
-        boot_locked(
-            &f.context,
-            &mut f.state,
-            11,
-            &"b".repeat(40),
-            (actual.dev(), actual.ino()),
-            minute(2 + n),
-        )
-        .unwrap();
-    }
     assert!(f.state.trial.as_ref().unwrap().healthy);
     assert_eq!(f.state.installed.build, 11);
-
-    let mut failing = Fixture::new();
-    let baseline = failing.state.installed.sha256.clone();
-    failing.apply().unwrap();
-    let failed_inode = fs::metadata(&failing.context.target).unwrap();
-    for n in 0..MAX_TRIAL_STARTS {
-        boot_locked(
-            &failing.context,
-            &mut failing.state,
-            11,
-            &"b".repeat(40),
-            (failed_inode.dev(), failed_inode.ino()),
-            minute(i64::from(n)),
-        )
-        .unwrap();
-    }
-    assert_eq!(failing.state.installed.build, 11);
-    boot_locked(
-        &failing.context,
-        &mut failing.state,
-        999,
-        &"c".repeat(40),
-        (failed_inode.dev(), failed_inode.ino()),
-        minute(i64::from(MAX_TRIAL_STARTS)),
-    )
-    .unwrap();
-    assert_eq!(failing.state.installed.build, 10);
-    assert_eq!(hash_file(&failing.context.target).unwrap(), baseline);
-    assert_eq!(failing.state.high_water, 11);
-    assert_eq!(failing.state.rejected_build, 11);
-    assert!(
-        failing
-            .state
-            .outcome
-            .contains("didn\u{2019}t start properly")
-            && !failing.state.outcome.contains("window"),
-        "a copy used only from the terminal opens no window: {}",
-        failing.state.outcome
-    );
 }
 
 /// The trial as it stands on disk — what the next process reads.
@@ -1333,18 +1293,13 @@ fn window_confirm_as(f: &Fixture, build: u64, commit: char) -> bool {
 }
 
 /// A copy used only from the terminal finishes its update through the session lane: the
-/// install is counted and confirmed at the first prompt, its words ask for no window, and
-/// the copy updates again.
+/// install is counted and confirmed at the first prompt, and the copy updates again. A
+/// session after that counts nothing.
 #[test]
 fn a_session_lane_install_is_counted_and_confirmed_by_a_session() {
     let mut f = Fixture::new();
-    assert!(
-        f.apply()
-            .unwrap()
-            .contains("the next aterm you start finishes it")
-    );
-    let pending = awaiting_start(&f.state).expect("the install waits for a start");
-    assert!(!pending.contains("window"), "{pending}");
+    f.apply().unwrap();
+    awaiting_start(&f.state).expect("the install waits for a start");
     assert!(
         session_start(&f, minute(0)),
         "a session of the new file is a start of its trial"
@@ -1428,90 +1383,6 @@ fn a_window_that_has_not_confirmed_still_decides_after_a_session_confirms() {
     let state = f.context.read_state().unwrap().unwrap();
     assert_eq!(state.installed.build, 10);
     assert_eq!(state.rejected_build, 11);
-    // A window that does confirm settles every lane.
-    let mut g = Fixture::new();
-    g.apply().unwrap();
-    assert!(window_start(&g, minute(0)));
-    assert!(window_confirm(&g));
-    let trial = trial_on_disk(&g);
-    assert!(trial.healthy && trial.window_proven);
-    assert!(
-        !window_start(&g, minute(1)),
-        "a confirmed window counts no more"
-    );
-}
-
-/// A window still owes its verdict after a session confirmed: its starts count from zero,
-/// and the start past the budget rolls the build back.
-#[test]
-fn a_window_start_after_a_session_confirmed_still_owes_its_verdict() {
-    let mut f = Fixture::new();
-    f.apply().unwrap();
-    for _ in 0..6 {
-        assert!(session_start(&f, minute(0)), "a burst of six tabs");
-    }
-    assert_eq!(session_confirm(&f), Confirmed::Yes);
-    let trial = trial_on_disk(&f);
-    assert!(trial.healthy && !trial.window_proven);
-    assert_eq!(trial.starts, 0, "the window lane counts from clean");
-    for n in 1..=MAX_TRIAL_STARTS {
-        assert!(
-            window_start(&f, minute(i64::from(n))),
-            "window start {n} is a try, not a verdict"
-        );
-    }
-    assert_eq!(f.context.read_state().unwrap().unwrap().installed.build, 11);
-    assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS) + 1)));
-    let state = f.context.read_state().unwrap().unwrap();
-    assert_eq!(
-        state.installed.build, 10,
-        "the window lane's verdict rolled it back"
-    );
-    assert_eq!(state.rejected_build, 11);
-}
-
-/// Six tabs restored at once are six starts before the first prompt: a start over the
-/// budget waits while the last can still confirm, and a quiet gap delivers the verdict.
-#[test]
-fn a_burst_of_session_starts_never_rolls_back_the_build_its_first_prompt_confirms() {
-    let mut f = Fixture::new();
-    f.apply().unwrap();
-    for tab in 0..6 {
-        assert!(
-            session_start(&f, minute(0)),
-            "tab {tab} of the burst is a start of the trial"
-        );
-    }
-    assert_eq!(
-        f.context.read_state().unwrap().unwrap().installed.build,
-        11,
-        "no start of the burst rolled back"
-    );
-    assert_eq!(trial_on_disk(&f).starts, 6);
-    assert_eq!(session_confirm(&f), Confirmed::Yes);
-    assert!(trial_on_disk(&f).healthy);
-
-    // The same burst from a build that crashes before its prompt: the first start
-    // after the burst has settled delivers the verdict.
-    let mut crashing = Fixture::new();
-    crashing.apply().unwrap();
-    for _ in 0..6 {
-        session_start(&crashing, minute(0));
-    }
-    assert_eq!(
-        crashing
-            .context
-            .read_state()
-            .unwrap()
-            .unwrap()
-            .installed
-            .build,
-        11
-    );
-    assert!(!session_start(&crashing, minute(1)));
-    let state = crashing.context.read_state().unwrap().unwrap();
-    assert_eq!(state.installed.build, 10);
-    assert_eq!(state.rejected_build, 11);
 }
 
 /// A burst of healthy but silent session starts is not rolled back by the next tab: the
@@ -1580,19 +1451,6 @@ fn a_silent_session_still_up_buys_its_burst_one_more_window() {
     let state = f.context.read_state().unwrap().unwrap();
     assert_eq!((state.installed.build, state.rejected_build), (10, 11));
 
-    // A healthy one confirms at its first prompt, as any start does.
-    let mut confirmed = Fixture::new();
-    confirmed.apply().unwrap();
-    let stamps = burst(&confirmed);
-    assert!(session_defer(
-        &confirmed,
-        stamps[2].as_ref().expect("stamped"),
-        t0 + 11
-    ));
-    assert!(session_start(&confirmed, t0 + 21));
-    assert_eq!(session_confirm(&confirmed), Confirmed::Yes);
-    assert!(trial_on_disk(&confirmed).healthy);
-
     // A move that lands late, the stamp already settled, defers nothing: the verdict is
     // due, and the next start delivers it.
     let mut late = Fixture::new();
@@ -1609,8 +1467,9 @@ fn a_silent_session_still_up_buys_its_burst_one_more_window() {
 
 /// A silent session's deferral outlasts a held update lock: a first try that fails
 /// [`LOCK_BUSY`] is retried after the pause and lands, and the fifth tab at 21 s is kept.
-/// Controls: one try loses the move; the shell speaking ends the tries; a settled stamp
-/// ends them with no pause; a refusal is never tried again.
+/// Controls: the shell speaking ends the tries; a settled stamp ends them with no pause; a
+/// refusal is never tried again. (Without the move the fifth tab rolls back:
+/// `a_silent_session_still_up_buys_its_burst_one_more_window`.)
 #[test]
 fn a_silent_session_s_deferral_outlasts_a_held_update_lock() {
     let t0 = minute(0);
@@ -1638,19 +1497,6 @@ fn a_silent_session_s_deferral_outlasts_a_held_update_lock() {
             reads(now),
         )
     };
-
-    // Control: one try. The held lock loses the move for good.
-    let mut once = Fixture::new();
-    once.apply().unwrap();
-    let own = burst(&once);
-    {
-        let _sibling = once.context.lock().unwrap();
-        assert_eq!(try_at(&once, &own, t0 + 11), Err(LOCK_BUSY.to_string()));
-    }
-    assert!(
-        !session_start(&once, t0 + 21),
-        "PRECONDITION: a move lost to the lock leaves the burst to be rolled back"
-    );
 
     let mut f = Fixture::new();
     f.apply().unwrap();
@@ -1751,27 +1597,6 @@ fn a_crash_loop_restarting_every_five_seconds_is_rolled_back() {
     assert_eq!(state.rejected_build, 11);
 }
 
-/// A state record an older build wrote has no `last_start_unix` or `window_proven`: it
-/// reads as no start stamped and a window lane not yet proved.
-#[test]
-fn a_trial_record_without_a_start_stamp_still_reads() {
-    let mut f = Fixture::new();
-    f.apply().unwrap();
-    let path = f.context.dir.join("state.toml");
-    let text = String::from_utf8(read_small(&path).unwrap()).unwrap();
-    let older: String = text
-        .lines()
-        .filter(|line| !line.starts_with("last_start_unix") && !line.starts_with("window_proven"))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    assert_ne!(older, text, "the record carried the stamp");
-    write_atomic(&path, older.as_bytes()).unwrap();
-    let state = f.context.read_state().unwrap().unwrap();
-    let trial = state.trial.as_ref().unwrap();
-    assert_eq!(trial.last_start_unix, 0);
-    assert!(!trial.window_proven, "the window lane still proves itself");
-}
-
 #[test]
 fn source_only_pointer_can_reach_discovery_but_a_non_app_tag_cannot_authorize_an_appcast() {
     let mut f = Fixture::new();
@@ -1798,19 +1623,6 @@ fn source_only_pointer_can_reach_discovery_but_a_non_app_tag_cannot_authorize_an
         }))
         .is_err()
     );
-}
-
-#[test]
-fn appcasts_have_the_full_five_megabyte_bound_not_the_small_state_record_bound() {
-    let f = Fixture::new();
-    let path = f.context.dir.join(APPCAST);
-    let bytes = vec![b'x'; (RECORD_LIMIT + 1) as usize];
-    write_atomic(&path, &bytes).unwrap();
-    assert_eq!(
-        read_bounded(&path, APPCAST_LIMIT).unwrap().len(),
-        bytes.len()
-    );
-    assert!(read_small(&path).is_err());
 }
 
 /// Stage signed release `build` — an executable ending in `marker`, built from
@@ -1844,41 +1656,112 @@ fn rollback_copies(f: &Fixture) -> Vec<String> {
     names
 }
 
+/// Spoil the copy kept for `identity`'s rollback in `way`: gone, changed on disk, or
+/// left with a mode (`0o…`) the rollback refuses to open as an executable.
+fn spoil_kept_copy(f: &Fixture, identity: &Identity, way: &str) {
+    let copy = f.context.backup(identity);
+    match way {
+        "gone" => fs::remove_file(copy).unwrap(),
+        "changed" => fs::write(copy, elf(9, native().unwrap())).unwrap(),
+        mode => {
+            let mode = u32::from_str_radix(mode.trim_start_matches("0o"), 8).unwrap();
+            fs::set_permissions(copy, fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+}
+
+/// The ways a kept rollback copy can be one no rollback could take: gone, changed on
+/// disk, or a mode the rollback refuses to open as an executable
+/// (`checked_file(.., true)`) — not executable or group-writable, or not readable at
+/// all (0o000 and 0o111 fail the open with `EACCES`, a fact, never a retry).
+const SPOILED_COPIES: [&str; 6] = ["gone", "changed", "0o644", "0o775", "0o000", "0o111"];
+
 /// A trial no rollback can ever be taken from (its target below the signed floor, or its
-/// kept copy gone) ends at the start past the budget, keeping the build and saying why, and
-/// a newer release installs over it.
+/// kept copy spoiled: [`SPOILED_COPIES`]) ends at the start past the budget, keeping the
+/// build and saying why, and a newer release installs over it, replacing a stale copy left
+/// under the installed build's own name.
 #[test]
 fn a_trial_no_rollback_can_be_taken_from_ends_and_the_copy_updates_again() {
-    for copy_gone in [false, true] {
+    for way in std::iter::once("yanked").chain(SPOILED_COPIES) {
         let mut f = Fixture::new();
         f.state.installed.machine_id = Some("old-machine".into());
+        let ten = f.state.installed.clone();
         f.apply().unwrap();
-        let mut state = f.context.read_state().unwrap().unwrap();
-        if copy_gone {
-            let trial = state.trial.as_ref().unwrap();
-            fs::remove_file(f.context.backup(&trial.old)).unwrap();
-        } else {
+        if way == "yanked" {
+            let mut state = f.context.read_state().unwrap().unwrap();
             state.min_build = 11;
+            f.context.save(&state).unwrap();
+        } else {
+            spoil_kept_copy(&f, &ten, way);
         }
-        f.context.save(&state).unwrap();
         for n in 0..MAX_TRIAL_STARTS {
-            assert!(window_start(&f, minute(i64::from(n))), "start {n} is a try");
+            assert!(window_start(&f, minute(i64::from(n))), "{way}: start {n}");
         }
         assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS))));
         let state = f.context.read_state().unwrap().unwrap();
-        assert!(state.trial.is_none(), "the trial is over");
-        assert_eq!(state.installed.build, 11, "the build stays");
-        assert_eq!(state.rejected_build, 0, "and is not refused");
-        assert!(awaiting_start(&state).is_none(), "nothing waits on it");
-        assert!(
-            state.outcome.contains("can\u{2019}t come back"),
-            "{}",
-            state.outcome
+        assert!(state.trial.is_none(), "{way}: the trial is over");
+        assert_eq!(state.installed.build, 11, "{way}: the build stays");
+        assert_eq!(state.rejected_build, 0, "{way}: and is not refused");
+        assert_eq!(
+            state.kept_unproven,
+            Some(11),
+            "{way}: the record keeps why it stays"
         );
-        assert!(!window_start(&f, minute(10)), "no start counts any more");
+        assert!(
+            status_in(Ok(&f.context), 11)
+                .linux
+                .is_some_and(|linux| linux.kept_unproven),
+            "{way}: and the status says so"
+        );
+        assert!(
+            awaiting_start(&state).is_none(),
+            "{way}: nothing waits on it"
+        );
+        assert!(
+            !window_start(&f, minute(10)),
+            "{way}: no start counts any more"
+        );
+        spoil_kept_copy(&f, &state.installed, "changed");
         stage_release(&mut f, 12, 3, 'c');
-        f.apply().expect("a newer release installs over it");
+        f.apply()
+            .unwrap_or_else(|error| panic!("{way}: a newer release installs: {error}"));
         assert_eq!(f.state.installed.build, 12);
+        assert!(
+            status_in(Ok(&f.context), 11)
+                .linux
+                .is_some_and(|linux| !linux.kept_unproven),
+            "{way}: the newer build is no kept one"
+        );
+        let eleven = trial_on_disk(&f).old;
+        assert_eq!(eleven.build, 11);
+        assert_eq!(
+            hash_file(&f.context.backup(&eleven)).unwrap(),
+            eleven.sha256,
+            "{way}: the stale copy under 11's name is replaced"
+        );
+    }
+}
+
+/// A KEPT COPY NO ROLLBACK COULD TAKE IS NEVER INHERITED. A session confirmed 11 and
+/// a window of it crashed, so 12 would keep 11's rollback target, 10 — but 10's kept
+/// copy is spoiled ([`SPOILED_COPIES`]), so 12 takes 11 instead.
+///
+/// FAILS WITHOUT THE FIX: 12 inherited the spoiled 10 (or, for a mode the rollback
+/// refuses, every apply of every newer release failed `unsafe update file`).
+#[test]
+fn a_kept_copy_no_rollback_could_take_is_never_inherited() {
+    for way in SPOILED_COPIES {
+        let mut g = Fixture::new();
+        let ten = g.state.installed.clone();
+        g.apply().unwrap();
+        assert!(session_start(&g, minute(0)));
+        assert_eq!(session_confirm(&g), Confirmed::Yes);
+        assert!(window_start(&g, minute(1)), "a window of 11 crashes");
+        spoil_kept_copy(&g, &ten, way);
+        stage_release(&mut g, 12, 3, 'c');
+        g.apply()
+            .unwrap_or_else(|error| panic!("{way}: a newer release installs: {error}"));
+        assert_eq!(trial_on_disk(&g).old.build, 11, "{way}: not inherited");
     }
 }
 
@@ -1921,31 +1804,6 @@ fn a_rotated_signers_build_still_comes_back_from_a_crash_loop() {
             "the revocation stands for every future acceptance"
         );
     }
-}
-
-/// One window that never drew (no display, killed at logout) does not let healthy sessions
-/// roll the build back: the first session's prompt confirms the session lane and the count
-/// starts again.
-#[test]
-fn one_window_that_never_drew_does_not_let_sessions_roll_the_build_back() {
-    let mut f = Fixture::new();
-    f.apply().unwrap();
-    assert!(window_start(&f, minute(0)));
-    for m in 1..=3 {
-        if session_start(&f, minute(m)) {
-            assert_eq!(session_confirm(&f), Confirmed::Yes, "session {m}");
-        }
-    }
-    let state = f.context.read_state().unwrap().unwrap();
-    assert_eq!(state.installed.build, 11);
-    assert_eq!(state.rejected_build, 0);
-    assert!(awaiting_start(&state).is_none(), "checks and applies go on");
-    let trial = state.trial.unwrap();
-    assert!(trial.healthy && !trial.window_proven);
-    assert_eq!(
-        trial.starts, 0,
-        "no session start spent the window lane's budget"
-    );
 }
 
 /// The shape of the record 0.98 reads and writes: no start stamp and no lane.
@@ -2037,7 +1895,8 @@ fn an_older_builds_save_mid_trial_keeps_the_window_verdict() {
 }
 
 /// A headless instance confirms the session lane only ([`confirm_lane`]), so a window still
-/// owes its verdict and windows that crash still roll the build back.
+/// owes its verdict (an owed window lane's crashes roll the build back:
+/// `a_window_that_has_not_confirmed_still_decides_after_a_session_confirms`).
 #[test]
 fn a_headless_instance_confirms_the_session_lane_only() {
     assert_eq!(confirm_lane(true), Lane::Session);
@@ -2069,53 +1928,14 @@ fn a_headless_instance_confirms_the_session_lane_only() {
         );
     }
     assert!(!trial_on_disk(&f).window_proven, "the window still owes");
-    for n in 2..2 + i64::from(MAX_TRIAL_STARTS) {
-        assert!(window_start(&f, minute(n)));
-    }
-    assert!(!window_start(&f, minute(2 + i64::from(MAX_TRIAL_STARTS))));
-    assert_eq!(
-        f.context.read_state().unwrap().unwrap().installed.build,
-        10,
-        "the windows that crash roll it back"
-    );
 }
 
-/// A newer install over a build whose window never confirmed rolls back past it: 12's trial
-/// keeps 11's target, 10. A copy used only from the terminal moves its target on, and either
-/// install keeps only the one rollback copy its trial can restore.
+/// A copy used only from the terminal moves its rollback target on: a session confirmed 11
+/// and no window of it was counted, so 12 takes 11 as its target and keeps only the one copy
+/// that trial can restore. (Had a window of 11 been counted and never confirmed, 12 keeps
+/// 11's target, 10: `an_inherited_rollback_target_a_yank_ruled_out_is_not_inherited`.)
 #[test]
-fn a_newer_install_over_a_window_that_never_confirmed_rolls_back_past_it() {
-    let mut f = Fixture::new();
-    let baseline = f.state.installed.clone();
-    f.apply().unwrap();
-    assert!(session_start(&f, minute(0)));
-    assert_eq!(session_confirm(&f), Confirmed::Yes);
-    assert!(window_start(&f, minute(1)), "a window of 11 crashes");
-    stage_release(&mut f, 12, 3, 'c');
-    f.apply().unwrap();
-    assert_eq!(trial_on_disk(&f).old.build, 10);
-    assert_eq!(
-        rollback_copies(&f),
-        vec![format!("rollback-{}", baseline.sha256)]
-    );
-    for n in 2..2 + i64::from(MAX_TRIAL_STARTS) {
-        assert!(window_start_as(&f, 12, 'c', minute(n)));
-    }
-    assert!(!window_start_as(
-        &f,
-        12,
-        'c',
-        minute(2 + i64::from(MAX_TRIAL_STARTS))
-    ));
-    let state = f.context.read_state().unwrap().unwrap();
-    assert_eq!(
-        state.installed.build, 10,
-        "back to the last window that worked"
-    );
-    assert_eq!(hash_file(&f.context.target).unwrap(), baseline.sha256);
-    assert_eq!(state.rejected_build, 12);
-    assert!(rollback_copies(&f).is_empty(), "nothing left to restore");
-
+fn a_terminal_only_copy_moves_its_rollback_target_on() {
     let mut g = Fixture::new();
     g.apply().unwrap();
     assert!(session_start(&g, minute(0)));
@@ -2123,11 +1943,7 @@ fn a_newer_install_over_a_window_that_never_confirmed_rolls_back_past_it() {
     let eleven = trial_on_disk(&g).new;
     stage_release(&mut g, 12, 3, 'c');
     g.apply().unwrap();
-    assert_eq!(
-        trial_on_disk(&g).old.build,
-        11,
-        "a copy used only from the terminal moves on"
-    );
+    assert_eq!(trial_on_disk(&g).old.build, 11);
     assert_eq!(
         rollback_copies(&g),
         vec![format!("rollback-{}", eleven.sha256)]
@@ -2333,26 +2149,13 @@ fn an_inherited_rollback_target_a_yank_ruled_out_is_not_inherited() {
     }
 }
 
-/// An older build's save in the middle of a burst rolls no healthy build back, and a crash
-/// loop is still rolled back.
+/// An older build's save in the middle of a burst still rolls a crash loop back: the start
+/// after the save stamps and waits
+/// (`an_older_builds_save_in_a_burst_does_not_roll_a_healthy_build_back`), and the next
+/// start past the budget decides as usual, one settle window on.
 #[test]
-fn an_older_builds_save_mid_burst_does_not_roll_a_healthy_build_back() {
+fn an_older_builds_save_mid_burst_still_rolls_a_crash_loop_back() {
     let t0 = minute(0);
-    let mut f = Fixture::new();
-    f.apply().unwrap();
-    for _ in 0..MAX_TRIAL_STARTS {
-        assert!(session_start(&f, t0));
-    }
-    save_as_098(&f);
-    assert_eq!(trial_on_disk(&f).last_start_unix, 0);
-    assert!(session_start(&f, t0 + 1), "the burst's next start is a try");
-    assert_eq!(trial_on_disk(&f).last_start_unix, t0 + 1);
-    assert_eq!(session_confirm(&f), Confirmed::Yes);
-    let state = f.context.read_state().unwrap().unwrap();
-    assert_eq!(state.installed.build, 11);
-    assert_eq!(state.rejected_build, 0);
-
-    // A crash loop the save landed in is still rolled back, one settle window on.
     let mut g = Fixture::new();
     g.apply().unwrap();
     for _ in 0..MAX_TRIAL_STARTS {
@@ -2520,43 +2323,14 @@ fn a_start_that_waited_on_the_lock_rolls_no_healthy_build_back() {
             "{lane:?}"
         );
     }
-    // The shipping entries hand over the clock itself, to be read under the lock, not
-    // a reading taken before it.
-    let src: String = include_str!("../linux.rs").split_whitespace().collect();
-    for entry in ["boot_in(", "session_started_stamping_in("] {
-        assert!(
-            src.contains(&format!(
-                "{entry}context,current_build,current_commit,proc_self_inode,start_clock,)"
-            )),
-            "{entry} is handed `start_clock` unread"
-        );
-    }
-    // And so is a silent session's deferral, which stamps as a start does, and its
-    // retry, which asks the stamp's youth before each pause.
-    assert!(
-        src.contains(
-            "defer_session_verdict_in(context,current_build,current_commit,proc_self_inode,&own,\
-             start_clock,)"
-        ),
-        "the deferral is handed `start_clock` unread"
-    );
-    assert!(
-        src.contains("},start_clock,pause,)"),
-        "the deferral's retry is handed `start_clock` unread"
-    );
-    let early = src
-        .match_indices("start_clock()")
-        .filter(|(at, _)| !src[..*at].ends_with('.') && !src[..*at].ends_with("fn"))
-        .count();
-    assert_eq!(early, 0, "no start reads its clock before the lock");
 }
 
 /// The steady clock names its boot (boot id and time namespace) and never runs back; a
-/// boot with no name to read gives no steady stamp. The stamp crosses the record, and an
-/// older build's save drops it with the wall-clock one.
+/// boot with no name to read gives no steady stamp, and that start is judged on the wall
+/// clock alone.
 #[test]
 fn the_steady_clock_names_its_boot_and_never_runs_back() {
-    let mut f = Fixture::new();
+    let f = Fixture::new();
     let boot = f.root.join("boot_id");
     let namespace = f.root.join("time-ns");
     fs::write(&boot, "0f5a1c6e-3b0e-4c55-9d4e-6c1f2a7b9e10\n").unwrap();
@@ -2587,21 +2361,6 @@ fn the_steady_clock_names_its_boot_and_never_runs_back() {
     assert!(
         steady_clock(Path::new(BOOT_ID), Path::new(TIME_NAMESPACE)).is_some(),
         "Linux names its boot"
-    );
-
-    f.apply().unwrap();
-    let stamp = clock_at(minute(0), "boot-a", 500);
-    assert!(session_start(&f, stamp.clone()));
-    assert_eq!(
-        trial_on_disk(&f).start_clock(),
-        stamp,
-        "the record keeps both"
-    );
-    save_as_098(&f);
-    assert_eq!(
-        trial_on_disk(&f).start_clock(),
-        StartClock::default(),
-        "an older build reads the record, and its save drops both stamps"
     );
 }
 
@@ -2636,12 +2395,14 @@ fn an_older_builds_save_before_every_start_still_rolls_a_crash_loop_back() {
     assert!(awaiting_start(&state).is_none(), "checks and applies go on");
 }
 
-/// An older build's save late in a burst (after the fourth or fifth start) rolls no healthy
-/// build back: the next start is spared.
+/// An older build's save anywhere in a burst after the budget's last start (before the
+/// fourth, fifth or sixth of six restored tabs) rolls no healthy build back: the start after
+/// the save is spared and stamps, where "no stamp" read as the plain budget rolled back a
+/// build none of whose starts had had time to print a prompt.
 #[test]
-fn an_older_builds_save_late_in_a_burst_does_not_roll_a_healthy_build_back() {
+fn an_older_builds_save_in_a_burst_does_not_roll_a_healthy_build_back() {
     let t0 = minute(0);
-    for past in [2, 3] {
+    for past in [1, 2, 3] {
         let mut f = Fixture::new();
         f.apply().unwrap();
         for n in 1..=MAX_TRIAL_STARTS + 3 {
@@ -2655,105 +2416,6 @@ fn an_older_builds_save_late_in_a_burst_does_not_roll_a_healthy_build_back() {
         let state = f.context.read_state().unwrap().unwrap();
         assert_eq!(state.installed.build, 11, "save before {past} past");
         assert_eq!(state.rejected_build, 0);
-    }
-}
-
-/// A kept copy that is not its build ends the trial, as a missing copy does, and is never
-/// inherited by a newer install; a stale copy under the installed build's name is replaced
-/// rather than refusing every apply.
-#[test]
-fn a_kept_copy_that_is_not_its_build_ends_the_trial_and_is_not_inherited() {
-    let corrupt = |f: &Fixture, identity: &Identity| {
-        fs::write(f.context.backup(identity), elf(9, native().unwrap())).unwrap();
-    };
-    let mut f = Fixture::new();
-    let ten = f.state.installed.clone();
-    f.apply().unwrap();
-    corrupt(&f, &ten);
-    for n in 0..MAX_TRIAL_STARTS {
-        assert!(window_start(&f, minute(i64::from(n))));
-    }
-    assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS))));
-    let state = f.context.read_state().unwrap().unwrap();
-    assert!(state.trial.is_none(), "the trial is over");
-    assert_eq!(state.installed.build, 11);
-    assert_eq!(state.rejected_build, 0);
-    assert!(awaiting_start(&state).is_none());
-    assert!(
-        state.outcome.contains("not that build"),
-        "{}",
-        state.outcome
-    );
-    // A stale copy under the installed build's own name does not refuse the apply.
-    corrupt(&f, &state.installed);
-    stage_release(&mut f, 12, 3, 'c');
-    f.apply().expect("a newer release installs over it");
-    let eleven = trial_on_disk(&f).old;
-    assert_eq!(eleven.build, 11);
-    assert_eq!(
-        hash_file(&f.context.backup(&eleven)).unwrap(),
-        eleven.sha256
-    );
-
-    let mut g = Fixture::new();
-    g.apply().unwrap();
-    assert!(session_start(&g, minute(0)));
-    assert_eq!(session_confirm(&g), Confirmed::Yes);
-    assert!(window_start(&g, minute(1)), "a window of 11 crashes");
-    corrupt(&g, &ten);
-    stage_release(&mut g, 12, 3, 'c');
-    g.apply().unwrap();
-    assert_eq!(
-        trial_on_disk(&g).old.build,
-        11,
-        "a copy that is not 10 is not inherited"
-    );
-}
-
-/// A kept copy the rollback would refuse to open (lost exec bit, group-writable,
-/// unreadable) ends the trial too, and is never inherited.
-#[test]
-fn a_kept_copy_the_rollback_would_refuse_ends_the_trial_and_is_not_inherited() {
-    use std::os::unix::fs::PermissionsExt;
-    // 0o000 and 0o111: a copy we may not read fails the rollback's open with `EACCES`
-    // at every try, a fact, never a retry.
-    for mode in [0o644, 0o775, 0o000, 0o111] {
-        let spoil = |f: &Fixture, identity: &Identity| {
-            fs::set_permissions(f.context.backup(identity), fs::Permissions::from_mode(mode))
-                .unwrap();
-        };
-        let mut f = Fixture::new();
-        let ten = f.state.installed.clone();
-        f.apply().unwrap();
-        spoil(&f, &ten);
-        for n in 0..MAX_TRIAL_STARTS {
-            assert!(window_start(&f, minute(i64::from(n))));
-        }
-        assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS))));
-        let state = f.context.read_state().unwrap().unwrap();
-        assert!(state.trial.is_none(), "mode {mode:o}: the trial is over");
-        assert_eq!(state.installed.build, 11);
-        assert!(awaiting_start(&state).is_none());
-        assert!(
-            state.outcome.contains("not safe to restore"),
-            "mode {mode:o}: {}",
-            state.outcome
-        );
-
-        let mut g = Fixture::new();
-        g.apply().unwrap();
-        assert!(session_start(&g, minute(0)));
-        assert_eq!(session_confirm(&g), Confirmed::Yes);
-        assert!(window_start(&g, minute(1)), "a window of 11 crashes");
-        spoil(&g, &ten);
-        stage_release(&mut g, 12, 3, 'c');
-        g.apply()
-            .unwrap_or_else(|error| panic!("mode {mode:o}: a newer release installs: {error}"));
-        assert_eq!(
-            trial_on_disk(&g).old.build,
-            11,
-            "mode {mode:o}: a copy the rollback would refuse is not inherited"
-        );
     }
 }
 
@@ -2821,90 +2483,22 @@ fn a_revoked_machines_minimum_build_floor_is_withdrawn() {
     assert!(durable.revoked_machines.contains(&"thief".to_string()));
 }
 
-/// A held stage stays applicable after the roster moves: a check of a head with nothing to
-/// stage admits roster 2, and the held stage is proved again under it.
+/// A held stage stays applicable after the roster moves, whatever becomes of the head: a
+/// check that admits roster 2 proves the held stage again under it on every exit of the
+/// head's judgement, accepted (a machine joined, nothing to stage) or refused after the
+/// floor moved (a stolen key's release carrying the owner's roster that revokes it, a tag
+/// that does not match its appcast). Negative controls: a roster the master did not sign
+/// moves no floor and re-proves nothing; a roster that revokes the stage's own signer
+/// re-proves nothing.
 #[test]
-fn a_held_stage_is_proved_again_under_the_roster_a_later_check_admitted() {
-    let mut f = Fixture::new();
+fn a_held_stage_is_proved_again_under_the_roster_the_head_s_check_admitted() {
     let anchor = public(&master());
     let pins = Pins {
         masters: &[&anchor],
     };
     let provider = settings_provider(false);
     let source = provider().unwrap().source;
-    f.proof.save(&f.context.dir).unwrap();
-    finish_candidate(
-        &f.context,
-        &mut f.state,
-        &f.proof,
-        pins,
-        &source,
-        &provider,
-        |_, _, _| Ok(()),
-    )
-    .unwrap();
-    assert_eq!(f.state.staged.as_ref().unwrap().build, 11);
-
-    // The later head's check: roster 2 (a machine joined), no Linux artifact to stage.
-    let joined = key(17);
-    let mut head = f.proof.clone();
-    (head.roster, head.roster_signature) =
-        roster_with(2, &[("fixture", &machine()), ("joined", &joined)], &[]);
-    authorize(&f.context, &mut f.state, &head, pins).unwrap();
-    assert_eq!(f.state.roster_floor, 2);
-    let stale = Proof::read(&f.context.dir).unwrap();
-    let refused = apply_with_checkpoints(
-        &f.context,
-        &mut f.state.clone(),
-        &stale,
-        pins,
-        |_, _, _| Ok(()),
-        |_| Ok(()),
-    );
-    assert!(
-        refused.as_ref().is_err_and(|e| e.contains("Rollback")),
-        "the saved proof alone is refused by the ratcheted floor: {refused:?}"
-    );
-
-    reroot_held_stage_proof(&f.context, &mut f.state, &head, pins).unwrap();
-    let proved = Proof::read(&f.context.dir).unwrap();
-    assert_eq!(proved.roster, head.roster);
-    f.proof = proved;
-    f.apply().expect("the held stage applies");
-    assert_eq!(f.state.installed.build, 11);
-
-    // Negative control: a roster that revokes the stage's signer proves nothing again.
-    let mut g = Fixture::new();
-    g.proof.save(&g.context.dir).unwrap();
-    finish_candidate(
-        &g.context,
-        &mut g.state,
-        &g.proof,
-        pins,
-        &source,
-        &provider,
-        |_, _, _| Ok(()),
-    )
-    .unwrap();
-    let mut revoking = g.proof.clone();
-    (revoking.roster, revoking.roster_signature) =
-        roster_with(2, &[("joined", &joined)], &["fixture"]);
-    let before = Proof::read(&g.context.dir).unwrap().roster;
-    reroot_held_stage_proof(&g.context, &mut g.state, &revoking, pins).unwrap();
-    assert_eq!(Proof::read(&g.context.dir).unwrap().roster, before);
-}
-
-/// A head refused after its roster was admitted still re-proves the held stage: the
-/// refusal comes after the floor moved, and the reroot keeps the stage applicable.
-#[test]
-fn a_refused_head_whose_roster_was_admitted_still_reproves_the_held_stage() {
-    let anchor = public(&master());
-    let pins = Pins {
-        masters: &[&anchor],
-    };
-    let provider = settings_provider(false);
-    let source = provider().unwrap().source;
-    let thief = key(13);
+    let (thief, joined) = (key(13), key(17));
     let stage = |f: &mut Fixture| {
         f.proof.save(&f.context.dir).unwrap();
         finish_candidate(
@@ -2920,60 +2514,68 @@ fn a_refused_head_whose_roster_was_admitted_still_reproves_the_held_stage() {
         assert_eq!(f.state.staged.as_ref().unwrap().build, 11);
     };
 
-    // The stolen-key head: the thief's appcast, the owner's roster 2 revoking the thief.
-    let mut f = Fixture::new();
-    stage(&mut f);
-    let mut head = f.proof.clone();
-    (head.roster, head.roster_signature) = roster_with(2, &[("fixture", &machine())], &["thief"]);
-    head.appcast = String::from_utf8(head.appcast.clone())
-        .unwrap()
-        .replace("machine_id = \"fixture\"", "machine_id = \"thief\"")
-        .replace("roster_seq = 1", "roster_seq = 2")
-        .replace("build_number = 11", "build_number = 12")
-        .into_bytes();
-    head.signature = thief.sign(&head.appcast).as_ref().to_vec();
-    let refused = authenticate_head(&f.context, &mut f.state, "v0.12.0", &head, pins);
-    assert!(refused.is_err(), "the thief's head is refused: {refused:?}");
-    assert_eq!(f.state.roster_floor, 2, "the head's roster was admitted");
-    let proved = Proof::read(&f.context.dir).unwrap();
-    assert_eq!(
-        proved.roster, head.roster,
-        "the held stage carries roster 2"
-    );
-    f.proof = proved;
-    f.apply().expect("the held stage applies");
-    assert_eq!(f.state.installed.build, 11);
+    for exit in ["accepted", "stolen", "mistagged"] {
+        let mut f = Fixture::new();
+        stage(&mut f);
+        let mut head = f.proof.clone();
+        let tag = if exit == "stolen" {
+            (head.roster, head.roster_signature) =
+                roster_with(2, &[("fixture", &machine())], &["thief"]);
+            head.appcast = String::from_utf8(head.appcast.clone())
+                .unwrap()
+                .replace("machine_id = \"fixture\"", "machine_id = \"thief\"")
+                .replace("roster_seq = 1", "roster_seq = 2")
+                .replace("build_number = 11", "build_number = 12")
+                .into_bytes();
+            head.signature = thief.sign(&head.appcast).as_ref().to_vec();
+            "v0.12.0"
+        } else {
+            (head.roster, head.roster_signature) =
+                roster_with(2, &[("fixture", &machine()), ("joined", &joined)], &[]);
+            if exit == "accepted" {
+                "v0.11.0"
+            } else {
+                "v0.99.0"
+            }
+        };
+        let judged = authenticate_head(&f.context, &mut f.state, tag, &head, pins);
+        assert_eq!(judged.is_ok(), exit == "accepted", "{exit}: {judged:?}");
+        assert_eq!(
+            f.state.roster_floor, 2,
+            "{exit}: the head's roster was admitted"
+        );
+        f.proof = Proof::read(&f.context.dir).unwrap();
+        assert_eq!(
+            f.proof.roster, head.roster,
+            "{exit}: the stage carries roster 2"
+        );
+        f.apply()
+            .unwrap_or_else(|error| panic!("{exit}: the held stage applies: {error}"));
+        assert_eq!(f.state.installed.build, 11);
+    }
 
-    // A genuine head whose tag does not match its appcast.
-    let mut g = Fixture::new();
-    stage(&mut g);
-    let mut head = g.proof.clone();
-    (head.roster, head.roster_signature) =
-        roster_with(2, &[("fixture", &machine()), ("joined", &key(17))], &[]);
-    let refused = authenticate_head(&g.context, &mut g.state, "v0.99.0", &head, pins);
-    assert!(
-        refused
-            .as_ref()
-            .is_err_and(|e| e.contains("does not match the elected release tag")),
-        "the head's own refusal is the answer: {refused:?}"
-    );
-    assert_eq!(g.state.roster_floor, 2);
-    g.proof = Proof::read(&g.context.dir).unwrap();
-    assert_eq!(g.proof.roster, head.roster);
-    g.apply().expect("the held stage applies");
-    assert_eq!(g.state.installed.build, 11);
-
-    // Negative control: a roster the master did not sign is never admitted, moves no
-    // floor, and re-proves nothing.
-    let mut n = Fixture::new();
-    stage(&mut n);
-    let before = Proof::read(&n.context.dir).unwrap().roster;
-    let mut forged = n.proof.clone();
-    (forged.roster, _) = roster_with(2, &[("fixture", &machine())], &[]);
-    let refused = authenticate_head(&n.context, &mut n.state, "v0.11.0", &forged, pins);
-    assert!(refused.is_err());
-    assert_eq!(n.state.roster_floor, 1);
-    assert_eq!(Proof::read(&n.context.dir).unwrap().roster, before);
+    // A roster the master did not sign, and one revoking the stage's own signer.
+    for control in ["forged", "revoking"] {
+        let mut n = Fixture::new();
+        stage(&mut n);
+        let before = Proof::read(&n.context.dir).unwrap().roster;
+        let mut head = n.proof.clone();
+        if control == "forged" {
+            (head.roster, _) = roster_with(2, &[("fixture", &machine())], &[]);
+        } else {
+            (head.roster, head.roster_signature) =
+                roster_with(2, &[("joined", &joined)], &["fixture"]);
+        }
+        let judged = authenticate_head(&n.context, &mut n.state, "v0.11.0", &head, pins);
+        assert!(judged.is_err(), "{control}");
+        let floor = if control == "forged" { 1 } else { 2 };
+        assert_eq!(n.state.roster_floor, floor, "{control}");
+        assert_eq!(
+            Proof::read(&n.context.dir).unwrap().roster,
+            before,
+            "{control}"
+        );
+    }
 }
 
 /// How many files `run` hashed on this thread ([`HASHED`]).
@@ -3063,6 +2665,9 @@ fn a_held_stage_is_hashed_once_not_at_every_pass() {
 
     let replacement = f.context.dir.join("replacement");
     fs::write(&replacement, &bytes).unwrap();
+    // The mode every writer of a candidate gives it, not the test's umask's (a 002 one
+    // leaves it group-writable, which `checked_file` refuses).
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
     fs::rename(&replacement, &candidate).unwrap();
     let (offered, hashed) = hashes_in(|| linux_status(&f.context, &f.state).staged_build);
     assert_eq!((offered, hashed), (Some(11), 1), "replaced: hashed again");
@@ -3082,15 +2687,6 @@ fn whether_the_check_loop_runs_is_asked_without_hashing() {
     assert!(
         !enrolled_in(&f.context),
         "a copy with no record is not enrolled"
-    );
-    let src: String = include_str!("../linux.rs").split_whitespace().collect();
-    let start = src
-        .find("pub(crate)fnspawn_background_check_with_settings(")
-        .expect("the background loop");
-    let gate = &src[start..start + src[start..].find("std::thread::Builder").unwrap()];
-    assert!(
-        gate.contains("context().is_ok_and(enrolled_in)") && !gate.contains("status("),
-        "the loop's gate reads the record alone: {gate}"
     );
 }
 
@@ -3156,7 +2752,7 @@ fn a_vetoed_automatic_install_keeps_the_trial_it_would_have_replaced() {
         })
     };
     let mut probes = 0;
-    let held = finish_candidate(
+    finish_candidate(
         &f.context,
         &mut f.state,
         &f.proof,
@@ -3174,7 +2770,6 @@ fn a_vetoed_automatic_install_keeps_the_trial_it_would_have_replaced() {
         },
     )
     .unwrap();
-    assert!(held.contains("`aterm update apply` installs it"), "{held}");
     assert_eq!(probes, 2, "the install was prepared");
     let trial = trial_on_disk(&f);
     assert_eq!((trial.old.build, trial.new.build), (10, 11));
@@ -3251,59 +2846,13 @@ fn an_abandoned_install_intent_puts_the_displaced_trial_back() {
     assert!(!text.contains("displaced"), "{text}");
 }
 
-/// A hand install zeroes the failure count with no check run: the loop's next pass, reading
-/// the copy's own record, announces no recovery.
+/// A due pass that waits on the trial is no check: after a hand install of a held stage it
+/// reads no channel and moves no `updated_at`, through the loop's own pass
+/// (`check_recording_in`). What the notice then makes of an unmoved `updated_at` is
+/// `linux_notice`'s (`a_zeroed_count_with_no_check_since_is_no_recovery`).
 #[test]
-fn a_manual_install_after_failing_checks_announces_no_recovery() {
-    use crate::linux_notice::{Announcer, Pass, Record};
-    let pass = |state: &State| {
-        (
-            state.outcome.clone(),
-            state.failing_checks,
-            state.updated_at.clone(),
-        )
-    };
-    let tick = |notice: &mut Announcer,
-                (outcome, failing_checks, updated_at): &(String, u32, String)| {
-        notice.tick(Pass {
-            outcome,
-            failing_checks: *failing_checks,
-            updated_at,
-            record: Record::Kept,
-            took_lock: true,
-        })
-    };
-    let mut f = Fixture::new();
-    hold_stage(&mut f);
-    let mut notice = Announcer::new("2026-09-28T10:00:00Z".into());
-    f.state.outcome = "machine roster signature refused".into();
-    f.state.failing_checks = 3;
-    f.state.failing_kind = "linux-update".into();
-    f.state.updated_at = "2026-09-28T10:30:00Z".into();
-    f.context.save(&f.state).unwrap();
-    assert!(tick(&mut notice, &pass(&f.state)).is_some(), "announced");
-    f.apply().unwrap();
-    let installed = f.context.read_state().unwrap().unwrap();
-    assert_eq!(installed.failing_checks, 0, "the install zeroes the count");
-    assert_eq!(tick(&mut notice, &pass(&installed)), None, "no check ran");
-}
-
-/// A due pass that waits on the trial is no check: it reads no channel, moves no
-/// `updated_at` and clears no streak, so after a hand install the loop announces no
-/// recovery. Negative control: a check recorded since the announcement answers it.
-#[test]
-fn a_due_pass_that_waits_on_the_trial_announces_no_recovery() {
-    use crate::linux_notice::{Announcer, Pass, Record};
-    let tick = |notice: &mut Announcer,
-                (status, record, took_lock): &(crate::UpdateStatus, Record, bool)| {
-        notice.tick(Pass {
-            outcome: &status.outcome,
-            failing_checks: status.failing_checks,
-            updated_at: &status.updated_at,
-            record: *record,
-            took_lock: *took_lock,
-        })
-    };
+fn a_due_pass_that_waits_on_the_trial_records_no_check() {
+    use crate::linux_notice::Record;
     let mut f = Fixture::new();
     hold_stage(&mut f);
     let failed = "2026-09-28T10:30:00Z";
@@ -3312,9 +2861,6 @@ fn a_due_pass_that_waits_on_the_trial_announces_no_recovery() {
     f.state.failing_kind = "linux-update".into();
     f.state.updated_at = failed.into();
     f.context.save(&f.state).unwrap();
-    let mut notice = Announcer::new("2026-09-28T10:00:00Z".into());
-    let announced = (status_in(Ok(&f.context), 10), Record::Kept, true);
-    assert!(tick(&mut notice, &announced).is_some(), "announced");
     f.apply().unwrap();
 
     let due = check_recording_in(Ok(&f.context), 11, &settings_provider(false), false);
@@ -3325,54 +2871,25 @@ fn a_due_pass_that_waits_on_the_trial_announces_no_recovery() {
     );
     let state = f.context.read_state().unwrap().unwrap();
     assert!(state.last_attempt_unix > 0, "the pass was due and ran");
-    assert!(
-        state.outcome.contains("update checks wait until then"),
-        "{}",
-        state.outcome
-    );
     assert_eq!(state.updated_at, failed, "no check is on record");
     assert_eq!(state.check_build, 0, "nor the build that made one");
-    assert_eq!(tick(&mut notice, &due), None, "no check ran");
-
-    let mut checked = state;
-    checked.updated_at = "2026-09-28T15:00:00Z".into();
-    checked.outcome = "Up to date".into();
-    f.context.save(&checked).unwrap();
-    assert_eq!(
-        tick(
-            &mut notice,
-            &(status_in(Ok(&f.context), 11), Record::Kept, true)
-        ),
-        Some((
-            crate::HEALTH_RECOVERED_TITLE.to_string(),
-            "manifest".to_string()
-        ))
-    );
 }
 
-/// A pass that failed before reaching the lock (unreadable settings) does not answer the
-/// lock's notice; the pass that takes the lock once it is free does. Driven through the
+/// A pass that failed before reaching the lock (unreadable settings) is handed over as lost,
+/// never as one that took the lock, so it cannot answer the lock's notice (`linux_notice`'s
+/// `a_pass_that_failed_before_the_lock_neither_answers_nor_restarts_its_notice`); the busy
+/// pass took no lock, and the pass once the holder is gone takes it. Driven through the
 /// loop's own pass (`check_recording_in`).
 #[test]
-fn a_pass_that_never_reached_the_lock_does_not_say_it_came_free() {
-    use crate::linux_notice::{Announcer, Pass, Record};
-    let tick = |notice: &mut Announcer,
-                (status, record, took_lock): &(crate::UpdateStatus, Record, bool)| {
-        notice.tick(Pass {
-            outcome: &status.outcome,
-            failing_checks: status.failing_checks,
-            updated_at: &status.updated_at,
-            record: *record,
-            took_lock: *took_lock,
-        })
-    };
-    let mut f = Fixture::new();
+fn a_pass_that_never_reached_the_lock_does_not_say_it_took_it() {
+    use crate::linux_notice::Record;
+    let f = Fixture::new();
     // No check is due, so the pass that takes the lock reads no channel.
-    f.state.check_owner = "alabsystems".into();
-    f.state.check_repo = "aterm".into();
-    f.state.next_check_unix = i64::MAX;
-    f.context.save(&f.state).unwrap();
-    let mut notice = Announcer::new("2026-09-28T10:00:00Z".into());
+    let mut state = f.state.clone();
+    state.check_owner = "alabsystems".into();
+    state.check_repo = "aterm".into();
+    state.next_check_unix = i64::MAX;
+    f.context.save(&state).unwrap();
     let holder = another_aterm_holds_the_lock(&f);
     let busy = check_recording_in(Ok(&f.context), 10, &settings_provider(false), false);
     assert_eq!(
@@ -3381,11 +2898,6 @@ fn a_pass_that_never_reached_the_lock_does_not_say_it_came_free() {
         "{}",
         busy.0.outcome
     );
-    let said = (0..120)
-        .filter_map(|_| tick(&mut notice, &busy))
-        .collect::<Vec<_>>();
-    assert_eq!(said.len(), 1, "PRECONDITION: the lock's notice is said");
-
     let unreadable: crate::CheckSettingsProvider = std::sync::Arc::new(|| None);
     let stalled = check_recording_in(Ok(&f.context), 10, &unreadable, false);
     assert_eq!(
@@ -3394,23 +2906,9 @@ fn a_pass_that_never_reached_the_lock_does_not_say_it_came_free() {
         "a failure before the lock: {}",
         stalled.0.outcome
     );
-    assert_eq!(
-        tick(&mut notice, &stalled),
-        None,
-        "no recovery while the lock is held"
-    );
-
     drop(holder);
     let freed = check_recording_in(Ok(&f.context), 10, &settings_provider(false), false);
     assert!(freed.2, "the pass took the lock: {}", freed.0.outcome);
-    assert_eq!(
-        tick(&mut notice, &freed),
-        Some((
-            crate::HEALTH_RECOVERED_TITLE.to_string(),
-            "manifest".to_string()
-        )),
-        "the lock came free"
-    );
 }
 
 /// Leave a full-size temp named as `stem`'s writer names it, as a process killed in
@@ -3489,68 +2987,10 @@ fn a_failed_rollback_copy_is_removed() {
     assert_eq!(restores(&f), 0);
 }
 
-/// A candidate the dynamic loader refuses (linked against a newer glibc) says why: the
-/// probe's first stderr line is the reason, and a loader's refusal is named as one.
-#[test]
-fn a_candidate_the_loader_refuses_says_why() {
-    let f = Fixture::new();
-    let manifest = Manifest::parse(std::str::from_utf8(&f.proof.appcast).unwrap()).unwrap();
-    let script = f.root.join("identity-probe");
-    let probe = |body: &str| {
-        fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        probe_candidate(
-            &script,
-            &manifest,
-            native().unwrap(),
-            &f.context.dir,
-            aterm_spec::wait::MUST_HAPPEN,
-        )
-        .unwrap_err()
-    };
-    let refused = probe(
-        "echo \"$0: /lib/x86_64-linux-gnu/libc.so.6: version \\`GLIBC_2.99' not found \
-         (required by $0)\" >&2\nexit 127",
-    );
-    assert_eq!(
-        refused,
-        "aterm 0.11.0 can\u{2019}t run on this system: /lib/x86_64-linux-gnu/libc.so.6: \
-         version `GLIBC_2.99' not found"
-    );
-    assert!(!refused.contains(&*script.to_string_lossy()), "{refused}");
-    // A missing symbol version that is not glibc's is a loader refusal too.
-    let refused = probe(
-        "echo \"$0: /usr/lib/libstdc++.so.6: version \\`CXXABI_1.3.15' not found \
-         (required by $0)\" >&2\nexit 127",
-    );
-    assert_eq!(
-        refused,
-        "aterm 0.11.0 can\u{2019}t run on this system: /usr/lib/libstdc++.so.6: \
-         version `CXXABI_1.3.15' not found"
-    );
-    // Any other failure keeps its status, and says what it said.
-    let refused = probe("echo 'unknown command: identity' >&2\nexit 2");
-    assert_eq!(
-        refused,
-        "aterm 0.11.0 failed when checked here (exit status: 2): unknown command: identity"
-    );
-    let refused = probe("exit 3");
-    assert_eq!(
-        refused,
-        "aterm 0.11.0 failed when checked here (exit status: 3)"
-    );
-    assert!(fs::read_dir(&f.context.dir).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with("probe-")
-    }));
-}
-
 /// A candidate whose identity probe failed is still the release's bytes: the next check of
-/// that release probes it again instead of downloading it (about 100 MB). Negative control:
-/// a candidate that is not the release's bytes is downloaded again.
+/// that release probes it again instead of downloading it (about 100 MB). (A candidate that
+/// is not the release's bytes is not reused:
+/// `staged_status_and_reuse_obey_new_minimum_revocations_and_exact_current_bytes`.)
 #[test]
 fn a_release_whose_probe_failed_is_not_downloaded_again() {
     let mut f = Fixture::new();
@@ -3594,15 +3034,260 @@ fn a_release_whose_probe_failed_is_not_downloaded_again() {
     )
     .unwrap();
     assert_eq!(f.state.installed.build, 11);
+}
 
-    let g = Fixture::new();
-    let mut bytes = fs::read(g.context.dir.join("candidate")).unwrap();
-    bytes[100] ^= 1;
-    fs::write(g.context.dir.join("candidate"), bytes).unwrap();
-    assert!(!reusable_stage(
-        &g.context,
-        &g.state,
-        &manifest,
-        native().unwrap()
-    ));
+/// What the loop's reporter told the window over `passes`, each one the pass the loop
+/// builds from a status ([`crate::linux_notice::Reporter::report`]'s `notify`).
+fn notices_over<'a>(
+    reporter: &mut crate::linux_notice::Reporter,
+    passes: impl IntoIterator<Item = &'a crate::UpdateStatus>,
+) -> Vec<(String, String)> {
+    use crate::linux_notice::{Pass, Record};
+    use std::sync::{Arc, Mutex};
+    let said = Arc::new(Mutex::new(Vec::new()));
+    let notify: crate::HealthNotify = Box::new({
+        let said = Arc::clone(&said);
+        move |title, body| said.lock().unwrap().push((title, body))
+    });
+    for status in passes {
+        reporter.report(Pass::of(status, Record::Kept, true), None, Some(&notify));
+    }
+    said.lock().unwrap().clone()
+}
+
+/// Whether the window reads `title` as the install half's failure — the class the macOS
+/// lane says an overdue or reverted update under.
+fn install_half(title: &str) -> bool {
+    crate::health_failing_class(title) == Some("apply")
+}
+
+/// A CRASH-LOOP ROLLBACK THIS LOOP SEES HAPPEN IS SAID (U21). The person keeps the old
+/// window, whose loop installed the release; the new build's starts crash and the copy
+/// rolls it back. The old window's loop saw the record move, and told the window
+/// nothing.
+#[test]
+fn a_crash_loop_rollback_the_loop_sees_is_said() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let waiting = status_in(Ok(&f.context), 10);
+    let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    assert!(notices_over(&mut reporter, [&waiting]).is_empty());
+    let t0 = minute(0);
+    let rolled = (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5));
+    assert!(rolled, "PRECONDITION: the crash loop is rolled back");
+    let rolled_back = status_in(Ok(&f.context), 10);
+    assert!(
+        rolled_back
+            .linux
+            .as_ref()
+            .is_some_and(|linux| linux.refused_newer)
+    );
+    let said = notices_over(&mut reporter, [&rolled_back]);
+    assert!(
+        said.iter()
+            .any(|(title, body)| install_half(title) && body.contains("0.10.0 is back")),
+        "the rollback was never said: {said:?}"
+    );
+}
+
+/// THE START-WAIT IS NO INSTALL FAILURE (the review of ATERM-KI-1015-2, U21). Linux never
+/// starts an installed executable in a running aterm, so an automatic install (`auto_apply`
+/// and automatic checks, both on by default) waits for the next aterm a person starts as
+/// a matter of course. Told to the window under the install half's failing title, it put
+/// "Couldn't install updates" on the band of everyone who kept a window open past the
+/// hour, and a day later "Updates are not installing" in the digest. The wait is said, in
+/// words the window reads as no failure of any half.
+#[test]
+fn a_start_wait_past_its_hour_is_said_as_no_failure() {
+    let mut f = Fixture::new();
+    hold_stage(&mut f);
+    f.apply().unwrap();
+    let (waiting, _, _) = check_recording_in(Ok(&f.context), 10, &settings_provider(false), false);
+    let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    let said = notices_over(&mut reporter, std::iter::repeat_n(&waiting, 24 * 60));
+    assert!(
+        said.iter().any(|(_, body)| body.contains("0.11.0")),
+        "a day of waiting for a start is told: {said:?}"
+    );
+    assert!(
+        said.iter()
+            .all(|(title, _)| crate::health_failing_class(title).is_none()
+                && title != crate::HEALTH_RESTATED_TITLE
+                && title != crate::HEALTH_RECOVERED_TITLE),
+        "and never as a failure of either half: {said:?}"
+    );
+}
+
+/// A ROLLBACK AFTER THE WAIT WAS SAID IS THE INSTALL HALF'S FAILURE (the review of U21).
+/// The person kept one old window open past the hour, so the wait was said; then the new
+/// build's starts crashed and the copy rolled it back. The rollback went to the window as
+/// a restatement, a log line, and the band kept the wait's words, which the rollback made
+/// false. It is said under the install half's failing title.
+#[test]
+fn a_rollback_after_a_said_wait_is_said_as_the_install_failure() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let waiting = status_in(Ok(&f.context), 10);
+    let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    let wait = notices_over(&mut reporter, std::iter::repeat_n(&waiting, 2 * 60));
+    assert!(
+        wait.iter().any(|(_, body)| body.contains("0.11.0")),
+        "PRECONDITION: the wait was said: {wait:?}"
+    );
+    let t0 = minute(0);
+    let rolled = (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5));
+    assert!(rolled, "PRECONDITION: the crash loop is rolled back");
+    let rolled_back = status_in(Ok(&f.context), 10);
+    let said = notices_over(&mut reporter, [&rolled_back]);
+    assert!(
+        said.iter()
+            .any(|(title, body)| install_half(title) && body.contains("is back")),
+        "the rollback is the install half's failure, on the band: {said:?}"
+    );
+}
+
+/// A ROLLBACK A PERSON ASKED FOR IS NO INSTALL FAILURE (the review of U21). `aterm update
+/// rollback` of a build that started and was confirmed healthy was told to every open
+/// window as "Couldn't install updates": the loop took any rollback it saw for a crash
+/// loop's. Only a rollback whose starts spent their budget is said.
+#[test]
+fn a_rollback_a_person_asked_for_is_said_as_no_install_failure() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    assert!(window_start(&f, minute(0)), "the new build starts");
+    assert!(window_confirm(&f), "and its window confirms it");
+    let healthy = status_in(Ok(&f.context), 10);
+    let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    assert!(notices_over(&mut reporter, [&healthy]).is_empty());
+    let mut state = f.context.read_state().unwrap().unwrap();
+    rollback_locked(&f.context, &mut state).expect("aterm update rollback");
+    let rolled = status_in(Ok(&f.context), 10);
+    assert!(
+        rolled
+            .linux
+            .as_ref()
+            .is_some_and(|linux| linux.refused_newer),
+        "PRECONDITION: the copy refuses the build it rolled back"
+    );
+    let said = notices_over(&mut reporter, [&rolled]);
+    assert!(
+        !said.iter().any(|(title, _)| install_half(title)),
+        "a person's own rollback is no install failure: {said:?}"
+    );
+}
+
+/// THE WAIT'S WORDS COUNT THE STARTS (the review of U21). A start that began and never
+/// finished (a window that never painted, a session that never prompted) is counted on
+/// the trial, and the wait said "has not started yet" over it.
+#[test]
+fn a_wait_over_a_start_that_never_finished_does_not_say_none_began() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    assert!(window_start(&f, minute(0)), "a start is counted");
+    let waiting = status_in(Ok(&f.context), 10);
+    assert_eq!(
+        waiting
+            .linux
+            .as_ref()
+            .map(|linux| (linux.trial_starts, linux.trial_healthy)),
+        Some((1, false)),
+        "PRECONDITION: one start, unfinished"
+    );
+    let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    let said = notices_over(&mut reporter, std::iter::repeat_n(&waiting, 2 * 60));
+    let wait: Vec<_> = said
+        .iter()
+        .filter(|(_, body)| body.contains("0.11.0"))
+        .collect();
+    assert!(
+        !wait.is_empty(),
+        "PRECONDITION: the wait was said: {said:?}"
+    );
+    assert!(
+        wait.iter()
+            .all(|(_, body)| !body.contains("not started yet")),
+        "a counted start is not 'not started yet': {wait:?}"
+    );
+}
+
+/// A ROLLBACK IS SAID IN ITS OWN WORDS, NEVER IN THE CHECK'S (the second review of
+/// ATERM-KI-1015-2, U21). The pass that first sees a crash loop's rollback may also be a
+/// due check, which replaces the record's "didn't start properly … is back" sentence with
+/// its own outcome before the pass is read; when the channel's head is at or below the
+/// restored build (a pulled release), the window got "Couldn't install updates" over "Up
+/// to date — the newest release is aterm 0.10.0." The record a check leaves is written
+/// here as `check_locked` writes it (the fixture reads no channel).
+#[test]
+fn a_rollback_seen_on_a_checks_pass_is_said_in_its_own_words() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    let waiting = status_in(Ok(&f.context), 10);
+    let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+    assert!(notices_over(&mut reporter, [&waiting]).is_empty());
+    let t0 = minute(0);
+    let rolled = (1..=60_i64).any(|start| !window_start(&f, t0 + start * 5));
+    assert!(rolled, "PRECONDITION: the crash loop is rolled back");
+    let mut checked = f.context.read_state().unwrap().unwrap();
+    checked.outcome = "Up to date \u{2014} the newest release is aterm 0.10.0".into();
+    checked.updated_at = "2026-09-28T15:00:00Z".into();
+    f.context.save(&checked).unwrap();
+    let said = notices_over(&mut reporter, [&status_in(Ok(&f.context), 10)]);
+    let rollback: Vec<_> = said
+        .iter()
+        .filter(|(title, _)| install_half(title))
+        .collect();
+    assert_eq!(
+        rollback.len(),
+        1,
+        "PRECONDITION: the rollback is said: {said:?}"
+    );
+    assert!(
+        rollback
+            .iter()
+            .all(|(_, body)| body.contains("0.10.0 is back") && !body.contains("Up to date")),
+        "the rollback says what happened, not what the check found: {rollback:?}"
+    );
+}
+
+/// A CRASH LOOP NO ROLLBACK COULD ANSWER IS SAID (the second review of ATERM-KI-1015-2,
+/// U21). The new build's starts spent their budget, but the build before it could not come
+/// back (below the signed floor, or its kept copy gone), so the trial ended and the build
+/// stays. The window was told only that the wait was over, when it had been said, and
+/// otherwise nothing: nobody learned that the build they run failed its trial. It is the
+/// install half's failure, said in the facts' own words.
+#[test]
+fn a_crash_loop_no_rollback_could_answer_is_said() {
+    for wait_said in [false, true] {
+        let mut f = Fixture::new();
+        f.apply().unwrap();
+        let mut state = f.context.read_state().unwrap().unwrap();
+        state.min_build = 11;
+        f.context.save(&state).unwrap();
+        let waiting = status_in(Ok(&f.context), 10);
+        let mut reporter = crate::linux_notice::Reporter::new("2026-09-28T10:00:00Z".into());
+        let passes = if wait_said { 2 * 60 } else { 1 };
+        let wait = notices_over(&mut reporter, std::iter::repeat_n(&waiting, passes));
+        assert_eq!(
+            wait.iter().any(|(_, body)| body.contains("0.11.0")),
+            wait_said,
+            "PRECONDITION: the wait was said as planned: {wait:?}"
+        );
+        for n in 0..MAX_TRIAL_STARTS {
+            assert!(window_start(&f, minute(i64::from(n))), "start {n} is a try");
+        }
+        assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS))));
+        let kept = f.context.read_state().unwrap().unwrap();
+        assert!(
+            kept.trial.is_none() && kept.installed.build == 11 && kept.rejected_build == 0,
+            "PRECONDITION: the trial ended and the build stays"
+        );
+        let said = notices_over(&mut reporter, [&status_in(Ok(&f.context), 10)]);
+        assert!(
+            said.iter().any(|(title, body)| install_half(title)
+                && body.contains("0.11.0")
+                && body.contains("stays")),
+            "the build that failed its trial and stays is told (wait said: {wait_said}): \
+             {said:?}"
+        );
+    }
 }

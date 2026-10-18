@@ -32,6 +32,12 @@ pub enum ExceptionKind {
     /// the third `/compact`. Going back is a person's, done in the tab, so the
     /// host files it per tab.
     Context,
+    /// A request the API refuses the same way each time it is sent
+    /// ([`aterm_phase::ApiCause::Request`]: a safeguards refusal, a model not
+    /// found, a tool history it rejects): the supervisor's slow ladder goes
+    /// on, and what ends it is a person's change in the tab (`/rewind`,
+    /// `/model`, a rephrased message), so the host files it per tab.
+    Refused,
     /// A screen no reader names, busy on background work alone for hours while
     /// Claude's title says idle ([`super::exception::Exception::stalled`]).
     Stalled,
@@ -53,6 +59,7 @@ impl ExceptionKind {
             Self::GoalCleared => "goal-cleared",
             Self::Futile => "futile",
             Self::Context => "context",
+            Self::Refused => "refused",
             Self::Stalled => "stalled",
             Self::Dialog => "dialog",
         }
@@ -107,6 +114,12 @@ pub fn outlook(
         // itself, when its jobs end): a digest item, and the chip says so.
         WallKind::ModelBucket { .. } if has_reset => Outlook::Resumes,
         WallKind::ModelBucket { .. } => Outlook::ResumesAndAsks(ExceptionKind::Bucket),
+        // A refused request: its slow ladder goes on, and a person's change
+        // in the tab ends it sooner (a digest item, never an interruption).
+        WallKind::ApiError {
+            cause: aterm_phase::ApiCause::Request,
+            ..
+        } if cfg.retry_api_errors => Outlook::ResumesAndAsks(ExceptionKind::Refused),
         WallKind::ApiError { .. } | WallKind::Overloaded if cfg.retry_api_errors => {
             Outlook::Resumes
         }
@@ -148,6 +161,7 @@ pub fn answer(kind: WallKind, has_reset: bool, cfg: &SupervisorConfig, supervise
         Outlook::Resumes | Outlook::VendorResumes => Answer::Resumes,
         Outlook::ResumesAndAsks(ExceptionKind::Bucket) => Answer::ResumesAsks("/model to switch"),
         Outlook::ResumesAndAsks(ExceptionKind::Spend) => Answer::ResumesAsks("add credits"),
+        Outlook::ResumesAndAsks(ExceptionKind::Refused) => Answer::ResumesAsks("fix in the tab"),
         Outlook::ResumesAndAsks(_) => Answer::Resumes,
         Outlook::Person(_) | Outlook::Unattended => Answer::Nobody,
     }

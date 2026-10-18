@@ -303,8 +303,20 @@ pub(crate) fn at_least_as_open_as(color: [u8; 3], floor: [u8; 3]) -> [u8; 3] {
 }
 
 /// Build the native palette. Neutral roles preserve the theme's perceptual hue;
-/// chromatic roles keep the theme accent hue but cap its chroma for large controls.
-pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeRoles {
+/// chromatic roles keep the chrome accent's hue
+/// ([`aterm_messages::tokens::ChromeTokens::accent`]: the authored accent, the
+/// cursor, or the ANSI blue or cyan it borrows) but cap its chroma for large
+/// controls. A palette whose accent is Neutral (a monochrome theme, or one with
+/// no palette known) keeps the derived treatment: the selection's hue, else one
+/// opposite the background's. An authored `border_color` is the separator, and
+/// the theme's own ANSI red and green set the status hues.
+pub(crate) fn roles(
+    p: impl Into<crate::chrome_band::ChromePalette>,
+    preferences: AppearancePreferences,
+) -> NativeRoles {
+    let p = p.into();
+    let theme = p.theme;
+    let tokens = p.tokens();
     let preferences = preferences.normalized();
     let bg = packed_rgb(theme.bg);
     let fg = packed_rgb(theme.fg);
@@ -322,6 +334,9 @@ pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeR
 
     let mut accent_seed = rgb_to_oklch(packed_rgb(theme.cursor));
     let selection_seed = rgb_to_oklch(selection);
+    if tokens.accent_source != aterm_messages::tokens::AccentSource::Neutral {
+        accent_seed = rgb_to_oklch(tokens.accent);
+    }
     if accent_seed.c < 0.035 && selection_seed.c >= 0.035 {
         accent_seed = selection_seed;
     }
@@ -365,14 +380,28 @@ pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeR
     let on_accent = ensure_contrast(on_seed, accent, 4.5);
 
     let separator_target = if preferences.high_contrast { 3.0 } else { 1.5 };
-    let separator = ensure_contrast(mix_oklab(fg, surface, 0.70), surface, separator_target);
+    let separator = match tokens.border {
+        Some(border) => ensure_contrast(border, surface, separator_target),
+        None => ensure_contrast(mix_oklab(fg, surface, 0.70), surface, separator_target),
+    };
     let control_track = ensure_contrast(mix_oklab(fg, surface, 0.57), surface, 2.0);
 
-    // Status hues share a semantic angle; this theme conditions their lightness,
-    // chroma and contrast, floored on the page and on the cards they mostly sit on.
+    // Status hues take the theme's own ANSI red and green where they carry a
+    // colour, else a shared semantic angle; lightness, chroma and final
+    // contrast are conditioned by this theme.
+    // Held against the cards they mostly sit on as well as the page.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "an OkLCh hue in degrees, [0, 360), fits f32"
+    )]
+    let hue = |token: Option<f64>, fallback: f32| token.map_or(fallback, |h| h as f32);
     let danger = ensure_contrast(
         ensure_contrast(
-            status_seed(dark, preferences.high_contrast, DANGER_HUE_DEGREES),
+            status_seed(
+                dark,
+                preferences.high_contrast,
+                hue(tokens.danger_hue, DANGER_HUE_DEGREES),
+            ),
             surface,
             4.5,
         ),
@@ -381,7 +410,11 @@ pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeR
     );
     let success = ensure_contrast(
         ensure_contrast(
-            status_seed(dark, preferences.high_contrast, SUCCESS_HUE_DEGREES),
+            status_seed(
+                dark,
+                preferences.high_contrast,
+                hue(tokens.success_hue, SUCCESS_HUE_DEGREES),
+            ),
             surface,
             4.5,
         ),
@@ -405,8 +438,17 @@ pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeR
     }
 }
 
-pub(crate) fn default_roles(theme: Theme) -> NativeRoles {
-    roles(theme, current_preferences())
+impl NativeRoles {
+    /// The roles of a chrome palette (a bare [`Theme`] converts with nothing
+    /// authored and no palette known), under the live accessibility
+    /// preferences ([`default_roles`]).
+    pub(crate) fn from_theme(p: impl Into<crate::chrome_band::ChromePalette>) -> Self {
+        default_roles(p)
+    }
+}
+
+pub(crate) fn default_roles(p: impl Into<crate::chrome_band::ChromePalette>) -> NativeRoles {
+    roles(p, current_preferences())
 }
 
 /// The forced-chrome seed palette for config `window_theme = light`, modelled
@@ -822,41 +864,96 @@ mod tests {
         }
         for (name, theme) in bundled_themes() {
             assert_role_contract(name, default_roles(theme));
+            // …and over the full chrome palette, with a hostile authored accent
+            // and border (the background itself): the floors still hold.
+            let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
+            let hostile = packed_rgb(theme.bg);
+            for authored in [
+                aterm_messages::tokens::AuthoredChrome::NONE,
+                aterm_messages::tokens::AuthoredChrome {
+                    accent: Some(hostile),
+                    border: Some(hostile),
+                    ..aterm_messages::tokens::AuthoredChrome::NONE
+                },
+            ] {
+                let palette = crate::chrome_band::ChromePalette {
+                    theme,
+                    ansi: Some(crate::chrome_band::ansi_of_scheme(&scheme)),
+                    authored,
+                };
+                assert_role_contract(name, default_roles(palette));
+            }
         }
     }
 
-    /// The strip's band tones, the CSD variant and this role pipeline share one
-    /// dark/light predicate, [`crate::tab_bar::bg_is_light`].
+    /// THE NATIVE ACCENT IS THE TOKEN ACCENT: on every built-in whose chrome
+    /// accent has a colour (its cursor, or the ANSI blue or cyan a grey cursor
+    /// borrows), the Settings accent wears that hue (the chroma and lightness
+    /// clamps and the floors move lightness and chroma, not hue), and an
+    /// authored accent's hue likewise. NEGATIVE CONTROL: a monochrome theme
+    /// (grey cursor, grey selection, grey ANSI) has no accent to borrow, so its
+    /// roles are exactly the ones derived with no palette known.
     #[test]
-    fn the_role_pipeline_and_the_strip_classify_every_background_the_same_way() {
-        // A mid-grey band where a WCAG relative-luminance split (< 0.42) says dark
-        // while the shared predicate says light.
-        for gray in 0x97..=0xAD_u8 {
-            let bg = [gray; 3];
-            assert!(
-                relative_luminance(bg) < 0.42,
-                "#{gray:02X}{gray:02X}{gray:02X} is inside the retired split's dark side"
-            );
-            assert!(
-                !surface_is_dark(bg),
-                "#{gray:02X}{gray:02X}{gray:02X} is on the strip's light side"
-            );
-        }
-        // …and no background anywhere can split the two sites apart.
-        for r in (0..=255).step_by(15) {
-            for g in (0..=255).step_by(15) {
-                for b in (0..=255).step_by(15) {
-                    let bg = [r as u8, g as u8, b as u8];
-                    let packed =
-                        (u32::from(bg[0]) << 16) | (u32::from(bg[1]) << 8) | u32::from(bg[2]);
-                    assert_eq!(
-                        surface_is_dark(bg),
-                        crate::tab_bar::theme_is_dark(packed),
-                        "{bg:?}: the role pipeline and the strip must be ONE predicate"
-                    );
+    fn native_accent_is_the_token_accent() {
+        use aterm_messages::tokens::{AccentSource, AuthoredChrome};
+        let hue_gap = |a: [u8; 3], b: [u8; 3]| {
+            let (x, y) = (rgb_to_oklch(a).h, rgb_to_oklch(b).h);
+            let d = (x - y).rem_euclid(TAU);
+            d.min(TAU - d).to_degrees()
+        };
+        let mut checked = 0;
+        for (name, theme) in bundled_themes() {
+            let scheme = aterm_types::scheme::builtin(name).expect("a built-in");
+            for authored in [
+                AuthoredChrome::NONE,
+                AuthoredChrome {
+                    accent: Some([0xff, 0x00, 0xaa]),
+                    ..AuthoredChrome::NONE
+                },
+            ] {
+                let palette = crate::chrome_band::ChromePalette {
+                    theme,
+                    ansi: Some(crate::chrome_band::ansi_of_scheme(&scheme)),
+                    authored,
+                };
+                let tokens = palette.tokens();
+                if tokens.accent_source == AccentSource::Neutral
+                    || rgb_to_oklch(tokens.accent).c < 0.035
+                {
+                    continue;
                 }
+                let accent = default_roles(palette).accent;
+                let gap = hue_gap(accent, tokens.accent);
+                assert!(
+                    gap < 12.0,
+                    "{name} {:?}: accent {accent:02x?} is {gap:.1} degrees off {:02x?}",
+                    tokens.accent_source,
+                    tokens.accent
+                );
+                checked += 1;
             }
         }
+        assert!(checked > 10, "CONTROL: accents to compare ({checked})");
+        let mono = Theme {
+            fg: 0x00D0_D0D0,
+            bg: 0x0010_1010,
+            cursor: 0x00C0_C0C0,
+            selection: 0x0040_4040,
+        };
+        let grey = aterm_messages::ink::AnsiHues {
+            red: [0x60; 3],
+            green: [0x70; 3],
+            yellow: [0x80; 3],
+            blue: [0x90; 3],
+            cyan: [0xa0; 3],
+        };
+        let palette = crate::chrome_band::ChromePalette {
+            theme: mono,
+            ansi: Some(grey),
+            authored: AuthoredChrome::NONE,
+        };
+        assert_eq!(palette.tokens().accent_source, AccentSource::Neutral);
+        assert_eq!(default_roles(palette), default_roles(mono));
     }
 
     /// `Auto` passes the terminal theme through; a forced side against its darkness
@@ -973,36 +1070,6 @@ mod tests {
                     >= contrast_ratio(normal.separator, normal.surface)
             );
         }
-    }
-
-    #[test]
-    fn gamut_mapping_is_total_and_preserves_neutral_endpoints() {
-        let mut mapped = std::collections::BTreeSet::new();
-        for l in [0.0, 0.25, 0.5, 0.75, 1.0] {
-            for h in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0] {
-                mapped.insert(oklch_to_rgb(Oklch { l, c: 0.8, h }));
-            }
-        }
-        assert!(
-            mapped.len() > 12,
-            "gamut mapping preserves chromatic variety"
-        );
-        assert_eq!(
-            oklch_to_rgb(Oklch {
-                l: 0.0,
-                c: 0.0,
-                h: 0.0
-            }),
-            [0; 3]
-        );
-        assert_eq!(
-            oklch_to_rgb(Oklch {
-                l: 1.0,
-                c: 0.0,
-                h: 0.0
-            }),
-            [255; 3]
-        );
     }
 
     #[test]

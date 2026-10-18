@@ -9,12 +9,6 @@ license.workspace = true
 repository.workspace = true
 description = "Smart semantic selection and text selection state machines for terminal text"
 
-[features]
-# Compile the `#[refines]` anchors on TextSelection's lifecycle calls into the
-# library so the `spec_xref_closure` gate in aterm-gui collects them. Off by
-# default: production builds carry no aterm-spec.
-spec-anchors = ["dep:aterm-spec"]
-
 [dependencies]
 aterm-grapheme = { workspace = true }
 aterm-types = { workspace = true }
@@ -22,13 +16,16 @@ aterm-types = { workspace = true }
 # are regexes — the eleven built-ins in `builtin_patterns.rs` plus user-defined
 # custom rules — so this crate is the engine's largest syntax consumer.
 aterm-regex = { workspace = true }
-# The `#[refines]` anchors only (`spec-anchors`).
-aterm-spec = { workspace = true, optional = true }
+# The anchor attributes' registry (std-only): `#[cfg_attr(any(test, debug_assertions),
+# aterm_spec_anchor::refines(…))]` expands in every test and debug build; release strips it.
+aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
 # The anchors under a plain test run, and the TextSelectionLifecycle model the
 # Tier-1 conformance drives.
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-core = { workspace = true }
 
 [lints]
 workspace = true

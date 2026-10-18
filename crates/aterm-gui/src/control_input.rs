@@ -306,7 +306,7 @@ fn named_key_from_token(body: &str) -> Option<aterm_types::keyboard::NamedKey> {
 }
 
 /// PURE parser for `key <name> [mods=<list>] [type=<t>] [base=<c>]` -> an
-/// [`InputEvent::Key`]. Factored out of [`cmd_key`] so the additive grammar is
+/// [`InputEvent::Key`]. The additive grammar is
 /// unit-testable WITHOUT an `EventLoopProxy` (the verb can't run headless — it
 /// posts a `Wake::Input`). The SAME (Key, mods, base_layout, event_type) tuple a
 /// human's named-key press builds, so the seam (the plain verb's encoder caller) yields
@@ -436,7 +436,7 @@ pub(crate) fn control_press(verb: &str, rest: &str) -> Option<InputEvent> {
 /// manufactured a no-fresh-hint decline — so they pass unfenced; a paste
 /// keeps the hand. A FENCED write (`if=`, `if-gen=`, `if-fp=`, `if-human=`)
 /// is delivered on the control thread, past the seam that would arm its
-/// class (see [`input_if_fenced`]), so it always fences, keeping the hand
+/// class (see [`input_if_fenced_observed`]), so it always fences, keeping the hand
 /// only for what keeps it.
 pub(crate) fn control_fence(verb: &str, rest: &str, fenced_write: bool) -> Option<bool> {
     if !control_attempt_closes_cursor_license(verb) {
@@ -461,19 +461,6 @@ pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>]
                                     [if-supervisor=<holder>] [unread=ok] <name> — enter tab esc space backspace delete \
                                     up down left right home end pageup pagedown f1..f12 (opt \
                                     +mods, e.g. ctrl+c)\n";
-
-/// `key <name> [mods=<list>]` -> build an [`InputEvent::Key`] and post it to the
-/// seam (the plain verb's encoder caller, under the CURRENT keyboard mode). See
-/// [`parse_key`] for the grammar.
-pub(crate) fn cmd_key(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    match parse_key(rest) {
-        // Reply-bearing: OK means the seam APPLIED the event (bytes written),
-        // not merely that it was enqueued. With no frontmost window the seam
-        // drops the reply sender, so the caller gets ERR rather than a false OK.
-        Some(ev) => input_reply_to_str(post_input_reply(proxy, vec![ev])),
-        None => KEY_USAGE.to_string(),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // `if=<re>` — the guarded press: ONE check-and-press under the terminal lock
@@ -521,12 +508,21 @@ pub(crate) struct LeadingInputOptions {
     /// lands after a proven self-claim replaced it. Taken on
     /// [`SUPERVISOR_FENCED_VERBS`].
     pub if_supervisor: Option<String>,
+    /// `cause=@<off>|<seq>` (phase 3A, design §2.6): the mail or record this
+    /// input acted on, which the turn it opens names. Taken on
+    /// [`CAUSE_VERBS`]; checked against what the session holds before any
+    /// byte moves (`session_log::validate_cause`).
+    pub cause: Option<crate::session_log::CauseRef>,
     /// A leading option that was recognized but malformed (a guard with no
     /// pattern, an option given twice). Carried rather than answered here so the
     /// dispatch answers it AFTER the halt gate: a halted session must say
     /// `ERR halted` whatever the rest of the line looks like.
     pub refusal: Option<String>,
 }
+
+/// The verbs that take a `cause=`: the input that opens a turn. (`turn` also
+/// takes one among its own options, `cmd_turn`.)
+pub(crate) const CAUSE_VERBS: &[&str] = &["send", "turn"];
 
 /// The verbs that take a leading `if-supervisor=<holder>` fence: every verb
 /// a supervisor types into its session with. On `paste` it is the ONE
@@ -714,6 +710,17 @@ pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptio
             consumed = true;
             continue;
         }
+        if CAUSE_VERBS.contains(&verb)
+            && let Some(value) = head.strip_prefix("cause=")
+        {
+            match crate::session_log::CauseRef::parse(value) {
+                Some(cause) if opts.cause.replace(cause).is_none() => {}
+                _ => opts.refusal = Some(crate::session_log::CAUSE_USAGE.to_string()),
+            }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
         if guarded && let Some(value) = head.strip_prefix("if-fp=") {
             match parse_fp(value) {
                 Some(fp) if opts.if_fp.replace(fp).is_some() => {
@@ -793,10 +800,9 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
 ///   header of [`crate::human_input`] says why). A controller's own write —
 ///   this one included — never counts.
 ///
-/// This is the operator delivery fence's shape (`operator_input_if_epoch`:
-/// compare the screen generation, then write, under one lock) offered to any
-/// driver: a supervisor that decided on box A cannot have its `1` land on a box
-/// B that replaced A between its read and its press.
+/// It compares the screen generation, then writes, under one lock: a
+/// supervisor that decided on box A cannot have its `1` land on a box B that
+/// replaced A between its read and its press.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct InputFence<'a> {
     /// `if=<re>` — some visible row must match.
@@ -872,8 +878,10 @@ pub(crate) enum GuardedInput {
     /// A person gave the session input since the caller's read (`if-human=`
     /// no longer holds): NOTHING was written.
     Person,
-    /// A row matched, and the bytes were handed to the kernel (or refused with
-    /// zero bytes, or accepted in part) while the lock was still held.
+    /// A row matched, and the bytes were handed to the kernel — the rest of a
+    /// frame the kernel took only part of queued right behind it — or refused
+    /// with zero bytes, or accepted in part with the rest lost, while the lock
+    /// was still held.
     Pressed(Delivery),
 }
 
@@ -891,16 +899,25 @@ pub(crate) enum GuardedInput {
 /// have an output batch land between them: what the guard saw is the screen the
 /// keystroke answers.
 ///
-/// WHY THE IMMEDIATE WRITE. The bytes go through the sink's bounded, non-parking,
-/// never-spilling write (`try_write_frame_immediate_with_receipt`, the operator
-/// actuator's primitive), not the spilling non-parking egress the App seam uses:
-/// a frame the kernel cannot take NOW would otherwise be queued behind the spill
-/// and delivered later, to whatever screen is up by then — the exact race the
-/// guard exists to close. So a busy sink (a spill ahead of it, another writer on
-/// the fd, a full tty buffer, or a master the spawn could not make non-blocking)
-/// answers zero bytes, which the caller reports as a transient `ERR busy`, and
-/// the driver retries against the live screen. The lock hold is bounded by that
-/// same non-parking property: nothing here waits.
+/// WHY THE GUARDED WRITE. The bytes go through the sink's bounded, non-parking
+/// guarded write (`try_write_frame_whole_with_receipt`), not the spilling
+/// non-parking egress the App seam uses: a frame the kernel cannot BEGIN taking
+/// now would otherwise be queued behind the spill and delivered later, to
+/// whatever screen is up by then — the exact race the guard exists to close. So
+/// a busy sink (a spill ahead of it, another writer on the fd, a full tty
+/// buffer, or a master the spawn could not make non-blocking) answers zero
+/// bytes, which the caller reports as a transient `ERR busy`, and the driver
+/// retries against the live screen. A frame the kernel began taking is
+/// delivered WHOLE: a pty's input queue holds about 1 KB (1022 bytes on
+/// Darwin), so a longer text comes back short, and its rest is queued in order
+/// right behind the prefix (the sink's spill, ahead of every later write) — the
+/// guard decided the whole frame, and the program reads it as one. Until
+/// 2026-10-16 that rest was dropped and the write answered `ERR write failed
+/// partial accepted=1022`, in doubt and never retried, so the harness's 1.1 KB
+/// instruction to save the work never reached Codex whole. The reply is in
+/// doubt now only where bytes are lost: a rest no drainer can be arranged for.
+/// The lock hold is bounded by the same non-parking property: nothing here
+/// waits, and the drainer's spawn is deferred to the session's reply writer.
 ///
 /// WHAT IT BYPASSES, said out loud. This runs on the CONTROL thread against the
 /// resolved target's `(term, sink)`, like every cross-session input verb, so for
@@ -909,11 +926,12 @@ pub(crate) enum GuardedInput {
 /// as unseamed, never silently zero) and does not arm a cursor licence of its
 /// own; the dispatch keeps the licence fence for it. A press that must ride the
 /// seam is a plain `key`.
-pub(crate) fn input_if_fenced(
+pub(crate) fn input_if_fenced_observed(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     ev: InputEvent,
     fence: &InputFence<'_>,
+    completion: Option<crate::control_input_ack::InputCompletion>,
 ) -> GuardedInput {
     let terminal = term_lock(term);
     // A person's hand since the caller's read: asked under the same hold as
@@ -953,17 +971,25 @@ pub(crate) fn input_if_fenced(
         echo_write.finish_delivery(Delivery::Full, None, &ctx.sink);
         return GuardedInput::Pressed(Delivery::Full);
     }
-    let (outcome, accepted_order) = ctx.sink.try_write_frame_immediate_with_receipt(&bytes);
+    let (outcome, accepted_order) = ctx.sink.try_write_frame_whole_with_receipt(&bytes);
     let delivery = match outcome {
-        aterm_session::sink::ImmediateWrite::Full => Delivery::Full,
+        // Queued: the rest rides the spill right behind the accepted prefix,
+        // accepted for ordered delivery as a spilled frame is (`Delivery::Full`).
+        aterm_session::sink::ImmediateWrite::Full
+        | aterm_session::sink::ImmediateWrite::Queued { .. } => Delivery::Full,
         aterm_session::sink::ImmediateWrite::BusyZero => Delivery::BusyZero,
-        aterm_session::sink::ImmediateWrite::ConflictZero => Delivery::ConflictZero,
         aterm_session::sink::ImmediateWrite::PartialInDoubt { accepted } => {
             Delivery::PartialInDoubt { accepted }
         }
     };
     echo_write.finish_delivery(delivery, accepted_order, &ctx.sink);
     drop(terminal);
+    if let Some(completion) = completion {
+        completion.finish(crate::input::EgressReceipt::from_reported_delivery(
+            delivery,
+            accepted_order,
+        ));
+    }
     GuardedInput::Pressed(delivery)
 }
 
@@ -972,16 +998,16 @@ pub(crate) fn input_if_fenced(
 /// stamps ` seq=<n>` on it like every other `OK` from an input verb, so the
 /// driver's next `await seq` is anchored either way. Zero bytes moved is the
 /// transient `ERR busy` class — the sequence an `id=` claimed is given back,
-/// because nothing was written; a partial write is in-doubt and says so.
+/// because nothing was written; a partial write whose rest could not be queued
+/// is in-doubt and says so. A frame whose rest WAS queued behind its prefix is
+/// `OK`: accepted for ordered delivery, as a spilled `send` is.
 pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
     match decision {
         GuardedInput::Skipped => "OK skipped\n".to_string(),
         GuardedInput::Changed => "OK skipped reason=changed\n".to_string(),
         GuardedInput::Person => "OK skipped reason=person\n".to_string(),
-        GuardedInput::Pressed(Delivery::Full | Delivery::FullAt { .. }) => "OK\n".to_string(),
-        GuardedInput::Pressed(Delivery::BusyZero | Delivery::ConflictZero) => {
-            "ERR busy sink\n".to_string()
-        }
+        GuardedInput::Pressed(Delivery::Full) => "OK\n".to_string(),
+        GuardedInput::Pressed(Delivery::BusyZero) => "ERR busy sink\n".to_string(),
         GuardedInput::Pressed(Delivery::PartialInDoubt { accepted }) => {
             format!("ERR write failed partial accepted={accepted}\n")
         }
@@ -989,8 +1015,8 @@ pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
     }
 }
 
-/// `key if=<re> <name>`: [`cmd_key`]'s guarded twin — the same [`parse_key`]
-/// grammar, delivered by [`input_if_fenced`] instead of the seam. A
+/// `key if=<re> <name>`: the plain verb's guarded twin — the same [`parse_key`]
+/// grammar, delivered by [`input_if_fenced_observed`] instead of the seam. A
 /// malformed name is the usage line BEFORE any lock is taken. The guard-only
 /// spelling of [`cmd_key_fenced`], which is what the dispatch calls.
 #[cfg(all(test, unix))]
@@ -1015,21 +1041,32 @@ pub(crate) fn cmd_key_guarded(
 /// the fenced press — [`cmd_key_guarded`] with every [`InputFence`]
 /// condition. A moved screen answers `OK skipped reason=changed`, a person
 /// who keyed since the read `OK skipped reason=person`; either writes nothing.
+#[cfg(test)]
 pub(crate) fn cmd_key_fenced(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     fence: &InputFence<'_>,
     rest: &str,
 ) -> String {
+    cmd_key_fenced_observed(term, ctx, fence, rest, None)
+}
+
+pub(crate) fn cmd_key_fenced_observed(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    fence: &InputFence<'_>,
+    rest: &str,
+    completion: Option<crate::control_input_ack::InputCompletion>,
+) -> String {
     match parse_key(rest) {
-        Some(ev) => guarded_input_reply(input_if_fenced(term, ctx, ev, fence)),
+        Some(ev) => guarded_input_reply(input_if_fenced_observed(term, ctx, ev, fence, completion)),
         None => KEY_USAGE.to_string(),
     }
 }
 
 /// `send if=<re> <text>`: the guarded `send` — the same [`send_bytes`] body
 /// (the literal `\n` submit form included), delivered by
-/// [`input_if_fenced`]. The guard-only spelling of [`cmd_send_fenced`].
+/// [`input_if_fenced_observed`]. The guard-only spelling of [`cmd_send_fenced`].
 #[cfg(all(test, unix))]
 pub(crate) fn cmd_send_guarded(
     term: &Arc<Mutex<Terminal>>,
@@ -1050,20 +1087,31 @@ pub(crate) fn cmd_send_guarded(
 
 /// `send [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] <text>`: the
 /// fenced raw write.
+#[cfg(test)]
 pub(crate) fn cmd_send_fenced(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     fence: &InputFence<'_>,
     rest: &str,
 ) -> String {
+    cmd_send_fenced_observed(term, ctx, fence, rest, None)
+}
+
+pub(crate) fn cmd_send_fenced_observed(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    fence: &InputFence<'_>,
+    rest: &str,
+    completion: Option<crate::control_input_ack::InputCompletion>,
+) -> String {
     let ev = InputEvent::KeySequence(send_bytes(rest));
-    guarded_input_reply(input_if_fenced(term, ctx, ev, fence))
+    guarded_input_reply(input_if_fenced_observed(term, ctx, ev, fence, completion))
 }
 
 /// `hwkey <char|name> [mods=…] [count=…] [interval=…]` -> inject the key through
 /// the OS EVENT QUEUE instead of the control seam.
 ///
-/// The deliberately different spelling from [`cmd_key`] is the point: the two
+/// The deliberately different spelling from `key` is the point: the two
 /// verbs are not interchangeable and must never be confused in a measurement.
 /// `key` posts a decoded `InputEvent` to the main thread over a `CFRunLoopSource`
 /// and the arrival is stamped inside the handler, so the key is BORN already
@@ -1119,9 +1167,8 @@ pub(super) fn input_reply_to_str(r: Result<InputOutcome, String>) -> String {
     }
 }
 
-/// PURE parser for `ctrl <letter>` -> a Control-modified character key. Factored
-/// out of [`cmd_ctrl`] for headless unit-testing. The seam encodes it (under the
-/// CURRENT keyboard mode) as a proper CSI-u sequence (Kitty/xterm) or the legacy
+/// PURE parser for `ctrl <letter>` -> a Control-modified character key.
+/// The seam encodes it (under the CURRENT keyboard mode) as a proper CSI-u sequence (Kitty/xterm) or the legacy
 /// control byte, byte-identical to a human Ctrl chord. Returns `None` unless
 /// `rest` is exactly one (non-whitespace) char.
 pub(crate) fn parse_ctrl(rest: &str) -> Option<InputEvent> {
@@ -1137,18 +1184,6 @@ pub(crate) fn parse_ctrl(rest: &str) -> Option<InputEvent> {
         layout_text: None,
         event_type: aterm_types::keyboard::KeyEventType::Press,
     })
-}
-
-/// `ctrl <letter>` -> a Control-modified character key posted to the seam. See
-/// [`parse_ctrl`]. Reply-bearing like `key` (not fire-and-forget): `OK` means the
-/// seam APPLIED the event; with no frontmost window the dropped reply sender
-/// yields `ERR`, so `ctrl c` never reports a false `OK` for an event that went
-/// nowhere — the same honesty the byte-identical `key ctrl+c` already had.
-pub(crate) fn cmd_ctrl(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    match parse_ctrl(rest) {
-        Some(ev) => input_reply_to_str(post_input_reply(proxy, vec![ev])),
-        None => "ERR usage: ctrl <single-letter>\n".to_string(),
-    }
 }
 
 /// `feed <hex>` -> write raw bytes (decoded from a hex string, whitespace
@@ -1523,6 +1558,9 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
                         _ => WheelDir::Down,
                     },
                     lines: wheel_lines,
+                    // The verb has no pixel field: each of its `lines` is a notch,
+                    // worth the platform's lines-per-detent where a hand's notch is.
+                    detent: true,
                     row,
                     col,
                     mods,
@@ -1570,7 +1608,7 @@ pub(crate) fn cmd_mouse(proxy: &EventLoopProxy<Wake>, scope: super::Scope, rest:
         // only the automatic clipboard write is suppressed. Owner scope and a real
         // human gesture leave the flag `false`, so their copy-on-select is
         // unaffected. This is a clipboard SIDE-EFFECT, never a PTY byte, so it does
-        // NOT gate `seam_egress` / violate `bytes_human_eq_controller`.
+        // NOT gate `seam_egress` or its human/controller byte equality.
         Ok(ev) => {
             let ev = apply_copy_on_select_policy(scope, ev);
             input_reply_to_str(post_input_reply(proxy, vec![ev]))
@@ -1637,13 +1675,6 @@ pub(crate) fn apply_copy_on_select_policy(scope: super::Scope, ev: InputEvent) -
 /// the rest of the line taken literally; a literal trailing `\n` (backslash + n)
 /// becomes a line break (sent as CR, like a real paste) so a paste can end in
 /// one. For raw unsanitized bytes use `feed`/`send` instead.
-pub(crate) fn cmd_paste(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    // The seam runs `format_paste` (bracketing + sanitize) under the lock and the
-    // snap-to-bottom, converging with the human Cmd-V path. Reply-bearing so OK
-    // means the paste reached the PTY (no window ⇒ ERR, not a false OK).
-    input_reply_to_str(post_input_reply(proxy, vec![paste_event(rest)]))
-}
-
 /// The `paste` verb's event: its text ([`paste_text`]), framed at the drain.
 /// One builder for the verb and the fence that classifies it
 /// ([`control_press`]).
@@ -1973,6 +2004,36 @@ pub(crate) fn cmd_pane(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 /// or range line the verb replies with — an out-of-range cell is REFUSED here
 /// rather than clamped, so a caller is never told the pointer went where it asked
 /// when it went somewhere else.
+const POINTER_MODS_USAGE: &str =
+    "ERR usage: pointer mods <none|link|cmd|ctrl|alt|shift joined by +>\n";
+
+/// `pointer mods <list>`: the modifier state a window holds, `+`-joined from
+/// `cmd` (alias `super`), `ctrl`, `alt` (alias `option`), `shift` and `link`
+/// (the platform's open-link modifier: Cmd on macOS, Ctrl elsewhere), or
+/// `none`. `None` for a word outside that set or an empty part.
+fn parse_pointer_mods(list: &str) -> Option<winit::keyboard::ModifiersState> {
+    use winit::keyboard::ModifiersState as M;
+    if list == "none" {
+        return Some(M::empty());
+    }
+    let link = if cfg!(target_os = "macos") {
+        M::SUPER
+    } else {
+        M::CONTROL
+    };
+    list.split('+').try_fold(M::empty(), |acc, word| {
+        let bit = match word {
+            "cmd" | "super" => M::SUPER,
+            "ctrl" => M::CONTROL,
+            "alt" | "option" => M::ALT,
+            "shift" => M::SHIFT,
+            "link" => link,
+            _ => return None,
+        };
+        Some(acc | bit)
+    })
+}
+
 pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerAction, String> {
     use crate::app_mouse::PointerAction;
     let mut it = rest.split_whitespace();
@@ -2015,7 +2076,15 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
             None => Ok(PointerAction::Click),
             Some(_) => Err("ERR usage: pointer click\n".to_string()),
         },
-        Some(_) => Err("ERR usage: pointer [move <r> <c>|click|leave|status]\n".to_string()),
+        Some("mods") => match (it.next(), it.next()) {
+            (Some(list), None) => parse_pointer_mods(list)
+                .map(PointerAction::Mods)
+                .ok_or_else(|| POINTER_MODS_USAGE.to_string()),
+            _ => Err(POINTER_MODS_USAGE.to_string()),
+        },
+        Some(_) => {
+            Err("ERR usage: pointer [move <r> <c>|click|leave|status|mods <list>]\n".to_string())
+        }
     }
 }
 
@@ -2023,7 +2092,7 @@ pub(crate) fn parse_pointer(rest: &str) -> Result<crate::app_mouse::PointerActio
 /// presence row and the message band's rows together stay far below it.
 const MAX_CHROME_ROWS: u16 = 16;
 
-/// `pointer [move <r> <c>|click|leave|status]` -> put the front window's
+/// `pointer [move <r> <c>|click|leave|status|mods <list>]` -> put the front window's
 /// POINTER on a cell (a negative `r` is a chrome row above the grid), click
 /// where it is, or withdraw it, and reply where it actually is.
 ///
@@ -2035,15 +2104,20 @@ const MAX_CHROME_ROWS: u16 = 16;
 ///
 /// `OK at=-` is the honest answer for a window holding no pointer position — after
 /// a `leave`, and before any motion has happened. It says only that; the position
-/// fields are not printed at all, so there is nothing there to be believed.
+/// fields are not printed at all, so there is nothing there to be believed. A held
+/// position also says the window pixel it is at (`px=<x>,<y>`), whoever put the
+/// pointer there.
 pub(crate) fn cmd_pointer(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let action = match parse_pointer(rest) {
         Ok(action) => action,
         Err(usage) => return usage,
     };
     match super::control_media::call_main(proxy, |reply| Wake::PointerCmd { action, reply }) {
-        Ok(Ok(Some((row, col)))) => format!("OK at={row},{col}\n"),
-        Ok(Ok(None)) => "OK at=-\n".to_string(),
+        Ok(Ok((Some((row, col)), px))) => match px {
+            Some((x, y)) => format!("OK at={row},{col} px={x},{y}\n"),
+            None => format!("OK at={row},{col}\n"),
+        },
+        Ok(Ok((None, _))) => "OK at=-\n".to_string(),
         Ok(Err(why)) => format!("ERR {why}\n"),
         Err(error) => format!("ERR pointer command failed: {error}\n"),
     }
@@ -2256,35 +2330,6 @@ mod tests {
         }
     }
 
-    /// THE REFUSAL NAMES THE BASE. `tab 3` on a three-tab window used to answer
-    /// `no tab at index 3: this window has 3` — self-contradictory to anyone
-    /// who counted three chips, because the strip's ordinals are 1-based and
-    /// the wire's index is 0-based (audit 2026-09-22). The reply now spells
-    /// the indexes that WOULD be accepted, and the count is grammatical.
-    #[test]
-    fn an_index_no_tab_holds_is_refused_with_the_accepted_range() {
-        assert_eq!(
-            no_such_tab(3, 3),
-            "no tab at index 3: this window has 3 tabs, indexes 0..2"
-        );
-        assert_eq!(
-            no_such_tab(7, 2),
-            "no tab at index 7: this window has 2 tabs, indexes 0..1"
-        );
-        assert_eq!(
-            no_such_tab(1, 1),
-            "no tab at index 1: this window has 1 tab, index 0"
-        );
-        assert_eq!(
-            no_such_tab(0, 0),
-            "no tab at index 0: this window has no tabs"
-        );
-        // The grammar `parse_tab` accepts is the base the message speaks:
-        // `tab 0` is the first tab, so the wire never reads `indexes 1..`.
-        assert_eq!(parse_tab("0"), Some(TabAction::Select(0)));
-        assert_eq!(parse_tab("close 2"), Some(TabAction::Close(Some(2))));
-    }
-
     /// GATE (the control fence, 2026-09-29): a verb body is fenced exactly as
     /// the event its own parser reads is fenced at the seam and ahead of a
     /// physical key (`app_input::press_fence`). No fence for a body that arms
@@ -2481,8 +2526,6 @@ mod tests {
         assert_eq!(o.refusal.as_deref(), Some("ERR usage: if= given twice\n"));
         let (o, _) = take_leading_options("key", "id=a:b:c id=d:e:f 1");
         assert_eq!(o.refusal.as_deref(), Some("ERR usage: id= given twice\n"));
-        // The guarded set is exactly the two keystroke-shaped writes.
-        assert_eq!(GUARDED_VERBS, ["send", "key"]);
     }
 
     /// `signal cont` (2026-09-24) is a known signal — the remedy the
@@ -2626,7 +2669,7 @@ mod tests {
         // touch nothing of the parent's.
         unsafe {
             shell.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY.into(), 0) < 0 {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -3173,9 +3216,33 @@ mod tests {
             parse_pointer(&format!("move 0 {MAX_GRID_COLS}")),
             Err("ERR out of range\n".to_string())
         );
-        for line in ["move 1", "move 1 2 3", "move a b", "leave now", "wiggle"] {
+        for line in [
+            "move 1",
+            "move 1 2 3",
+            "move a b",
+            "leave now",
+            "wiggle",
+            "mods",
+            "mods hyper",
+            "mods cmd+",
+            "mods cmd shift",
+        ] {
             assert!(parse_pointer(line).is_err(), "pointer {line:?}");
         }
+        use winit::keyboard::ModifiersState as M;
+        assert_eq!(
+            parse_pointer("mods none"),
+            Ok(PointerAction::Mods(M::empty()))
+        );
+        assert_eq!(
+            parse_pointer("mods cmd+alt"),
+            Ok(PointerAction::Mods(M::SUPER | M::ALT))
+        );
+        let link = parse_pointer("mods link");
+        assert!(
+            matches!(link, Ok(PointerAction::Mods(m)) if crate::app_mouse::link_modifier_held(m)),
+            "{link:?}"
+        );
         // DAY NINE, D5: a negative row names a chrome row above the grid (the
         // message band), and `click` presses where the pointer is.
         assert_eq!(

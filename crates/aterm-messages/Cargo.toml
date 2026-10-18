@@ -9,31 +9,27 @@ repository.workspace = true
 description = "aterm's unified message engine — the platform-neutral model, glass policy, single-row width law, tagged log ring and line codec behind the message band, the Settings ▸ Messages page and the `messages`/`notice` verbs; and the per-tab presence row's core (facts, story, levels, words, tones, cells); the host paints cells, appends the file, performs intents and senses the presence facts."
 
 [dependencies]
-# The only dependency, so the crate stays wasm-clean: `Instant` is std's on
-# native and a JS clock on wasm32. Every method that reads time takes
-# `now: Instant`; the crate never samples a clock (lib.rs's
-# `no_wall_clock_in_this_crate`).
+# `Instant` is std's on native and a JS clock on wasm32. Every method that
+# reads time takes `now: Instant`; the crate never samples a clock (clippy.toml
+# bans the reads).
 aterm-time = { workspace = true }
+# The chrome floors (`tokens::ACCENT_FLOOR` and friends) ARE the theme
+# checker's (`aterm_types::scheme::MIN_*`), defined once there. aterm-types is
+# wasm-clean (aterm-wasm ships it) and depends on nothing here.
+aterm-types = { workspace = true }
 
 # tests/conformance_*.rs drive `MessageCenter` in lock step with aterm-spec's
 # derived models.
 [dev-dependencies]
 aterm-spec = { workspace = true }
+# The models its tests drive (a model edit rebuilds only their tests).
+aterm-models-session = { workspace = true }
 # Test-only: the control wire's percent escape (re-exported as
 # `aterm_control::wire::pct_encode`), so the tests pin the bytes the socket carries.
 aterm-codec = { workspace = true }
 # Test-only: the grid's measure (`str_grid_columns`), which hosts inject as
 # `presence::Host::columns`, so the presence width law is proven on real cells.
 aterm-grapheme = { workspace = true }
-# TEST-ONLY: the built-in colour schemes, so the band's warn/error inks are
-# held to their properties on every theme aterm ships. Never in the shipped
-# or wasm32 graph.
-aterm-types = { workspace = true }
-
-# Hosts' tests (never a shipped build): `Hold::STANDING` and `Hold::asking(..)`,
-# since a persistent hold has no public constructor.
-[features]
-test-fixtures = []
 
 [lints]
 workspace = true

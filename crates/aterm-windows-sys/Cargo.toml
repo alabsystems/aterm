@@ -5,17 +5,18 @@
 # THE DIRECTORY AND THE PACKAGE NAME DIFFER ON PURPOSE, as with
 # crates/aterm-windows-sys-052: `[patch.crates-io]` matches on PACKAGE name,
 # so this must be called `windows-sys` to take the `windows-sys = "0.61"`
-# edges of winit (crates/aterm-window), softbuffer, aterm-http and aterm-net,
-# and the directory keeps the `aterm-` prefix so it reads as ours
+# edges of winit (crates/aterm-window), softbuffer and aterm-http, and the
+# directory keeps the `aterm-` prefix so it reads as ours
 # (docs/AUDIT-third-party-2026-10-15.md, windows-bindings step 3).
 name = "windows-sys"
 # NOT `version.workspace = true`: a SEMVER CONTRACT with the consumers, not an
-# aterm release number. winit and softbuffer ask `^0.61.2`, aterm-http and
-# aterm-net `^0.61`, and the lock-only parents (async-io, async-signal, errno,
-# polling, rustix 1.x, tempfile, uds_windows, zbus) ask `^0.61` or lower;
-# 0.61.2 is what the lock held, so the lock's version line does not move. A
-# registry 0.61.x above it would outrank the patch (`targo --unverified forge
-# check` [OB-12] fails if one does).
+# aterm release number. winit and softbuffer ask `^0.61.2`, aterm-http
+# `^0.61`, and the lock-only parents (async-io, async-signal, errno, polling,
+# rustix 1.x, tempfile, uds_windows, zbus; rustix, errno and polling left the
+# lock at linux-windowing LW.7) ask `^0.61` or lower; 0.61.2 is
+# what the lock held, so the lock's version line does not move. A registry
+# 0.61.x above it would outrank the patch (`targo --unverified forge check`
+# [OB-12] fails if one does).
 version = "0.61.2"
 # NOT A WORKSPACE MEMBER, so no field is inherited: cargo refuses two members
 # of one package name ("two packages named `windows-sys` in this workspace"),

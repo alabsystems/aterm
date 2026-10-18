@@ -319,7 +319,7 @@
 05D0 0020 3008 05D1 002E 0031 232A;0;0;1 1 1 1 1 2 1;6 5 4 3 2 1 0
 
 ################################################################################
-# Generated permutation cases: every 40th line (subset.py).
+# Generated permutation cases: every 40th line (examples/gen_tables.rs subset).
 0028 0029;0;0;0 0;0 1
 0028 2680 05D0 0029;0;0;0 0 1 0;0 1 2 3
 05D0 0028 0061 0029;0;0;1 0 0 0;0 1 2 3

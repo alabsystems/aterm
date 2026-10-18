@@ -1,0 +1,22 @@
+# claude-code 2.1.302 · MEASURED 2026-10-16, `aterm ctl text` of a private headless aterm (144x50, aterm 0.106.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a Bash call (echo stamped) and a PostToolUse hook (command ./pb) printing {"decision": "block"} with no reason and turning the stub too-long: the output, the hook's row, Claude Code's default reason (Blocked by hook), then its own context wall for the follow-up request, each a column-2 row under the call
+ ▐▛███▛█   Claude Code v2.1.302
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.0000/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Bash(echo stamped)
+  ⎿  stamped
+  ⎿  PostToolUse:Bash hook returned blocking error
+  ⎿  Blocked by hook
+  ⎿  Context limit reached · /compact or /clear to continue
+
+✻ Crunched for 0s · done 10:35 PM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
