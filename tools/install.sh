@@ -220,10 +220,15 @@ parse_release_tag() {
 	TAG_KIND_RESULT=""
 	[[ "$tag" == v* ]] || return 1
 	body="${tag#v}"
-	# `read -a` discards a final empty field on Bash 3.2, so validate the whole
-	# grammar first; this rejects both v0.55. and v0..55 before component parsing.
+	# Splitting discards a final empty field, so validate the whole grammar
+	# first; this rejects both v0.55. and v0..55 before component parsing.
 	[[ "$body" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1
-	IFS='.' read -r -a parts <<<"$body"
+	# Split by word splitting on the dots, not `read -a <<<`: Bash 3.2 writes
+	# every here-string to a temporary file, and this runs once per tag. The
+	# body is ASCII digits and dots alone (just matched), so no field can glob;
+	# IFS is this function's own, and nothing below expands unquoted.
+	local IFS=.
+	parts=($body)
 	for part in "${parts[@]}"; do
 		# Reject leading-zero spellings so a tag has exactly ONE canonical form
 		# and two distinct tags can never share a numeric order. The u64 bound is
@@ -260,14 +265,15 @@ canonical_authority_tag() {
 # arithmetic. Both operands must already be canonical (parse_release_tag), which
 # is what makes "same length ⇒ lexical == numeric" hold.
 compare_numeric_tags() {
-	local lhs="$1" rhs="$2" body i common l r
+	local lhs="$1" rhs="$2" i common l r
 	local LC_ALL=C
 	local -a left right
 	parse_release_tag "$lhs" && parse_release_tag "$rhs" || return 2
-	body="${lhs#v}"
-	IFS='.' read -r -a left <<<"$body"
-	body="${rhs#v}"
-	IFS='.' read -r -a right <<<"$body"
+	# Split as parse_release_tag splits (no here-string, no temporary file):
+	# both bodies are ASCII digits and dots alone, so no field can glob.
+	local IFS=.
+	left=(${lhs#v})
+	right=(${rhs#v})
 	common="${#left[@]}"
 	[[ "${#right[@]}" -lt "$common" ]] && common="${#right[@]}"
 	for ((i = 0; i < common; i++)); do
@@ -318,10 +324,11 @@ validate_manifest_identity() {
 #              redirects refused. GitHub answers 302 to the tag-specific URL of
 #              the newest published release — drafts and prereleases excluded on
 #              the server — and the release cut owns that pointer, so it names
-#              the newest APP release. The Location is accepted only when it is
-#              exactly the derived appcast URL of this repository under a
-#              canonical vMAJOR.MINOR.PATCH tag; anything else is refused, never
-#              followed.
+#              the newest APP release. Every redirect code the updater reads
+#              (301, 302, 303, 307, 308) is read alike. The Location is
+#              accepted only when it is exactly the derived appcast URL of this
+#              repository under a canonical vMAJOR.MINOR.PATCH tag; anything
+#              else is refused, never followed.
 #   the bytes  tag-specific …/releases/download/<tag>/<name> URLs, never `latest`
 #              again, so a pointer that moves mid-install cannot mix two
 #              releases. A HEAD that refuses redirects answers 302 when the asset
@@ -387,6 +394,12 @@ release_asset_url() { # <tag> <name>
 # that is not an app release — a skip), or status 2 when the redirect is one this
 # script refuses to interpret (a refusal, never "follow and hope"). Called
 # directly, never in $(…), so the two globals reach the caller.
+#
+# Every redirect code the updater reads a pointer from is read here, and alike
+# (crates/aterm-update-core pointer.rs classify: 301, 302, 303, 307, 308).
+# github.com answers 302 today; a 301 or a 307 from the same host names the
+# same release, so the code alone must never strand a fresh install on a
+# channel every installed copy still follows. The Location decides.
 HEAD_TAG=""
 HEAD_WHY=""
 channel_head() {
@@ -402,7 +415,7 @@ channel_head() {
 	code="${answer%% *}"
 	location="${answer#* }"
 	case "$code" in
-	302) ;;
+	301 | 302 | 303 | 307 | 308) ;;
 	404)
 		HEAD_WHY="$REPO_SLUG has no published release (or the repository is private, renamed or missing — github.com answers the same for all three)"
 		return 1
@@ -2385,7 +2398,7 @@ bin_aterm_plan() { # <path> <store-dir>
 # The argv0 aliases the store lanes link beside the store's `aterm`
 # (expose_store_binary), each a symlink whose target is exactly `aterm` — which
 # is how the uninstall sweep knows one, whatever its name.
-STORE_ALIASES="aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive aterm-askpass aterm-link aterm-gui"
+STORE_ALIASES="aterm-cli aterm-ctl atpkg abrew atpkg-abrew aterm-fleet aterm-drive aterm-askpass aterm-link aterm-gui"
 
 # _dir_split <path> <head-var> <tail-var>: the deepest directory on <path> that
 # exists, resolved (cd -P), and the part below it still to be created, without
